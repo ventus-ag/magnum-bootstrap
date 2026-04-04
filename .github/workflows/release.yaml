@@ -11,8 +11,7 @@ permissions:
 jobs:
   release:
     name: Build and Release
-    runs-on:
-      group: ventus
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
