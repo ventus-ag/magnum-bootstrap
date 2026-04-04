@@ -11,7 +11,8 @@ permissions:
 jobs:
   release:
     name: Build and Release
-    runs-on: ventus
+    runs-on:
+      group: ventus
     steps:
       - name: Checkout
         uses: actions/checkout@v4
