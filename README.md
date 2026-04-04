@@ -27,6 +27,9 @@ make build
 # Validate heat-params input
 ./dist/bootstrap validate-input
 
+# Cancel a stuck local update/lock
+./dist/bootstrap cancel
+
 # Print last result
 ./dist/bootstrap print-last-result
 ```
@@ -39,6 +42,7 @@ make build
 | `up` | Apply changes to reconcile node state |
 | `run-once` | Alias for `up` (Heat-triggered invocations) |
 | `run-periodic` | Alias for `up` (timer-triggered drift correction) |
+| `cancel` | Cancel the current Pulumi update for the local node stack |
 | `validate-input` | Parse heat-params and print role/operation |
 | `print-last-result` | Print last reconcile result JSON |
 
@@ -50,7 +54,15 @@ make build
 --refresh              Pulumi refresh to detect drift (default: true)
 --target-phase STRING  Execute only the specified phase
 --parallelism INT      Pulumi resource operation parallelism (default: 10)
---debug                Enable debug logging
+--debug                Enable Pulumi debug logging and verbose event output
+--backend-url STRING   Override Pulumi backend URL
+--heat-params-file     Override heat-params file path
+```
+
+`cancel` also supports:
+
+```
+--stack-name STRING    Override the Pulumi stack name to cancel
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
 ```

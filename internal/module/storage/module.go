@@ -22,7 +22,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "storage" }
+func (Module) PhaseID() string        { return "storage" }
+func (Module) Dependencies() []string { return []string{"container-runtime"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Shared.DockerVolumeSize <= 0 {
@@ -43,13 +44,13 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	if runtime != "containerd" {
 		runtimeService = "docker"
 	}
-	if executor.SystemctlIsActive(runtimeService) && isMountpoint(executor, storageDir) {
+	if executor.SystemctlIsActive(runtimeService) && executor.IsMountpoint(storageDir) {
 		return moduleapi.Result{
 			Outputs: map[string]string{"storageDir": storageDir, "status": "already-mounted"},
 		}, nil
 	}
 	// Also skip if just mounted (runtime might not be started yet).
-	if isMountpoint(executor, storageDir) {
+	if executor.IsMountpoint(storageDir) {
 		return moduleapi.Result{
 			Outputs: map[string]string{"storageDir": storageDir, "status": "already-mounted"},
 		}, nil
@@ -100,7 +101,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	// Mount only if not yet mounted.
-	if !isMountpoint(executor, storageDir) {
+	if !executor.IsMountpoint(storageDir) {
 		if err := executor.Run("mount", "-a"); err != nil {
 			return moduleapi.Result{}, err
 		}
@@ -117,12 +118,6 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		Changes: changes,
 		Outputs: map[string]string{"storageDir": storageDir, "devicePath": devicePath},
 	}, nil
-}
-
-// isMountpoint checks if a path is a mountpoint.
-func isMountpoint(executor *host.Executor, path string) bool {
-	err := executor.Run("mountpoint", "-q", path)
-	return err == nil
 }
 
 func findDevicePath(cfg config.Config, executor *host.Executor, logger *logging.Logger) (string, error) {

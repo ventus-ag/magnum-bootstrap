@@ -13,6 +13,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -39,17 +40,17 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "cluster-rbac" }
+func (Module) Dependencies() []string { return []string{"health"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() {
 		return moduleapi.Result{}, nil
 	}
 
-	executor := host.NewExecutor(req.Apply, req.Logger)
 	if req.Apply {
-		err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
-		if err != nil {
-			return moduleapi.Result{}, fmt.Errorf("cluster-rbac: API server not healthy: %w", err)
+		executor := host.NewExecutor(req.Apply, req.Logger)
+		if err := clusterhelm.WaitForAPI(executor); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("cluster-rbac: %w", err)
 		}
 	}
 

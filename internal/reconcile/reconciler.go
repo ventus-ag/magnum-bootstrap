@@ -6,16 +6,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
+	autodebug "github.com/pulumi/pulumi/sdk/v3/go/auto/debug"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optpreview"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optrefresh"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optup"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/internal/paths"
@@ -37,7 +42,7 @@ import (
 //
 // If eventCh is non-nil, Pulumi engine events are streamed to it for real-time
 // display. The caller should drain the channel in a separate goroutine.
-func Run(ctx context.Context, mode string, diff bool, refresh bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
+func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
 	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, mode, diff, runtimePaths.HeatParamsFile)
 	acc := pulumipkg.NewRunAccumulator()
 	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc)
@@ -78,15 +83,39 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, parallelism 
 		return result.Result{}, state.State{}, fmt.Errorf("failed to initialize pulumi stack: %w", err)
 	}
 
+	progressWriters, errorProgressWriters := pulumiProgressWriters(req.Logger, debugEnabled)
+	pulumiDebugOpts := pulumiDebugLogging(debugEnabled)
+
 	if refresh {
+		start := time.Now()
 		if req.Logger != nil {
 			req.Logger.Infof("refreshing pulumi stack state stack=%s", cfg.StackName())
 		}
-		if _, err := stack.Refresh(ctx,
-			optrefresh.ProgressStreams(io.Discard),
-			optrefresh.ErrorProgressStreams(io.Discard),
-		); err != nil {
+		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "refresh", cfg.StackName(), start)
+		refreshOpts := []optrefresh.Option{
+			optrefresh.SuppressProgress(),
+			optrefresh.ProgressStreams(progressWriters...),
+			optrefresh.ErrorProgressStreams(errorProgressWriters...),
+		}
+		if diff {
+			refreshOpts = append(refreshOpts, optrefresh.Diff())
+		}
+		if pulumiDebugOpts != nil {
+			refreshOpts = append(refreshOpts, optrefresh.DebugLogging(*pulumiDebugOpts))
+		}
+		refreshRes, err := runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "refresh", func() (auto.RefreshResult, error) {
+			return stack.Refresh(ctx, refreshOpts...)
+		})
+		stopHeartbeat()
+		if err != nil {
+			if req.Logger != nil {
+				req.Logger.Errorf("pulumi refresh failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+			}
 			return result.Result{}, state.State{}, fmt.Errorf("failed to refresh stack state: %w", err)
+		}
+		if req.Logger != nil {
+			req.Logger.Infof("pulumi refresh completed stack=%s duration=%s changes=%s",
+				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(refreshRes.Summary.ResourceChanges))
 		}
 	}
 
@@ -96,24 +125,58 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, parallelism 
 
 	switch mode {
 	case "preview":
+		start := time.Now()
+		if req.Logger != nil {
+			req.Logger.Infof("running pulumi preview stack=%s parallelism=%d diff=%t", cfg.StackName(), parallelism, diff)
+		}
+		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "preview", cfg.StackName(), start)
 		previewOpts := []optpreview.Option{
-			optpreview.Diff(),
 			optpreview.Parallel(parallelism),
-			optpreview.ProgressStreams(io.Discard),
-			optpreview.ErrorProgressStreams(io.Discard),
+			optpreview.SuppressProgress(),
+			optpreview.ProgressStreams(progressWriters...),
+			optpreview.ErrorProgressStreams(errorProgressWriters...),
+		}
+		if diff {
+			previewOpts = append(previewOpts, optpreview.Diff())
 		}
 		if eventCh != nil {
 			previewOpts = append(previewOpts, optpreview.EventStreams(eventCh))
 		}
-		if _, err := stack.Preview(ctx, previewOpts...); err != nil {
+		if pulumiDebugOpts != nil {
+			previewOpts = append(previewOpts, optpreview.DebugLogging(*pulumiDebugOpts))
+		}
+		var previewRes auto.PreviewResult
+		var err error
+		if eventCh == nil {
+			previewRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "preview", func() (auto.PreviewResult, error) {
+				return stack.Preview(ctx, previewOpts...)
+			})
+		} else {
+			previewRes, err = stack.Preview(ctx, previewOpts...)
+		}
+		stopHeartbeat()
+		if err != nil {
+			if req.Logger != nil {
+				req.Logger.Errorf("pulumi preview failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+			}
 			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, err)
+		}
+		if req.Logger != nil {
+			req.Logger.Infof("pulumi preview completed stack=%s duration=%s changes=%s",
+				cfg.StackName(), formatDuration(time.Since(start)), formatPreviewChangeSummary(previewRes.ChangeSummary))
 		}
 
 	case "up":
+		start := time.Now()
+		if req.Logger != nil {
+			req.Logger.Infof("running pulumi up stack=%s parallelism=%d diff=%t", cfg.StackName(), parallelism, diff)
+		}
+		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "up", cfg.StackName(), start)
 		upOpts := []optup.Option{
 			optup.Parallel(parallelism),
-			optup.ProgressStreams(io.Discard),
-			optup.ErrorProgressStreams(io.Discard),
+			optup.SuppressProgress(),
+			optup.ProgressStreams(progressWriters...),
+			optup.ErrorProgressStreams(errorProgressWriters...),
 		}
 		if diff {
 			upOpts = append(upOpts, optup.Diff())
@@ -121,8 +184,28 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, parallelism 
 		if eventCh != nil {
 			upOpts = append(upOpts, optup.EventStreams(eventCh))
 		}
-		if _, err := stack.Up(ctx, upOpts...); err != nil {
+		if pulumiDebugOpts != nil {
+			upOpts = append(upOpts, optup.DebugLogging(*pulumiDebugOpts))
+		}
+		var upRes auto.UpResult
+		var err error
+		if eventCh == nil {
+			upRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "up", func() (auto.UpResult, error) {
+				return stack.Up(ctx, upOpts...)
+			})
+		} else {
+			upRes, err = stack.Up(ctx, upOpts...)
+		}
+		stopHeartbeat()
+		if err != nil {
+			if req.Logger != nil {
+				req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+			}
 			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, err)
+		}
+		if req.Logger != nil {
+			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
+				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(upRes.Summary.ResourceChanges))
 		}
 
 	default:
@@ -259,6 +342,85 @@ func buildModuleFailureResult(cfg config.Config, _ paths.Paths, phaseID string, 
 	}
 }
 
+func pulumiProgressWriters(logger *logging.Logger, debugEnabled bool) ([]io.Writer, []io.Writer) {
+	if logger == nil || !debugEnabled {
+		return []io.Writer{io.Discard}, []io.Writer{io.Discard}
+	}
+	return []io.Writer{logger.Writer(logging.LevelDebug)}, []io.Writer{logger.Writer(logging.LevelDebug)}
+}
+
+func pulumiDebugLogging(debugEnabled bool) *autodebug.LoggingOptions {
+	if !debugEnabled {
+		return nil
+	}
+	level := uint(9)
+	return &autodebug.LoggingOptions{
+		LogLevel:      &level,
+		LogToStdErr:   true,
+		FlowToPlugins: true,
+		Debug:         true,
+	}
+}
+
+func startPulumiHeartbeat(ctx context.Context, logger *logging.Logger, operation string, stack string, start time.Time) func() {
+	if logger == nil {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				logger.Infof("pulumi %s still running stack=%s elapsed=%s", operation, stack, formatDuration(time.Since(start)))
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
+}
+
+func formatPreviewChangeSummary(summary map[apitype.OpType]int) string {
+	if len(summary) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, 0, len(summary))
+	for op, count := range summary {
+		parts = append(parts, fmt.Sprintf("%s=%d", op, count))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+func formatUpdateChangeSummary(summary *map[string]int) string {
+	if summary == nil || len(*summary) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, 0, len(*summary))
+	for op, count := range *summary {
+		parts = append(parts, fmt.Sprintf("%s=%d", op, count))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
 func attemptedState(cfg config.Config, reconcilePlan plan.Plan) state.State {
 	return state.State{
 		LastAttemptedGeneration:        cfg.GenerationToken(),
@@ -303,4 +465,3 @@ func truncateError(msg string, maxLen int) string {
 	}
 	return msg
 }
-

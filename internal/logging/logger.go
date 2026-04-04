@@ -1,10 +1,12 @@
 package logging
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,15 +25,23 @@ type Logger struct {
 	stderr io.Writer
 	path   string
 	size   int64
+	debug  bool
 }
 
-func New(path string, stderr io.Writer) (*Logger, error) {
+const (
+	LevelDebug = "DEBUG"
+	LevelInfo  = "INFO"
+	LevelWarn  = "WARN"
+	LevelError = "ERROR"
+)
+
+func New(path string, stderr io.Writer, debug bool) (*Logger, error) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
 
 	if path == "" {
-		return &Logger{writer: stderr}, nil
+		return &Logger{writer: stderr, debug: debug}, nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -55,6 +65,7 @@ func New(path string, stderr io.Writer) (*Logger, error) {
 		stderr: stderr,
 		path:   path,
 		size:   size,
+		debug:  debug,
 	}
 
 	// Trim on startup if already oversized.
@@ -73,23 +84,45 @@ func (l *Logger) Close() error {
 }
 
 func (l *Logger) Infof(format string, args ...any) {
-	l.logf("INFO", format, args...)
+	l.logf(LevelInfo, format, args...)
 }
 
 func (l *Logger) Warnf(format string, args ...any) {
-	l.logf("WARN", format, args...)
+	l.logf(LevelWarn, format, args...)
 }
 
 func (l *Logger) Errorf(format string, args ...any) {
-	l.logf("ERROR", format, args...)
+	l.logf(LevelError, format, args...)
+}
+
+func (l *Logger) Debugf(format string, args ...any) {
+	l.logf(LevelDebug, format, args...)
+}
+
+// Writer returns an io.Writer that forwards line-oriented output to the logger
+// at the requested level. It is intended for subprocess progress streams.
+func (l *Logger) Writer(level string) io.Writer {
+	return &lineWriter{logger: l, level: strings.ToUpper(level)}
 }
 
 func (l *Logger) logf(level, format string, args ...any) {
+	l.logLine(level, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) logLine(level, message string) {
 	if l == nil || l.writer == nil {
 		return
 	}
+	if level == LevelDebug && !l.debug {
+		return
+	}
 
-	line := fmt.Sprintf("%s [%s] %s\n", time.Now().UTC().Format(time.RFC3339), level, fmt.Sprintf(format, args...))
+	message = strings.TrimRight(message, "\r\n")
+	if message == "" {
+		return
+	}
+
+	line := fmt.Sprintf("%s [%s] %s\n", time.Now().UTC().Format(time.RFC3339), level, message)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -100,6 +133,39 @@ func (l *Logger) logf(level, format string, args ...any) {
 	// Auto-trim when log exceeds max size.
 	if l.file != nil && l.size > MaxLogSize {
 		l.trimLocked()
+	}
+}
+
+type lineWriter struct {
+	logger *Logger
+	level  string
+	mu     sync.Mutex
+	buf    bytes.Buffer
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	if w == nil || w.logger == nil {
+		return len(p), nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	normalized := strings.ReplaceAll(string(p), "\r", "\n")
+	if _, err := w.buf.WriteString(normalized); err != nil {
+		return 0, err
+	}
+
+	for {
+		line, err := w.buf.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				w.buf.WriteString(line)
+				return len(p), nil
+			}
+			return 0, err
+		}
+		w.logger.logLine(w.level, line)
 	}
 }
 

@@ -20,6 +20,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "cluster-manila-csi" }
+func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	return clusterhelm.RunNoop(ctx, cfg, req, cfg.Shared.ManilaCSIPluginEnabled, "openstack-manila-csi", "kube-system")

@@ -25,6 +25,7 @@ type Resource struct {
 func (Module) PhaseID() string {
 	return "prereq-validation"
 }
+func (Module) Dependencies() []string { return nil }
 
 func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (moduleapi.Result, error) {
 	validated := []string{"INSTANCE_NAME", "NODEGROUP_ROLE", "KUBE_TAG", "ARCH"}

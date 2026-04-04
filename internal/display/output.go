@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/result"
@@ -40,8 +43,8 @@ func NewRenderer(writer io.Writer, debug bool) *Renderer {
 // StreamEvents processes Pulumi engine events and prints real-time resource
 // changes in colored k8s-pulumi style:
 //
-//	+ create  TYPE=magnum:module:PrereqValidation
-//	= same    TYPE=magnum:index:HeatParams
+//   - create  TYPE=magnum:module:PrereqValidation
+//     = same    TYPE=magnum:index:HeatParams
 func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 	if r == nil || r.writer == nil {
 		for range ch {
@@ -54,9 +57,9 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			continue
 		}
 		switch {
-		case ev.EngineEvent.ResOutputsEvent != nil:
-			meta := ev.EngineEvent.ResOutputsEvent.Metadata
-			// Skip the synthetic stack resource.
+		case ev.EngineEvent.ResourcePreEvent != nil:
+			// Pre-event carries the diff details before the operation executes.
+			meta := ev.EngineEvent.ResourcePreEvent.Metadata
 			if meta.Type == "pulumi:pulumi:Stack" {
 				continue
 			}
@@ -66,7 +69,32 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			}
 			sigil := pulumiSigil(op)
 			color := pulumiColor(op)
-			// Show short type name rather than full URN.
+			fmt.Fprintf(r.writer, "%s\n", r.colorize(
+				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
+
+			// Show property-level diffs for update/replace operations.
+			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
+				r.printDetailedDiff(meta)
+			}
+
+		case ev.EngineEvent.ResOutputsEvent != nil:
+			meta := ev.EngineEvent.ResOutputsEvent.Metadata
+			if meta.Type == "pulumi:pulumi:Stack" {
+				continue
+			}
+			// If we already printed from ResPreEvent, skip the duplicate.
+			// Only print ResOutputsEvent for ops that don't have a PreEvent
+			// or when there's no detailed diff.
+			op := string(meta.Op)
+			if op == "same" && !r.debug {
+				continue
+			}
+			if op == "update" || op == "replace" {
+				// Already printed from ResPreEvent with diff.
+				continue
+			}
+			sigil := pulumiSigil(op)
+			color := pulumiColor(op)
 			fmt.Fprintf(r.writer, "%s\n", r.colorize(
 				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
 
@@ -94,6 +122,140 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 				fmt.Sprintf("  ! FAILED %s TYPE=%s", meta.Op, meta.Type), colorRed))
 		}
 	}
+}
+
+// printDetailedDiff renders property-level changes for update/replace operations.
+// Shows old → new values for each changed property:
+//
+//	~ kubeTag: "v1.32.0" => "v1.35.0"
+//	+ newField: "value"
+//	- removedField
+func (r *Renderer) printDetailedDiff(meta apitype.StepEventMetadata) {
+	// Sort property paths for stable output.
+	paths := make([]string, 0, len(meta.DetailedDiff))
+	for path := range meta.DetailedDiff {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		diff := meta.DetailedDiff[path]
+		// Skip internal/noisy fields.
+		if strings.HasPrefix(path, "__") {
+			continue
+		}
+
+		oldPreferred := diffValueInputs
+		newPreferred := diffValueInputs
+		if !diff.InputDiff {
+			oldPreferred = diffValueOutputs
+		}
+
+		oldVal := formatValue(resolveDiffValue(meta.Old, path, oldPreferred))
+		newVal := formatValue(resolveDiffValue(meta.New, path, newPreferred))
+
+		switch diff.Kind {
+		case apitype.DiffAdd, apitype.DiffAddReplace:
+			fmt.Fprintf(r.writer, "%s\n", r.colorize(
+				fmt.Sprintf("      + %s: %s", path, newVal), colorGreen))
+		case apitype.DiffDelete, apitype.DiffDeleteReplace:
+			fmt.Fprintf(r.writer, "%s\n", r.colorize(
+				fmt.Sprintf("      - %s: %s", path, oldVal), colorRed))
+		case apitype.DiffUpdate, apitype.DiffUpdateReplace:
+			fmt.Fprintf(r.writer, "      %s %s: %s => %s\n",
+				r.colorize("~", colorYellow),
+				path,
+				r.colorize(oldVal, colorRed),
+				r.colorize(newVal, colorGreen))
+		}
+	}
+}
+
+type diffValueSource int
+
+const (
+	diffValueInputs diffValueSource = iota
+	diffValueOutputs
+)
+
+func resolveDiffValue(state *apitype.StepEventStateMetadata, path string, preferred diffValueSource) interface{} {
+	if state == nil {
+		return nil
+	}
+
+	for _, source := range orderedDiffSources(preferred) {
+		switch source {
+		case diffValueInputs:
+			if value, ok := getValueAtPath(state.Inputs, path); ok {
+				return value
+			}
+		case diffValueOutputs:
+			if value, ok := getValueAtPath(state.Outputs, path); ok {
+				return value
+			}
+		}
+	}
+
+	return nil
+}
+
+func orderedDiffSources(preferred diffValueSource) []diffValueSource {
+	if preferred == diffValueOutputs {
+		return []diffValueSource{diffValueOutputs, diffValueInputs}
+	}
+	return []diffValueSource{diffValueInputs, diffValueOutputs}
+}
+
+// getValueAtPath resolves a Pulumi property path like "spec.template[0].name"
+// against a JSON-like map and returns the plain Go value when present.
+func getValueAtPath(m map[string]interface{}, path string) (interface{}, bool) {
+	if len(m) == 0 {
+		return nil, false
+	}
+
+	propertyPath, err := resource.ParsePropertyPath(path)
+	if err != nil {
+		return nil, false
+	}
+
+	value, ok := propertyPath.Get(resource.NewObjectProperty(resource.NewPropertyMapFromMap(m)))
+	if !ok {
+		return nil, false
+	}
+
+	return unwrapPropertyValue(value), true
+}
+
+func unwrapPropertyValue(v resource.PropertyValue) interface{} {
+	for {
+		switch {
+		case v.IsSecret():
+			v = v.SecretValue().Element
+		case v.IsOutput():
+			output := v.OutputValue()
+			if !output.Known {
+				return nil
+			}
+			v = output.Element
+		case v.IsComputed():
+			return nil
+		default:
+			return v.Mappable()
+		}
+	}
+}
+
+// formatValue renders a value for diff display, truncating long strings.
+func formatValue(v interface{}) string {
+	if v == nil {
+		return "<nil>"
+	}
+	s := fmt.Sprintf("%v", v)
+	// Truncate long values (e.g. base64 cert data).
+	if len(s) > 80 {
+		return fmt.Sprintf("%.77s...", s)
+	}
+	return fmt.Sprintf("%q", s)
 }
 
 // PrintResult renders the final result: operations, warnings, and a short summary.

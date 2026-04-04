@@ -20,6 +20,9 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "services" }
+func (Module) Dependencies() []string {
+	return []string{"kube-master-config", "kube-worker-config", "storage"}
+}
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)
@@ -75,8 +78,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	for _, svc := range serviceList {
-		// Always enable (idempotent).
-		_ = executor.Run("systemctl", "enable", svc)
+		// Always enable so services come back after reboot.
+		if err := executor.Run("systemctl", "enable", svc); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("enable %s: %w", svc, err)
+		}
 
 		needsRestart := req.Restarts != nil && req.Restarts.NeedsRestart(svc)
 		isActive := executor.SystemctlIsActive(svc)
@@ -97,6 +102,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 				Action:  host.ActionRestart,
 				Summary: fmt.Sprintf("restart %s%s", svc, reason),
 			})
+			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
+				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after restart", svc)
+			}
 
 		case !isActive:
 			// Service not running — start it.
@@ -107,6 +115,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 				Action:  host.ActionCreate,
 				Summary: fmt.Sprintf("start %s", svc),
 			})
+			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
+				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
+			}
 
 		default:
 			// Already running and no changes — skip.
@@ -140,4 +151,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func serviceReadyTimeout(service string) time.Duration {
+	switch service {
+	case "etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet":
+		return 60 * time.Second
+	default:
+		return 30 * time.Second
+	}
 }

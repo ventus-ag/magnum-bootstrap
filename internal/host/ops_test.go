@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -113,5 +114,38 @@ func TestEnsureFileClassifiesReplace(t *testing.T) {
 	}
 	if change.Action != ActionReplace {
 		t.Fatalf("expected replace action, got %q", change.Action)
+	}
+}
+
+func TestWaitForActiveStateRequiresStableWindow(t *testing.T) {
+	states := []bool{false, true, false, true, true, true, true}
+	index := 0
+
+	got := waitForActiveState(func() bool {
+		if index >= len(states) {
+			return states[len(states)-1]
+		}
+		state := states[index]
+		index++
+		return state
+	}, 200*time.Millisecond, 10*time.Millisecond, 30*time.Millisecond)
+
+	if !got {
+		t.Fatalf("expected service to eventually become stably active")
+	}
+	if index < 6 {
+		t.Fatalf("expected repeated polls before success, got %d", index)
+	}
+}
+
+func TestWaitForActiveStateTimesOutWhenServiceFlaps(t *testing.T) {
+	state := false
+	got := waitForActiveState(func() bool {
+		state = !state
+		return state
+	}, 120*time.Millisecond, 10*time.Millisecond, 40*time.Millisecond)
+
+	if got {
+		t.Fatalf("expected unstable service to time out")
 	}
 }

@@ -18,7 +18,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "start-services" }
+func (Module) PhaseID() string        { return "start-services" }
+func (Module) Dependencies() []string { return []string{"services"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	// Uncordon only when KUBE_TAG actually changed (matching stop-services).
@@ -47,6 +48,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		if !executor.SystemctlIsActive(svc) {
 			if err := executor.Run("systemctl", "start", svc); err != nil {
 				return moduleapi.Result{}, fmt.Errorf("start %s: %w", svc, err)
+			}
+			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
+				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
 			}
 			changes = append(changes, host.Change{Action: host.ActionRestart, Summary: fmt.Sprintf("start %s", svc)})
 		}
@@ -129,4 +133,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func serviceReadyTimeout(service string) time.Duration {
+	switch service {
+	case "kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet":
+		return 60 * time.Second
+	default:
+		return 30 * time.Second
+	}
 }

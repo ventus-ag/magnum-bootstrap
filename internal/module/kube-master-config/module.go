@@ -11,6 +11,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -21,6 +22,9 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "kube-master-config" }
+func (Module) Dependencies() []string {
+	return []string{"master-certificates", "cert-api-manager", "etcd", "client-tools", "container-runtime"}
+}
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)
@@ -383,6 +387,7 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		registerWithTaints = `  - effect: "NoSchedule"
     key: "node-role.kubernetes.io/control-plane"`
 	}
+	featureGates := kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag)
 
 	kubeletConfig := fmt.Sprintf(`---
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -424,10 +429,9 @@ staticPodPath: /etc/kubernetes/manifests
 runtimeRequestTimeout: 15m
 eventRecordQPS: 5
 containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
-featureGates:
-  GracefulNodeShutdown: false
+%s
 `, certDir, cgroupDriver, dnsServiceIP, dnsClusterDomain, nodeIP,
-		registerWithTaints, instanceID, certDir, certDir)
+		registerWithTaints, instanceID, certDir, certDir, featureGates)
 
 	change, err := executor.EnsureFile("/etc/kubernetes/kubelet-config.yaml", []byte(kubeletConfig), 0o644)
 	if err != nil {

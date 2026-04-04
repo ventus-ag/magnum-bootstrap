@@ -62,6 +62,7 @@ func buildRoot(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.
 	root.AddCommand(newUpCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newRunOnceCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newRunPeriodicCmd(ctx, code, stdout, stderr))
+	root.AddCommand(newCancelCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newValidateInputCmd(code, stdout, stderr))
 	root.AddCommand(newPrintLastResultCmd(code, stdout, stderr))
 	return root
@@ -74,7 +75,7 @@ func addRunFlags(cmd *cobra.Command, f *runFlags) {
 	cmd.Flags().BoolVar(&f.refresh, "refresh", true, "run pulumi refresh before preview or up to sync state with actual node state (default: true)")
 	cmd.Flags().StringVar(&f.targetPhase, "target-phase", "", "run only the specified phase (empty means all phases in the plan)")
 	cmd.Flags().IntVar(&f.parallelism, "parallelism", 10, "maximum number of phases to execute in parallel")
-	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable debug logging")
+	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
 	cmd.Flags().StringVar(&f.backendURL, "backend-url", "", "override Pulumi backend URL (default: $MAGNUM_PULUMI_BACKEND_URL or file:///var/lib/magnum/pulumi)")
 	cmd.Flags().StringVar(&f.heatParamsFile, "heat-params-file", "", "override heat-params file path (default: $MAGNUM_RECONCILE_HEAT_PARAMS_FILE or /etc/sysconfig/heat-params)")
 }
@@ -203,7 +204,7 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 
 	renderer := display.NewRenderer(stdout, f.debug)
 
-	logger, err := logging.New(runtimePaths.LogFile, stderr)
+	logger, err := logging.New(runtimePaths.LogFile, stderr, f.debug)
 	if err != nil {
 		writeFailure(runtimePaths.ResultFile, "logging", fmt.Sprintf("failed to initialize reconciler log: %v", err))
 		fmt.Fprintf(stderr, "failed to initialize reconciler log: %v\n", err)
@@ -255,21 +256,27 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	// changed vs stale IS_UPGRADE=true).
 	previousState, _ := state.Load(runtimePaths.StateFile)
 
-	// Create event channel for real-time Pulumi resource output.
-	eventCh := make(chan events.EngineEvent, 100)
+	// Stream Pulumi resource-level diff output only when requested.
+	var eventCh chan events.EngineEvent
 	done := make(chan struct{})
-	go func() {
-		renderer.StreamEvents(eventCh)
+	if f.diff || f.debug {
+		eventCh = make(chan events.EngineEvent, 100)
+		go func() {
+			renderer.StreamEvents(eventCh)
+			close(done)
+		}()
+	} else {
 		close(done)
-	}()
+	}
 
-	runResult, reconcileState, err := reconcile.Run(ctx, mode, f.diff, f.refresh, f.parallelism, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
+	runResult, reconcileState, err := reconcile.Run(ctx, mode, f.diff, f.refresh, f.debug, f.parallelism, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
 		Apply:           mode != "preview",
 		AllowPartial:    f.allowPartial,
 		Logger:          logger,
 		Paths:           runtimePaths,
 		PreviousKubeTag: previousState.LastKubeTag,
 	}, eventCh)
+	safeCloseEngineEvents(eventCh)
 	<-done // wait for event stream to drain
 	if err != nil {
 		_ = journal.MarkFailed(runtimePaths.RunStateFile, mode, err.Error())
@@ -320,6 +327,16 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	renderer.PrintResult(runResult)
 	logger.Infof("reconcile completed summary=%s", runResult.Summary)
 	return 0
+}
+
+func safeCloseEngineEvents(ch chan events.EngineEvent) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
 }
 
 func writeFailure(path, step, summary string) {

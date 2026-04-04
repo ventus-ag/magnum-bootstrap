@@ -17,6 +17,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "cert-api-manager" }
+func (Module) Dependencies() []string { return []string{"master-certificates"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.Shared.CertManagerAPI {

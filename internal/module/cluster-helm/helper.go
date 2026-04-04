@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	helmv3 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
@@ -19,10 +20,17 @@ func SkipResult() (moduleapi.Result, error) {
 	return moduleapi.Result{}, nil
 }
 
-// WaitForAPI verifies the Kubernetes API is reachable. Called from Run()
-// before any cluster-level operations.
+// WaitForAPI waits up to 5 minutes for the Kubernetes API to become healthy.
+// The API server may not be ready immediately after services start.
 func WaitForAPI(executor *host.Executor) error {
-	return executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
+	for i := 0; i < 60; i++ {
+		err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
+		if err == nil {
+			return nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("API server not healthy after 5 minutes")
 }
 
 // RunNoop is a standard Run implementation for Helm-based addons that only

@@ -22,7 +22,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "etcd" }
+func (Module) PhaseID() string        { return "etcd" }
+func (Module) Dependencies() []string { return []string{"master-certificates"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Master == nil {
@@ -138,7 +139,7 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	}
 
 	// Already mounted — nothing to do.
-	if isMountpoint(executor, "/var/lib/etcd") {
+	if executor.IsMountpoint("/var/lib/etcd") {
 		return nil, nil
 	}
 
@@ -208,11 +209,6 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	}
 
 	return changes, nil
-}
-
-func isMountpoint(executor *host.Executor, path string) bool {
-	err := executor.Run("mountpoint", "-q", path)
-	return err == nil
 }
 
 func writeEtcdService(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -416,9 +412,9 @@ func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, 
 	// Sort members by master index in reverse order (highest first) to maintain
 	// quorum safety by removing the highest-numbered master first.
 	type memberEntry struct {
-		line       string
-		memberID   string
-		masterIdx  int
+		line      string
+		memberID  string
+		masterIdx int
 	}
 	var candidates []memberEntry
 	for _, member := range members {

@@ -88,9 +88,9 @@ type Result struct {
 //
 // Modules receive *HeatParamsComponent in Register() instead of a plain
 // config.Config. They access config values via heat.Cfg and wire Pulumi
-// dependencies by using heat as their parent resource. This means Pulumi's
-// state JSON records the full config inputs that drove each run, and Pulumi's
-// diff can detect when inputs change between runs.
+// dependencies by using heat as their parent resource. The component also
+// publishes the relevant config values as Pulumi resource outputs so Pulumi can
+// diff the desired state that drove each run between executions.
 type HeatParamsComponent struct {
 	pulumi.ResourceState
 
@@ -100,7 +100,8 @@ type HeatParamsComponent struct {
 }
 
 // NewHeatParamsComponent registers a HeatParams Pulumi component resource and
-// exposes all key config fields as Pulumi outputs for state tracking.
+// exposes all key config fields as Pulumi outputs for state tracking and diff
+// rendering.
 func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) (*HeatParamsComponent, error) {
 	heat := &HeatParamsComponent{Cfg: cfg}
 	if err := ctx.RegisterComponentResource("magnum:index:HeatParams", name, heat, opts...); err != nil {
@@ -119,9 +120,9 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		"nodegroupName": pulumi.String(cfg.Shared.NodegroupName),
 
 		// Kubernetes version
-		"kubeTag":  pulumi.String(cfg.Shared.KubeTag),
+		"kubeTag":     pulumi.String(cfg.Shared.KubeTag),
 		"kubeVersion": pulumi.String(cfg.Shared.KubeVersion),
-		"arch":     pulumi.String(cfg.Shared.Arch),
+		"arch":        pulumi.String(cfg.Shared.Arch),
 
 		// Runtime and network
 		"containerRuntime": pulumi.String(cfg.Shared.ContainerRuntime),
@@ -158,17 +159,17 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 
 	// Role-specific fields
 	if cfg.Master != nil {
-		outputs["numberOfMasters"]        = pulumi.Int(cfg.Master.NumberOfMasters)
-		outputs["kubeApiPublicAddress"]   = pulumi.String(cfg.Master.KubeAPIPublicAddress)
-		outputs["kubeApiPrivateAddress"]  = pulumi.String(cfg.Master.KubeAPIPrivateAddress)
-		outputs["etcdDiscoveryUrl"]       = pulumi.String(cfg.Master.EtcdDiscoveryURL)
-		outputs["etcdTag"]                = pulumi.String(cfg.Master.EtcdTag)
+		outputs["numberOfMasters"] = pulumi.Int(cfg.Master.NumberOfMasters)
+		outputs["kubeApiPublicAddress"] = pulumi.String(cfg.Master.KubeAPIPublicAddress)
+		outputs["kubeApiPrivateAddress"] = pulumi.String(cfg.Master.KubeAPIPrivateAddress)
+		outputs["etcdDiscoveryUrl"] = pulumi.String(cfg.Master.EtcdDiscoveryURL)
+		outputs["etcdTag"] = pulumi.String(cfg.Master.EtcdTag)
 	}
 	if cfg.Worker != nil {
-		outputs["kubeMasterIp"]    = pulumi.String(cfg.Worker.KubeMasterIP)
-		outputs["etcdServerIp"]    = pulumi.String(cfg.Worker.EtcdServerIP)
+		outputs["kubeMasterIp"] = pulumi.String(cfg.Worker.KubeMasterIP)
+		outputs["etcdServerIp"] = pulumi.String(cfg.Worker.EtcdServerIP)
 		outputs["registryEnabled"] = pulumi.Bool(cfg.Worker.RegistryEnabled)
-		outputs["registryPort"]    = pulumi.Int(cfg.Worker.RegistryPort)
+		outputs["registryPort"] = pulumi.Int(cfg.Worker.RegistryPort)
 	}
 
 	if err := ctx.RegisterResourceOutputs(heat, outputs); err != nil {
@@ -181,6 +182,12 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 type Module interface {
 	// PhaseID returns the stable phase identifier (e.g. "client-tools").
 	PhaseID() string
+
+	// Dependencies returns the phase IDs this module must run after.
+	// Modules with no dependencies return nil — they can run in parallel
+	// with other dependency-free modules.  The program builder constructs
+	// a DAG from these declarations and runs independent branches in parallel.
+	Dependencies() []string
 
 	// Run executes the module's imperative host operations.
 	// req.Apply gates whether changes are actually written; when false the

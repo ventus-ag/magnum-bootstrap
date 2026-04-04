@@ -274,6 +274,57 @@ func (e *Executor) SystemctlIsActive(unit string) bool {
 	return err == nil && strings.TrimSpace(out) == "active"
 }
 
+// SystemctlIsEnabled returns true if the given unit is enabled.
+func (e *Executor) SystemctlIsEnabled(unit string) bool {
+	out, err := e.RunCapture("systemctl", "is-enabled", unit)
+	return err == nil && strings.TrimSpace(out) == "enabled"
+}
+
+// WaitForSystemctlActive polls until the given unit becomes active or the
+// timeout expires.
+func (e *Executor) WaitForSystemctlActive(unit string, timeout, interval time.Duration) bool {
+	stableFor := 3 * interval
+	if stableFor < 3*time.Second {
+		stableFor = 3 * time.Second
+	}
+	if stableFor > 10*time.Second {
+		stableFor = 10 * time.Second
+	}
+	return waitForActiveState(func() bool {
+		return e.SystemctlIsActive(unit)
+	}, timeout, interval, stableFor)
+}
+
+func waitForActiveState(check func() bool, timeout, interval, stableFor time.Duration) bool {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var activeSince time.Time
+	for {
+		if check() {
+			if activeSince.IsZero() {
+				activeSince = time.Now()
+			}
+			if time.Since(activeSince) >= stableFor {
+				return true
+			}
+		} else {
+			activeSince = time.Time{}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
+// IsMountpoint returns true if the given path is a mounted filesystem.
+func (e *Executor) IsMountpoint(path string) bool {
+	_, err := e.RunCapture("mountpoint", "-q", path)
+	return err == nil
+}
+
 func (e *Executor) applyFunc(change *Change, fn func() error) error {
 	if e.Logger != nil {
 		e.Logger.Infof("action=%s path=%s %s", change.Action, change.Path, change.Summary)

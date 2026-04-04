@@ -27,6 +27,7 @@ bootstrap preview      # Dry-run: show planned changes
 bootstrap up           # Apply changes
 bootstrap run-once     # Alias for up (Heat-triggered invocations)
 bootstrap run-periodic # Alias for up (timer-triggered)
+bootstrap cancel       # Cancel the current Pulumi update for the local node stack
 bootstrap validate-input   # Parse heat-params, print role/operation
 bootstrap print-last-result # Print last result JSON
 ```
@@ -39,7 +40,7 @@ bootstrap print-last-result # Print last result JSON
 --refresh              Pulumi refresh before run (default: true, detects drift)
 --target-phase STRING  Execute only specified phase
 --parallelism INT      Pulumi resource operation parallelism (default: 10)
---debug                Enable debug logging (shows Pulumi "same" events)
+--debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
 ```

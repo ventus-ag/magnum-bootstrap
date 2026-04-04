@@ -3,10 +3,12 @@ package workercerts
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
+	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
@@ -19,7 +21,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "worker-certificates" }
+func (Module) PhaseID() string        { return "worker-certificates" }
+func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Shared.TLSDisabled {
@@ -60,34 +63,50 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		},
 	}
 
+	caCertPath := certDir + "/ca.crt"
+	caNeedsRefresh, _ := certutil.CertFileNeedsRefresh(caCertPath)
+
 	if !req.Apply {
+		if caNeedsRefresh {
+			changes = append(changes, plannedFileChange(caCertPath, "reconcile cluster CA certificate"))
+		}
 		for _, spec := range specs {
-			if !certExists(certDir, spec.Name) {
-				changes = append(changes, host.Change{
-					Action:  host.ActionCreate,
-					Path:    fmt.Sprintf("%s/%s.crt", certDir, spec.Name),
-					Summary: fmt.Sprintf("generate %s certificate", spec.Name),
-				})
+			if needsReconcile, _ := certNeedsReconcile(certDir, spec); needsReconcile {
+				changes = append(changes, plannedFileChange(
+					fmt.Sprintf("%s/%s.crt", certDir, spec.Name),
+					fmt.Sprintf("reconcile %s certificate", spec.Name),
+				))
 			}
 		}
 		return moduleapi.Result{Changes: changes}, nil
 	}
 
-	client := magnumapi.NewClient(
-		cfg.Shared.AuthURL, cfg.Shared.MagnumURL,
-		cfg.Shared.TrusteeUserID, cfg.Shared.TrusteePassword,
-		cfg.Shared.TrustID, cfg.Shared.ClusterUUID,
-		cfg.Shared.VerifyCA,
-	)
-
-	token, err := client.GetToken()
-	if err != nil {
-		return moduleapi.Result{}, fmt.Errorf("worker-certificates: %w", err)
+	needsSigning := caNeedsRefresh
+	for _, spec := range specs {
+		if needsReconcile, _ := certNeedsReconcile(certDir, spec); needsReconcile {
+			needsSigning = true
+			break
+		}
 	}
 
-	// Fetch CA cert only if not present.
-	caCertPath := certDir + "/ca.crt"
-	if _, statErr := os.Stat(caCertPath); os.IsNotExist(statErr) {
+	var client *magnumapi.Client
+	token := ""
+	if needsSigning {
+		client = magnumapi.NewClient(
+			cfg.Shared.AuthURL, cfg.Shared.MagnumURL,
+			cfg.Shared.TrusteeUserID, cfg.Shared.TrusteePassword,
+			cfg.Shared.TrustID, cfg.Shared.ClusterUUID,
+			cfg.Shared.VerifyCA,
+		)
+
+		token, err = client.GetToken()
+		if err != nil {
+			return moduleapi.Result{}, fmt.Errorf("worker-certificates: %w", err)
+		}
+	}
+
+	// Fetch CA cert if missing or unhealthy.
+	if caNeedsRefresh {
 		caPEM, err := client.FetchCACert(token)
 		if err != nil {
 			return moduleapi.Result{}, fmt.Errorf("worker-certificates: %w", err)
@@ -101,9 +120,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Generate and sign each certificate — skip if already exists.
+	// Generate and sign each certificate if missing or invalid.
 	for _, spec := range specs {
-		if certExists(certDir, spec.Name) {
+		needsReconcile, _ := certNeedsReconcile(certDir, spec)
+		if !needsReconcile {
 			continue
 		}
 
@@ -148,12 +168,38 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
-func certExists(certDir, name string) bool {
-	certPath := fmt.Sprintf("%s/%s.crt", certDir, name)
-	keyPath := fmt.Sprintf("%s/%s.key", certDir, name)
-	_, certErr := os.Stat(certPath)
-	_, keyErr := os.Stat(keyPath)
-	return certErr == nil && keyErr == nil
+func certNeedsReconcile(certDir string, spec magnumapi.CertSpec) (bool, string) {
+	desired := certutil.Spec{
+		CommonName:  spec.CN,
+		DNSNames:    spec.SANDNSs,
+		IPAddresses: parseSANIPs(spec.SANIPs),
+	}
+	if spec.O != "" {
+		desired.Organizations = []string{spec.O}
+	}
+	return certutil.NeedsReconcile(
+		fmt.Sprintf("%s/%s.crt", certDir, spec.Name),
+		fmt.Sprintf("%s/%s.key", certDir, spec.Name),
+		desired,
+	)
+}
+
+func plannedFileChange(path, summary string) host.Change {
+	action := host.ActionReplace
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		action = host.ActionCreate
+	}
+	return host.Change{Action: action, Path: path, Summary: summary}
+}
+
+func parseSANIPs(values []string) []net.IP {
+	ips := make([]net.IP, 0, len(values))
+	for _, value := range values {
+		if ip := net.ParseIP(value); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

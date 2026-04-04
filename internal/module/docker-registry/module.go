@@ -18,6 +18,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "registry" }
+func (Module) Dependencies() []string { return []string{"container-runtime"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Worker == nil || !cfg.Worker.RegistryEnabled {

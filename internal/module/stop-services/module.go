@@ -19,6 +19,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "stop-services" }
+func (Module) Dependencies() []string { return []string{"admin-kubeconfig"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	// Drain only when KUBE_TAG actually changed — not just because IS_UPGRADE

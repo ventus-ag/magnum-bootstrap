@@ -125,11 +125,11 @@ func BuildMetadata(cfg config.Config, reconcilePlan plan.Plan, command string, d
 //
 //  1. Reads heat-params from heatParamsPath inside the RunFunc so the config
 //     is loaded fresh on each Pulumi execution — Pulumi's diff mechanism then
-//     detects any input changes via HeatParamsComponent outputs.
+//     detects desired-state changes via HeatParamsComponent outputs.
 //  2. Registers a NodeReconcile root component.
-//  3. Registers a HeatParamsComponent as its child — all config fields are
-//     stored as Pulumi outputs so the state JSON records what drove each run
-//     and Pulumi can diff inputs between runs.
+//  3. Registers a HeatParamsComponent as its child — the relevant config
+//     fields are stored as Pulumi outputs so the state JSON records what drove
+//     each run and Pulumi can diff those values between runs.
 //  4. For each phase: calls mod.Run() (imperative), accumulates results in acc,
 //     then calls mod.Register() with heat as parent so every module component
 //     is a Pulumi child of HeatParams in the resource tree.
@@ -176,9 +176,10 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 		executed := make(gopulumi.StringArray, 0, len(reconcilePlan.Phases))
 		missing := make(gopulumi.StringArray, 0)
 
-		// Track the last registered resource so each phase depends on the
-		// previous one, preserving execution order in Pulumi's engine.
-		var prevResource gopulumi.Resource
+		// DAG-based dependency resolution: each module declares its
+		// dependencies via Dependencies(). Modules whose dependencies are
+		// all satisfied can run in parallel via Pulumi's engine.
+		phaseResources := make(map[string]gopulumi.Resource)
 
 		for _, phase := range reconcilePlan.Phases {
 			mod, ok := registry[phase.ID]
@@ -199,18 +200,23 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 			}
 			acc.RecordPhase(phase.ID, phaseResult)
 
-			// Declarative registration: Register() records the module's desired
-			// state in Pulumi as a child of HeatParams.
-			// Each phase depends on the previous one to preserve ordering.
+			// Build Pulumi DependsOn from the module's declared dependencies.
 			regOpts := []gopulumi.ResourceOption{gopulumi.Parent(heat)}
-			if prevResource != nil {
-				regOpts = append(regOpts, gopulumi.DependsOn([]gopulumi.Resource{prevResource}))
+			var deps []gopulumi.Resource
+			for _, depID := range mod.Dependencies() {
+				if depRes, ok := phaseResources[depID]; ok && depRes != nil {
+					deps = append(deps, depRes)
+				}
 			}
+			if len(deps) > 0 {
+				regOpts = append(regOpts, gopulumi.DependsOn(deps))
+			}
+
 			phaseRes, err := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...)
 			if err != nil {
 				return err
 			}
-			prevResource = phaseRes
+			phaseResources[phase.ID] = phaseRes
 			executed = append(executed, gopulumi.String(phase.ID))
 		}
 

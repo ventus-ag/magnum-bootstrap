@@ -27,6 +27,7 @@ type Resource struct {
 func (Module) PhaseID() string {
 	return "admin-kubeconfig"
 }
+func (Module) Dependencies() []string { return []string{"master-certificates", "worker-certificates"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	content, err := buildContent(cfg)

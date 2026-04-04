@@ -24,6 +24,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "ca-rotation" }
+func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	rotationID := cfg.Trigger.CARotationID

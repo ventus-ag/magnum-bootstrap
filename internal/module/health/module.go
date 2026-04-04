@@ -2,12 +2,15 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -22,25 +25,197 @@ type Resource struct {
 func (Module) PhaseID() string {
 	return "health"
 }
+func (Module) Dependencies() []string { return []string{"services"} }
 
-func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
+	executor := host.NewExecutor(req.Apply, req.Logger)
 	checks := []string{
 		"role=" + cfg.Role().String(),
 		"operation=" + cfg.Operation().String(),
 		"instance=" + cfg.Shared.InstanceName,
 	}
 
-	for _, path := range []string{"/etc/sysconfig/heat-params", "/etc/kubernetes"} {
+	var failures []string
+
+	for _, path := range requiredPaths(cfg, req) {
 		if _, err := os.Stat(path); err == nil {
 			checks = append(checks, "exists="+path)
+		} else {
+			failures = append(failures, "missing required path "+path)
 		}
 	}
 
-	return moduleapi.Result{
+	for _, service := range requiredServices(cfg) {
+		if executor.SystemctlIsEnabled(service) {
+			checks = append(checks, "enabled="+service)
+		} else {
+			failures = append(failures, "service not enabled "+service)
+		}
+		if executor.SystemctlIsActive(service) {
+			checks = append(checks, "active="+service)
+		} else {
+			failures = append(failures, "service not active "+service)
+		}
+	}
+
+	for _, mount := range requiredMounts(cfg) {
+		if executor.IsMountpoint(mount) {
+			checks = append(checks, "mounted="+mount)
+		} else {
+			failures = append(failures, "required mount missing "+mount)
+		}
+	}
+
+	if cfg.Role() == config.RoleMaster {
+		if err := verifyMasterAPI(executor, cfg); err != nil {
+			failures = append(failures, err.Error())
+		} else {
+			checks = append(checks, "apiserver=ready", "node-registered="+cfg.Shared.InstanceName)
+		}
+	}
+
+	res := moduleapi.Result{
 		Outputs: map[string]string{
 			"checks": strings.Join(checks, ","),
 		},
-	}, nil
+	}
+	if len(failures) > 0 {
+		res.Warnings = failures
+		if !req.Apply {
+			return res, nil
+		}
+		return res, fmt.Errorf("health checks failed: %s", strings.Join(failures, "; "))
+	}
+
+	return res, nil
+}
+
+func requiredPaths(cfg config.Config, req moduleapi.Request) []string {
+	paths := []string{"/etc/kubernetes", "/usr/local/bin/kubelet", "/usr/local/bin/kubectl", "/srv/magnum/bin/kubectl"}
+	if req.Paths.HeatParamsFile != "" {
+		paths = append(paths, req.Paths.HeatParamsFile)
+	}
+
+	switch cfg.Role() {
+	case config.RoleMaster:
+		paths = append(paths,
+			"/etc/kubernetes/admin.conf",
+			"/etc/kubernetes/kubelet.conf",
+			"/etc/kubernetes/kubelet-config.yaml",
+			"/etc/kubernetes/controller-kubeconfig.yaml",
+			"/etc/kubernetes/scheduler-kubeconfig.yaml",
+			"/etc/kubernetes/proxy-kubeconfig.yaml",
+			"/etc/kubernetes/apiserver",
+			"/etc/kubernetes/controller-manager",
+			"/etc/kubernetes/scheduler",
+			"/etc/kubernetes/proxy",
+		)
+		if cfg.Shared.UsePodman {
+			paths = append(paths,
+				"/etc/systemd/system/etcd.service",
+				"/etc/systemd/system/kubelet.service",
+				"/etc/systemd/system/kube-apiserver.service",
+				"/etc/systemd/system/kube-controller-manager.service",
+				"/etc/systemd/system/kube-scheduler.service",
+				"/etc/systemd/system/kube-proxy.service",
+			)
+		}
+	case config.RoleWorker:
+		paths = append(paths,
+			"/etc/kubernetes/kubelet.conf",
+			"/etc/kubernetes/kubelet-config.yaml",
+			"/etc/kubernetes/proxy-config.yaml",
+			"/etc/kubernetes/proxy",
+			"/etc/kubernetes/config",
+		)
+		if cfg.Shared.UsePodman {
+			paths = append(paths,
+				"/etc/systemd/system/kubelet.service",
+				"/etc/systemd/system/kube-proxy.service",
+			)
+		}
+	}
+
+	if !cfg.Shared.TLSDisabled {
+		paths = append(paths, requiredCertPaths(cfg.Role())...)
+	}
+
+	return paths
+}
+
+func requiredServices(cfg config.Config) []string {
+	runtimeService := "docker"
+	if cfg.Shared.ContainerRuntime == "containerd" {
+		runtimeService = "containerd"
+	}
+	if cfg.Role() == config.RoleMaster {
+		return []string{
+			"etcd",
+			runtimeService,
+			"kube-apiserver",
+			"kube-controller-manager",
+			"kube-scheduler",
+			"kubelet",
+			"kube-proxy",
+		}
+	}
+	return []string{
+		runtimeService,
+		"kubelet",
+		"kube-proxy",
+	}
+}
+
+func requiredCertPaths(role config.Role) []string {
+	paths := []string{"/etc/kubernetes/certs/ca.crt", "/etc/kubernetes/certs/kubelet.crt", "/etc/kubernetes/certs/kubelet.key", "/etc/kubernetes/certs/proxy.crt", "/etc/kubernetes/certs/proxy.key"}
+	if role == config.RoleMaster {
+		paths = append(paths,
+			"/etc/kubernetes/certs/server.crt",
+			"/etc/kubernetes/certs/server.key",
+			"/etc/kubernetes/certs/admin.crt",
+			"/etc/kubernetes/certs/admin.key",
+		)
+	}
+	return paths
+}
+
+func requiredMounts(cfg config.Config) []string {
+	var mounts []string
+	if cfg.Shared.DockerVolumeSize > 0 {
+		if cfg.Shared.ContainerRuntime == "containerd" {
+			mounts = append(mounts, "/var/lib/containerd")
+		} else {
+			mounts = append(mounts, "/var/lib/docker")
+		}
+	}
+	if cfg.Role() == config.RoleMaster && cfg.Master != nil && cfg.Master.EtcdVolumeSize > 0 {
+		mounts = append(mounts, "/var/lib/etcd")
+	}
+	return mounts
+}
+
+func verifyMasterAPI(executor *host.Executor, cfg config.Config) error {
+	kubectl := "/srv/magnum/bin/kubectl"
+	kubeconfig := "/etc/kubernetes/admin.conf"
+
+	var lastErr error
+	attempts := 30
+	if !executor.Apply {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		if _, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig, "get", "--raw=/readyz"); err != nil {
+			lastErr = fmt.Errorf("apiserver not ready via %s: %w", kubeconfig, err)
+		} else if _, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig, "get", "node", cfg.Shared.InstanceName, "-o", "name"); err != nil {
+			lastErr = fmt.Errorf("node %s not registered: %w", cfg.Shared.InstanceName, err)
+		} else {
+			return nil
+		}
+		if attempt+1 < attempts {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	return lastErr
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
