@@ -63,7 +63,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		if file.content == "" {
 			change, err = executor.EnsureAbsent(file.path)
 		} else {
-			change, err = executor.EnsureFile(file.path, []byte(file.content), 0o600)
+			// These files are read from hostPath mounts by in-cluster pods such as
+			// cluster-autoscaler, so root-only permissions break them with EACCES.
+			change, err = executor.EnsureFile(file.path, []byte(file.content), 0o644)
 		}
 		if err != nil {
 			return moduleapi.Result{}, err
