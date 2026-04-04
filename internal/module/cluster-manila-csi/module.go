@@ -3,10 +3,10 @@ package clustermanilacsi
 import (
 	"context"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
 	storagev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/storage/v1"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
@@ -19,7 +19,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cluster-manila-csi" }
+func (Module) PhaseID() string        { return "cluster-manila-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -86,6 +86,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			Namespace: pulumi.String("kube-system"),
 			Annotations: pulumi.StringMap{
 				"pulumi.com/patchForce": pulumi.String("true"),
+				"pulumi.com/skipAwait":  pulumi.String("true"),
 			},
 		},
 		StringData: pulumi.StringMap{
@@ -106,6 +107,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			Name: pulumi.String("csi-manila-nfs"),
 			Annotations: pulumi.StringMap{
 				"pulumi.com/patchForce": pulumi.String("true"),
+				"pulumi.com/skipAwait":  pulumi.String("true"),
 			},
 		},
 		Provisioner: pulumi.String("nfs.manila.csi.openstack.org"),

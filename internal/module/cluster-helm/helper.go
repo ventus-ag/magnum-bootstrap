@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	helmv3 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
@@ -20,21 +19,8 @@ func SkipResult() (moduleapi.Result, error) {
 	return moduleapi.Result{}, nil
 }
 
-// WaitForAPI waits up to 5 minutes for the Kubernetes API to become healthy.
-// The API server may not be ready immediately after services start.
-func WaitForAPI(executor *host.Executor) error {
-	for i := 0; i < 60; i++ {
-		err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
-		if err == nil {
-			return nil
-		}
-		time.Sleep(5 * time.Second)
-	}
-	return fmt.Errorf("API server not healthy after 5 minutes")
-}
-
 // RunNoop is a standard Run implementation for Helm-based addons that only
-// need Pulumi Register (no imperative host ops beyond API readiness check).
+// need Pulumi Register.
 // releaseName and namespace identify the Helm release to adopt — if it already
 // exists (from legacy bash scripts), it is uninstalled first so Pulumi can
 // create a fresh managed release.
@@ -43,14 +29,11 @@ func RunNoop(_ context.Context, cfg config.Config, req moduleapi.Request, featur
 		return SkipResult()
 	}
 	if req.Apply {
-		executor := host.NewExecutor(req.Apply, req.Logger)
-		if err := WaitForAPI(executor); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("cluster addon: API not ready: %w", err)
-		}
 		// Adopt existing Helm release: uninstall the old release so Pulumi
 		// can create a managed one. This handles migration from bash scripts
 		// that installed charts via `helm install`.
 		if releaseName != "" {
+			executor := host.NewExecutor(req.Apply, req.Logger)
 			AdoptHelmRelease(executor, releaseName, namespace)
 		}
 	}
@@ -80,7 +63,7 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	}
 
 	// Release exists from legacy bash — uninstall it.
-	_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace, "--wait")
+	_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
 	_ = os.WriteFile(markerFile, []byte("adopted"), 0o644)
 }
 
@@ -121,6 +104,8 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 		Chart:           pulumi.String(args.Chart),
 		Version:         pulumi.String(args.Version),
 		CreateNamespace: pulumi.Bool(true),
+		SkipAwait:       pulumi.BoolPtr(true),
+		WaitForJobs:     pulumi.BoolPtr(false),
 		RepositoryOpts: &helmv3.RepositoryOptsArgs{
 			Repo: pulumi.String(args.RepoURL),
 		},

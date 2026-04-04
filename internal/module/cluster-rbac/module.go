@@ -3,17 +3,14 @@ package clusterrbac
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"os"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
 	rbacv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/rbac/v1"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
-	"github.com/ventus-ag/magnum-bootstrap/internal/host"
-	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -25,6 +22,7 @@ func mergeMetadata(name string, ns string) *metav1.ObjectMetaArgs {
 		Name: pulumi.String(name),
 		Annotations: pulumi.StringMap{
 			"pulumi.com/patchForce": pulumi.String("true"),
+			"pulumi.com/skipAwait":  pulumi.String("true"),
 		},
 	}
 	if ns != "" {
@@ -39,19 +37,12 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cluster-rbac" }
+func (Module) PhaseID() string        { return "cluster-rbac" }
 func (Module) Dependencies() []string { return []string{"health"} }
 
-func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() {
 		return moduleapi.Result{}, nil
-	}
-
-	if req.Apply {
-		executor := host.NewExecutor(req.Apply, req.Logger)
-		if err := clusterhelm.WaitForAPI(executor); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("cluster-rbac: %w", err)
-		}
 	}
 
 	return moduleapi.Result{
