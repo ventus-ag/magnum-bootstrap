@@ -161,7 +161,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			if req.Logger != nil {
 				req.Logger.Errorf("pulumi preview failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
 			}
-			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, err)
+			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
 		}
 		if req.Logger != nil {
 			req.Logger.Infof("pulumi preview completed stack=%s duration=%s changes=%s",
@@ -206,7 +206,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			if req.Logger != nil {
 				req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
 			}
-			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, err)
+			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
 		}
 		if req.Logger != nil {
 			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
@@ -220,7 +220,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	if acc.HasFailure() {
 		failedPhase, failedErr := acc.Failure()
 		return buildModuleFailureResult(cfg, runtimePaths, failedPhase, failedErr, acc.Changes(), acc.Warnings()),
-			attemptedState(cfg, reconcilePlan), failedErr
+			attemptedState(cfg, req, reconcilePlan), failedErr
 	}
 
 	missing := module.MissingPhases(module.BuildRegistry(cfg), reconcilePlan)
@@ -232,12 +232,12 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			warnings = append(warnings, fmt.Sprintf("skipped unimplemented phase(s): %s", strings.Join(missing, ", ")))
 		} else {
 			return buildMissingModulesResult(mode, cfg, runtimePaths, reconcilePlan, missing, acc.Changes(), warnings, acc.Outputs()),
-				attemptedState(cfg, reconcilePlan),
+				attemptedState(cfg, req, reconcilePlan),
 				fmt.Errorf("missing modules: %s", strings.Join(missing, ", "))
 		}
 	}
 
-	reconcileState := successfulState(cfg, reconcilePlan)
+	reconcileState := successfulState(cfg, req, reconcilePlan)
 	res := buildSuccessResult(mode, diff, cfg, runtimePaths, reconcilePlan, acc.PhaseChanges(), acc.Changes(), warnings, acc.Outputs(), missing)
 	if mode == "preview" {
 		res.PreviewPlan = previewPlanText
@@ -247,11 +247,11 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 
 // extractFailureResult returns a module-level failure if the accumulator captured one,
 // or a generic pulumi-level failure otherwise.
-func extractFailureResult(acc *pulumipkg.RunAccumulator, mode string, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, runErr error) (result.Result, state.State, error) {
+func extractFailureResult(acc *pulumipkg.RunAccumulator, mode string, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, runErr error) (result.Result, state.State, error) {
 	if acc.HasFailure() {
 		failedPhase, failedErr := acc.Failure()
 		return buildModuleFailureResult(cfg, runtimePaths, failedPhase, failedErr, acc.Changes(), acc.Warnings()),
-			attemptedState(cfg, reconcilePlan), failedErr
+			attemptedState(cfg, req, reconcilePlan), failedErr
 	}
 	return result.Result{
 		Status:    "failed",
@@ -263,7 +263,7 @@ func extractFailureResult(acc *pulumipkg.RunAccumulator, mode string, cfg config
 			"mode":    mode,
 			"logFile": runtimePaths.LogFile,
 		},
-	}, attemptedState(cfg, reconcilePlan), runErr
+	}, attemptedState(cfg, req, reconcilePlan), runErr
 }
 
 func buildSuccessResult(mode string, _ bool, cfg config.Config, _ paths.Paths, reconcilePlan plan.Plan, phaseChanges []string, changeLog []host.Change, warnings []string, _ map[string]string, missing []string) result.Result {
@@ -429,12 +429,12 @@ func formatUpdateChangeSummary(summary *map[string]int) string {
 	return strings.Join(parts, ",")
 }
 
-func attemptedState(cfg config.Config, reconcilePlan plan.Plan) state.State {
+func attemptedState(cfg config.Config, req moduleapi.Request, reconcilePlan plan.Plan) state.State {
 	return state.State{
 		LastAttemptedGeneration:        cfg.GenerationToken(),
 		LastAttemptedReconcilerVersion: cfg.Shared.ReconcilerVersion,
 		LastKubeTag:                    cfg.Shared.KubeTag,
-		LastCARotationID:               cfg.Trigger.CARotationID,
+		LastCARotationID:               effectiveCARotationStateID(cfg, req.PreviousCARotationID),
 		LastRole:                       cfg.Role().String(),
 		LastOperation:                  cfg.Operation().String(),
 		LastInputChecksum:              cfg.InputChecksum,
@@ -442,19 +442,28 @@ func attemptedState(cfg config.Config, reconcilePlan plan.Plan) state.State {
 	}
 }
 
-func successfulState(cfg config.Config, reconcilePlan plan.Plan) state.State {
+func successfulState(cfg config.Config, req moduleapi.Request, reconcilePlan plan.Plan) state.State {
 	return state.State{
 		LastAttemptedGeneration:         cfg.GenerationToken(),
 		LastSuccessfulGeneration:        cfg.GenerationToken(),
 		LastAttemptedReconcilerVersion:  cfg.Shared.ReconcilerVersion,
 		LastSuccessfulReconcilerVersion: cfg.Shared.ReconcilerVersion,
 		LastKubeTag:                     cfg.Shared.KubeTag,
-		LastCARotationID:                cfg.Trigger.CARotationID,
+		LastCARotationID:                effectiveCARotationStateID(cfg, req.PreviousCARotationID),
 		LastRole:                        cfg.Role().String(),
 		LastOperation:                   cfg.Operation().String(),
 		LastInputChecksum:               cfg.InputChecksum,
 		PlannedPhases:                   reconcilePlan.PhaseIDs(),
 	}
+}
+
+func effectiveCARotationStateID(cfg config.Config, previousID string) string {
+	previousID = strings.TrimSpace(previousID)
+	currentID := strings.TrimSpace(cfg.Trigger.CARotationID)
+	if cfg.IsPureCARotation() && currentID != "" {
+		return currentID
+	}
+	return previousID
 }
 
 // truncateError trims a Pulumi error to a reasonable length for Heat signals.

@@ -127,7 +127,7 @@ func Load(path string) (Config, error) {
 			MasterIndex:            parseInt(raw["MASTER_INDEX"]),
 		},
 		Trigger: TriggerConfig{
-			CARotationID: raw["CA_ROTATION_ID"],
+			CARotationID: strings.TrimSpace(raw["CA_ROTATION_ID"]),
 		},
 	}
 

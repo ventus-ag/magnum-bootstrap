@@ -24,6 +24,11 @@ type Request struct {
 	// changed) vs stale IS_UPGRADE=true that never resets in heat-params.
 	PreviousKubeTag string
 
+	// PreviousCARotationID is the last successfully applied CA rotation ID from
+	// reconciler state. Used to ignore stale CA_ROTATION_ID values that leak
+	// into non-rotation operations.
+	PreviousCARotationID string
+
 	// Restarts is a shared tracker that modules use to signal which systemd
 	// services need a restart.  Config-writing modules call Restarts.Add()
 	// when they change a file that affects a running service.  The "services"

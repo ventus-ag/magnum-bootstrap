@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -24,27 +25,36 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
+const lastRotationFile = "/var/lib/magnum/last_ca_rotation_id"
+
 func (Module) PhaseID() string        { return "ca-rotation" }
 func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	rotationID := cfg.Trigger.CARotationID
+	rotationID, lastAppliedRotationID, err := resolveCARotationIDs(cfg, req, lastRotationFile)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
 
-	// No rotation requested — nothing to do.
+	// No effective rotation requested — nothing to do.
 	if rotationID == "" {
 		return moduleapi.Result{}, nil
 	}
 	if cfg.Shared.TLSDisabled {
 		return moduleapi.Result{}, nil
 	}
-
-	// Check if this rotation was already applied.
-	lastRotationFile := "/var/lib/magnum/last_ca_rotation_id"
-	if data, err := os.ReadFile(lastRotationFile); err == nil {
-		if string(data) == rotationID {
-			// Already rotated — no-op.
-			return moduleapi.Result{}, nil
+	if !cfg.IsPureCARotation() {
+		if req.Logger != nil {
+			req.Logger.Infof("skipping ca rotation rotationId=%s operation=%s because this is not a pure CA rotation run",
+				rotationID, cfg.Operation())
 		}
+		return moduleapi.Result{}, nil
+	}
+	if lastAppliedRotationID == rotationID {
+		if req.Logger != nil {
+			req.Logger.Infof("skipping ca rotation rotationId=%s because it matches the latest applied rotation id", rotationID)
+		}
+		return moduleapi.Result{}, nil
 	}
 
 	executor := host.NewExecutor(req.Apply, req.Logger)
@@ -184,6 +194,36 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			"role":         cfg.Role().String(),
 		},
 	}, nil
+}
+
+func resolveCARotationIDs(cfg config.Config, req moduleapi.Request, markerPath string) (string, string, error) {
+	rotationID := strings.TrimSpace(cfg.Trigger.CARotationID)
+	latestAppliedRotationID, err := latestAppliedCARotationID(markerPath, req.PreviousCARotationID)
+	if err != nil {
+		return "", "", fmt.Errorf("ca-rotation: load latest applied rotation id: %w", err)
+	}
+	return rotationID, latestAppliedRotationID, nil
+}
+
+func latestAppliedCARotationID(markerPath, previousRotationID string) (string, error) {
+	previousRotationID = strings.TrimSpace(previousRotationID)
+	if markerPath == "" {
+		return previousRotationID, nil
+	}
+
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return previousRotationID, nil
+		}
+		return "", err
+	}
+
+	markerRotationID := strings.TrimSpace(string(data))
+	if markerRotationID != "" {
+		return markerRotationID, nil
+	}
+	return previousRotationID, nil
 }
 
 func rotateMasterCerts(cfg config.Config, executor *host.Executor, client *magnumapi.Client, token, stageCertDir string) ([]host.Change, error) {
