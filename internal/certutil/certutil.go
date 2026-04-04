@@ -20,6 +20,8 @@ type Spec struct {
 	Organizations []string
 	DNSNames      []string
 	IPAddresses   []net.IP
+	KeyUsage      x509.KeyUsage
+	ExtKeyUsage   []x509.ExtKeyUsage
 }
 
 // NeedsReconcile returns true when the certificate/key pair is missing or no
@@ -70,6 +72,16 @@ func NeedsReconcile(certPath, keyPath string, spec Spec) (bool, string) {
 	for _, ip := range spec.IPAddresses {
 		if !containsIP(cert.IPAddresses, ip) {
 			return true, fmt.Sprintf("certificate missing IP SAN %q", ip.String())
+		}
+	}
+
+	if spec.KeyUsage != 0 && cert.KeyUsage&spec.KeyUsage != spec.KeyUsage {
+		return true, "certificate key usage mismatch"
+	}
+
+	for _, usage := range spec.ExtKeyUsage {
+		if !slices.Contains(cert.ExtKeyUsage, usage) {
+			return true, fmt.Sprintf("certificate missing extended key usage %d", usage)
 		}
 	}
 

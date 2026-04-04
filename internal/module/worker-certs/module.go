@@ -2,6 +2,7 @@ package workercerts
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
@@ -57,9 +58,16 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		{
 			Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName),
 			O: "system:nodes", SANIPs: sanIPs, SANDNSs: sanDNSs,
+			KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		},
 		{
 			Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
 	}
 
@@ -162,6 +170,13 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	_ = executor.Run("chmod", "440", certDir+"/kubelet.key")
 	_ = executor.Run("chmod", "440", certDir+"/proxy.key")
 
+	// Kubelet and kube-proxy must reload certificate changes on workers.
+	if len(changes) > 0 && req.Restarts != nil {
+		for _, svc := range []string{"kubelet", "kube-proxy"} {
+			req.Restarts.Add(svc, "certificate material changed")
+		}
+	}
+
 	return moduleapi.Result{
 		Changes: changes,
 		Outputs: map[string]string{"certDir": certDir},
@@ -173,6 +188,8 @@ func certNeedsReconcile(certDir string, spec magnumapi.CertSpec) (bool, string) 
 		CommonName:  spec.CN,
 		DNSNames:    spec.SANDNSs,
 		IPAddresses: parseSANIPs(spec.SANIPs),
+		KeyUsage:    spec.KeyUsage,
+		ExtKeyUsage: spec.ExtKeyUsage,
 	}
 	if spec.O != "" {
 		desired.Organizations = []string{spec.O}

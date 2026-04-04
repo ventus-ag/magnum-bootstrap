@@ -24,6 +24,8 @@ func TestNeedsReconcileAcceptsMatchingPair(t *testing.T) {
 		Organizations: []string{"system:nodes"},
 		DNSNames:      []string{"worker-1"},
 		IPAddresses:   []net.IP{net.ParseIP("10.0.0.10")},
+		KeyUsage:      x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 	}
 
 	if err := writeCertPair(certPath, keyPath, spec, time.Now().Add(-time.Hour), time.Now().Add(time.Hour)); err != nil {
@@ -93,6 +95,54 @@ func TestNeedsReconcileDetectsMissingSAN(t *testing.T) {
 	}
 }
 
+func TestNeedsReconcileDetectsMissingExtendedKeyUsage(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+
+	actual := Spec{
+		CommonName:  "system:kube-scheduler",
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	desired := Spec{
+		CommonName:  "system:kube-scheduler",
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+	}
+	if err := writeCertPair(certPath, keyPath, actual, time.Now().Add(-time.Hour), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("writeCertPair: %v", err)
+	}
+
+	needs, reason := NeedsReconcile(certPath, keyPath, desired)
+	if !needs || reason == "" {
+		t.Fatalf("expected EKU mismatch to need reconcile")
+	}
+}
+
+func TestNeedsReconcileDetectsMissingKeyUsageBit(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+
+	actual := Spec{
+		CommonName: "system:kube-proxy",
+		KeyUsage:   x509.KeyUsageDigitalSignature,
+	}
+	desired := Spec{
+		CommonName: "system:kube-proxy",
+		KeyUsage:   x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+	if err := writeCertPair(certPath, keyPath, actual, time.Now().Add(-time.Hour), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("writeCertPair: %v", err)
+	}
+
+	needs, reason := NeedsReconcile(certPath, keyPath, desired)
+	if !needs || reason == "" {
+		t.Fatalf("expected key usage mismatch to need reconcile")
+	}
+}
+
 func writeCertPair(certPath, keyPath string, spec Spec, notBefore, notAfter time.Time) error {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -107,8 +157,8 @@ func writeCertPair(certPath, keyPath string, spec Spec, notBefore, notAfter time
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              spec.KeyUsage,
+		ExtKeyUsage:           spec.ExtKeyUsage,
 		BasicConstraintsValid: true,
 		DNSNames:              spec.DNSNames,
 		IPAddresses:           spec.IPAddresses,

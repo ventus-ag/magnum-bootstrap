@@ -2,6 +2,7 @@ package mastercerts
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
@@ -49,22 +50,44 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		{
 			Name: "server", CN: "kubernetes",
 			SANIPs: sans.ips, SANDNSs: sans.dns,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		},
 		{
 			Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName),
 			O: "system:nodes", SANIPs: sans.ips, SANDNSs: sans.dns,
+			KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		},
 		{
 			Name: "admin", CN: "admin", O: "system:masters",
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
 		{
 			Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
 		{
 			Name: "controller", CN: "system:kube-controller-manager", O: "system:kube-controller-manager",
+			KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		},
 		{
 			Name: "scheduler", CN: "system:kube-scheduler", O: "system:kube-scheduler",
+			KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		},
 	}
 
@@ -202,6 +225,20 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	_ = executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/")
 
+	// Any certificate material change requires consumers to reload it.
+	if len(changes) > 0 && req.Restarts != nil {
+		for _, svc := range []string{
+			"etcd",
+			"kube-apiserver",
+			"kube-controller-manager",
+			"kube-scheduler",
+			"kubelet",
+			"kube-proxy",
+		} {
+			req.Restarts.Add(svc, "certificate material changed")
+		}
+	}
+
 	return moduleapi.Result{
 		Changes: changes,
 		Outputs: map[string]string{"certDir": certDir},
@@ -273,6 +310,8 @@ func certNeedsReconcile(certDir string, spec magnumapi.CertSpec) (bool, string) 
 		CommonName:  spec.CN,
 		DNSNames:    spec.SANDNSs,
 		IPAddresses: parseSANIPs(spec.SANIPs),
+		KeyUsage:    spec.KeyUsage,
+		ExtKeyUsage: spec.ExtKeyUsage,
 	}
 	if spec.O != "" {
 		desired.Organizations = []string{spec.O}

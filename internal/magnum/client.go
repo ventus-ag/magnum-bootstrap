@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -148,11 +149,11 @@ func (c *Client) SignCSR(token string, csrPEM string) (string, error) {
 
 // CertSpec describes a certificate to generate and sign.
 type CertSpec struct {
-	Name    string   // e.g. "server", "kubelet", "admin"
-	CN      string   // Common Name
-	O       string   // Organization (optional)
-	SANIPs  []string // IP SANs
-	SANDNSs []string // DNS SANs
+	Name        string   // e.g. "server", "kubelet", "admin"
+	CN          string   // Common Name
+	O           string   // Organization (optional)
+	SANIPs      []string // IP SANs
+	SANDNSs     []string // DNS SANs
 	KeyUsage    x509.KeyUsage
 	ExtKeyUsage []x509.ExtKeyUsage
 }
@@ -178,11 +179,11 @@ func GenerateKeyAndCSR(spec CertSpec) (keyPEM, csrPEM string, err error) {
 
 	template := &x509.CertificateRequest{
 		Subject: pkix.Name{
-			CommonName:   spec.CN,
-			Organization: []string{},
-			Country:      []string{"US"},
-			Province:     []string{"TX"},
-			Locality:     []string{"Austin"},
+			CommonName:         spec.CN,
+			Organization:       []string{},
+			Country:            []string{"US"},
+			Province:           []string{"TX"},
+			Locality:           []string{"Austin"},
 			OrganizationalUnit: []string{"OpenStack/Magnum"},
 		},
 		IPAddresses: ipSANs,
@@ -190,6 +191,20 @@ func GenerateKeyAndCSR(spec CertSpec) (keyPEM, csrPEM string, err error) {
 	}
 	if spec.O != "" {
 		template.Subject.Organization = []string{spec.O}
+	}
+	if len(spec.ExtKeyUsage) > 0 {
+		extension, err := marshalExtendedKeyUsage(spec.ExtKeyUsage)
+		if err != nil {
+			return "", "", fmt.Errorf("marshal extended key usage: %w", err)
+		}
+		template.ExtraExtensions = append(template.ExtraExtensions, extension)
+	}
+	if spec.KeyUsage != 0 {
+		extension, err := marshalKeyUsage(spec.KeyUsage)
+		if err != nil {
+			return "", "", fmt.Errorf("marshal key usage: %w", err)
+		}
+		template.ExtraExtensions = append(template.ExtraExtensions, extension)
 	}
 
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, key)
@@ -203,4 +218,87 @@ func GenerateKeyAndCSR(spec CertSpec) (keyPEM, csrPEM string, err error) {
 	})
 
 	return string(keyBytes), string(csrBytes), nil
+}
+
+var (
+	oidExtensionKeyUsage         = asn1.ObjectIdentifier{2, 5, 29, 15}
+	oidExtensionExtendedKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 37}
+)
+
+func marshalExtendedKeyUsage(usages []x509.ExtKeyUsage) (pkix.Extension, error) {
+	encoded := make([]asn1.ObjectIdentifier, 0, len(usages))
+	for _, usage := range usages {
+		oid, ok := extKeyUsageOID(usage)
+		if !ok {
+			return pkix.Extension{}, fmt.Errorf("unsupported extended key usage %d", usage)
+		}
+		encoded = append(encoded, oid)
+	}
+	value, err := asn1.Marshal(encoded)
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+	return pkix.Extension{Id: oidExtensionExtendedKeyUsage, Value: value}, nil
+}
+
+func marshalKeyUsage(usage x509.KeyUsage) (pkix.Extension, error) {
+	var bits asn1.BitString
+	for bit := 0; bit < 9; bit++ {
+		if usage&(1<<bit) != 0 {
+			bits.BitLength = bit + 1
+		}
+	}
+	if bits.BitLength == 0 {
+		return pkix.Extension{Id: oidExtensionKeyUsage, Critical: true, Value: []byte{0x03, 0x01, 0x00}}, nil
+	}
+	byteLen := (bits.BitLength + 7) / 8
+	bits.Bytes = make([]byte, byteLen)
+	for bit := 0; bit < bits.BitLength; bit++ {
+		if usage&(1<<bit) == 0 {
+			continue
+		}
+		byteIndex := bit / 8
+		bitIndex := uint(7 - (bit % 8))
+		bits.Bytes[byteIndex] |= 1 << bitIndex
+	}
+	value, err := asn1.Marshal(bits)
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+	return pkix.Extension{Id: oidExtensionKeyUsage, Critical: true, Value: value}, nil
+}
+
+func extKeyUsageOID(usage x509.ExtKeyUsage) (asn1.ObjectIdentifier, bool) {
+	switch usage {
+	case x509.ExtKeyUsageAny:
+		return asn1.ObjectIdentifier{2, 5, 29, 37, 0}, true
+	case x509.ExtKeyUsageServerAuth:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 1}, true
+	case x509.ExtKeyUsageClientAuth:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 2}, true
+	case x509.ExtKeyUsageCodeSigning:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 3}, true
+	case x509.ExtKeyUsageEmailProtection:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 4}, true
+	case x509.ExtKeyUsageIPSECEndSystem:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 5}, true
+	case x509.ExtKeyUsageIPSECTunnel:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 6}, true
+	case x509.ExtKeyUsageIPSECUser:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 7}, true
+	case x509.ExtKeyUsageTimeStamping:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 8}, true
+	case x509.ExtKeyUsageOCSPSigning:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 9}, true
+	case x509.ExtKeyUsageMicrosoftServerGatedCrypto:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 10, 3, 3}, true
+	case x509.ExtKeyUsageNetscapeServerGatedCrypto:
+		return asn1.ObjectIdentifier{2, 16, 840, 1, 113730, 4, 1}, true
+	case x509.ExtKeyUsageMicrosoftCommercialCodeSigning:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 22}, true
+	case x509.ExtKeyUsageMicrosoftKernelCodeSigning:
+		return asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 61, 1, 1}, true
+	default:
+		return nil, false
+	}
 }

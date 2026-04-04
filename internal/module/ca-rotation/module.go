@@ -2,6 +2,7 @@ package carotation
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -23,7 +24,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "ca-rotation" }
+func (Module) PhaseID() string        { return "ca-rotation" }
 func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -223,12 +224,31 @@ func rotateMasterCerts(cfg config.Config, executor *host.Executor, client *magnu
 	}
 
 	specs := []magnumapi.CertSpec{
-		{Name: "server", CN: "kubernetes", SANIPs: sanIPs, SANDNSs: sanDNSs},
-		{Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), O: "system:nodes", SANIPs: sanIPs, SANDNSs: sanDNSs},
-		{Name: "admin", CN: "admin", O: "system:masters"},
-		{Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier"},
-		{Name: "controller", CN: "system:kube-controller-manager", O: "system:kube-controller-manager"},
-		{Name: "scheduler", CN: "system:kube-scheduler", O: "system:kube-scheduler"},
+		{
+			Name: "server", CN: "kubernetes", SANIPs: sanIPs, SANDNSs: sanDNSs,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		},
+		{
+			Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), O: "system:nodes", SANIPs: sanIPs, SANDNSs: sanDNSs,
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		},
+		{Name: "admin", CN: "admin", O: "system:masters", ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}},
+		{
+			Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		},
+		{
+			Name: "controller", CN: "system:kube-controller-manager", O: "system:kube-controller-manager",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		},
+		{
+			Name: "scheduler", CN: "system:kube-scheduler", O: "system:kube-scheduler",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		},
 	}
 
 	for _, spec := range specs {
@@ -263,8 +283,16 @@ func rotateWorkerCerts(cfg config.Config, executor *host.Executor, client *magnu
 	sanDNSs := []string{cfg.Shared.InstanceName}
 
 	specs := []magnumapi.CertSpec{
-		{Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), O: "system:nodes", SANIPs: sanIPs, SANDNSs: sanDNSs},
-		{Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier"},
+		{
+			Name: "kubelet", CN: fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), O: "system:nodes", SANIPs: sanIPs, SANDNSs: sanDNSs,
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		},
+		{
+			Name: "proxy", CN: "system:kube-proxy", O: "system:node-proxier",
+			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		},
 	}
 
 	for _, spec := range specs {

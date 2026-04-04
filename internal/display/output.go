@@ -30,6 +30,7 @@ type Renderer struct {
 	writer     io.Writer
 	enableANSI bool
 	debug      bool
+	prePrinted map[string]bool
 }
 
 func NewRenderer(writer io.Writer, debug bool) *Renderer {
@@ -37,6 +38,7 @@ func NewRenderer(writer io.Writer, debug bool) *Renderer {
 		writer:     writer,
 		enableANSI: supportsColor(writer),
 		debug:      debug,
+		prePrinted: make(map[string]bool),
 	}
 }
 
@@ -71,6 +73,9 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			color := pulumiColor(op)
 			fmt.Fprintf(r.writer, "%s\n", r.colorize(
 				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
+			if op == "update" || op == "replace" {
+				r.markPrePrinted(meta)
+			}
 
 			// Show property-level diffs for update/replace operations.
 			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
@@ -89,14 +94,16 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			if op == "same" && !r.debug {
 				continue
 			}
-			if op == "update" || op == "replace" {
-				// Already printed from ResPreEvent with diff.
+			if (op == "update" || op == "replace") && r.consumePrePrinted(meta) {
 				continue
 			}
 			sigil := pulumiSigil(op)
 			color := pulumiColor(op)
 			fmt.Fprintf(r.writer, "%s\n", r.colorize(
 				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
+			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
+				r.printDetailedDiff(meta)
+			}
 
 		case ev.EngineEvent.DiagnosticEvent != nil:
 			diag := ev.EngineEvent.DiagnosticEvent
@@ -263,9 +270,19 @@ func (r *Renderer) PrintResult(res result.Result) {
 	if r == nil || r.writer == nil {
 		return
 	}
+	r.printPreviewPlan(res.PreviewPlan)
 	r.printOperations(res.Operations)
 	r.printWarnings(res.Warnings)
 	r.printSummary(res)
+}
+
+func (r *Renderer) printPreviewPlan(plan string) {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return
+	}
+	fmt.Fprintln(r.writer)
+	fmt.Fprintln(r.writer, plan)
 }
 
 func (r *Renderer) printOperations(changes []host.Change) {
@@ -301,6 +318,29 @@ func (r *Renderer) printOperations(changes []host.Change) {
 		}
 		fmt.Fprintf(r.writer, "  %s %d\n", r.colorize(fmt.Sprintf("%-10s", actionLabel(action)), colorForAction(action)), counts[action])
 	}
+}
+
+func (r *Renderer) markPrePrinted(meta apitype.StepEventMetadata) {
+	if r == nil || r.prePrinted == nil {
+		return
+	}
+	r.prePrinted[stepKey(meta)] = true
+}
+
+func (r *Renderer) consumePrePrinted(meta apitype.StepEventMetadata) bool {
+	if r == nil || r.prePrinted == nil {
+		return false
+	}
+	key := stepKey(meta)
+	if !r.prePrinted[key] {
+		return false
+	}
+	delete(r.prePrinted, key)
+	return true
+}
+
+func stepKey(meta apitype.StepEventMetadata) string {
+	return fmt.Sprintf("%s|%s|%s", meta.URN, meta.Type, meta.Op)
 }
 
 func (r *Renderer) printWarnings(warnings []string) {

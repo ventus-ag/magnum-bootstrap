@@ -17,6 +17,7 @@ type Result struct {
 	Reason           string            `json:"reason,omitempty"`
 	Changed          []string          `json:"changed,omitempty"`
 	Operations       []host.Change     `json:"operations,omitempty"`
+	PreviewPlan      string            `json:"previewPlan,omitempty"`
 	Warnings         []string          `json:"warnings,omitempty"`
 	ErrorCode        string            `json:"errorCode,omitempty"`
 	Details          map[string]string `json:"details,omitempty"`

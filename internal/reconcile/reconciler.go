@@ -123,6 +123,8 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		parallelism = 10
 	}
 
+	previewPlanText := ""
+
 	switch mode {
 	case "preview":
 		start := time.Now()
@@ -164,6 +166,9 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		if req.Logger != nil {
 			req.Logger.Infof("pulumi preview completed stack=%s duration=%s changes=%s",
 				cfg.StackName(), formatDuration(time.Since(start)), formatPreviewChangeSummary(previewRes.ChangeSummary))
+		}
+		if diff {
+			previewPlanText = strings.TrimSpace(previewRes.StdOut)
 		}
 
 	case "up":
@@ -234,6 +239,9 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 
 	reconcileState := successfulState(cfg, reconcilePlan)
 	res := buildSuccessResult(mode, diff, cfg, runtimePaths, reconcilePlan, acc.PhaseChanges(), acc.Changes(), warnings, acc.Outputs(), missing)
+	if mode == "preview" {
+		res.PreviewPlan = previewPlanText
+	}
 	return res, reconcileState, nil
 }
 
