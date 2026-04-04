@@ -21,7 +21,9 @@ type Resource struct {
 func (Module) PhaseID() string { return "start-services" }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if !cfg.Shared.IsUpgrade && !cfg.Shared.IsResize {
+	// Uncordon only when KUBE_TAG actually changed (matching stop-services).
+	kubeTagChanged := req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
+	if !kubeTagChanged {
 		return moduleapi.Result{}, nil
 	}
 

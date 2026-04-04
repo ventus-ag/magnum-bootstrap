@@ -25,9 +25,6 @@ type Resource struct {
 func (Module) PhaseID() string { return "etcd" }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if cfg.IsPureCARotation() {
-		return moduleapi.Result{}, nil
-	}
 	if cfg.Master == nil {
 		return moduleapi.Result{}, fmt.Errorf("etcd module requires master config")
 	}

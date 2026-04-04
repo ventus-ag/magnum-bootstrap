@@ -23,10 +23,6 @@ type Resource struct {
 func (Module) PhaseID() string { return "kube-master-config" }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if cfg.IsPureCARotation() {
-		return moduleapi.Result{}, nil
-	}
-
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
 

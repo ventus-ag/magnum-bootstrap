@@ -21,7 +21,12 @@ type Resource struct {
 func (Module) PhaseID() string { return "stop-services" }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if !cfg.Shared.IsUpgrade && !cfg.Shared.IsResize {
+	// Drain only when KUBE_TAG actually changed — not just because IS_UPGRADE
+	// is true (it stays true permanently and never resets in heat-params).
+	// On a fresh node (no previous state), PreviousKubeTag is empty so we
+	// skip drain (nothing to upgrade from).
+	kubeTagChanged := req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
+	if !kubeTagChanged {
 		return moduleapi.Result{}, nil
 	}
 

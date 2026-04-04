@@ -251,6 +251,10 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	}
 	logger.Infof("recorded running state runStateFile=%s", runtimePaths.RunStateFile)
 
+	// Load previous successful state to detect actual changes (e.g. KUBE_TAG
+	// changed vs stale IS_UPGRADE=true).
+	previousState, _ := state.Load(runtimePaths.StateFile)
+
 	// Create event channel for real-time Pulumi resource output.
 	eventCh := make(chan events.EngineEvent, 100)
 	done := make(chan struct{})
@@ -260,10 +264,11 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	}()
 
 	runResult, reconcileState, err := reconcile.Run(ctx, mode, f.diff, f.refresh, f.parallelism, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
-		Apply:        mode != "preview",
-		AllowPartial: f.allowPartial,
-		Logger:       logger,
-		Paths:        runtimePaths,
+		Apply:           mode != "preview",
+		AllowPartial:    f.allowPartial,
+		Logger:          logger,
+		Paths:           runtimePaths,
+		PreviousKubeTag: previousState.LastKubeTag,
 	}, eventCh)
 	<-done // wait for event stream to drain
 	if err != nil {

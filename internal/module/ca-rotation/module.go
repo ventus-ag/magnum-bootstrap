@@ -26,17 +26,27 @@ type Resource struct {
 func (Module) PhaseID() string { return "ca-rotation" }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if !cfg.IsPureCARotation() {
+	rotationID := cfg.Trigger.CARotationID
+
+	// No rotation requested — nothing to do.
+	if rotationID == "" {
 		return moduleapi.Result{}, nil
 	}
 	if cfg.Shared.TLSDisabled {
 		return moduleapi.Result{}, nil
 	}
 
+	// Check if this rotation was already applied.
+	lastRotationFile := "/var/lib/magnum/last_ca_rotation_id"
+	if data, err := os.ReadFile(lastRotationFile); err == nil {
+		if string(data) == rotationID {
+			// Already rotated — no-op.
+			return moduleapi.Result{}, nil
+		}
+	}
+
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
-
-	rotationID := cfg.Trigger.CARotationID
 	certDir := "/etc/kubernetes/certs"
 
 	if !req.Apply {
@@ -46,16 +56,6 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			Summary: fmt.Sprintf("rotate CA certificates (rotation_id=%s)", rotationID),
 		})
 		return moduleapi.Result{Changes: changes}, nil
-	}
-
-	// Check if already rotated.
-	lastRotationFile := "/var/lib/magnum/last_ca_rotation_id"
-	if data, err := os.ReadFile(lastRotationFile); err == nil {
-		if string(data) == rotationID {
-			return moduleapi.Result{
-				Warnings: []string{fmt.Sprintf("CA rotation %s already applied", rotationID)},
-			}, nil
-		}
 	}
 
 	// Validate service account keys are provided.

@@ -14,27 +14,19 @@ type Plan struct {
 	Phases    []Phase          `json:"phases"`
 }
 
+// Build returns the reconcile plan for the given config.  Every operation
+// (create, upgrade, resize, ca-rotate, periodic drift correction) uses the
+// same unified phase list.  Each module internally checks desired vs current
+// state and only acts when something actually needs changing.
 func Build(cfg config.Config) Plan {
 	role := cfg.Role()
-	operation := cfg.Operation()
-	includeCARotation := cfg.Trigger.CARotationID != ""
 
 	var phases []Phase
 	switch role {
 	case config.RoleMaster:
-		switch operation {
-		case config.OperationCreate:
-			phases = masterCreatePhases()
-		default:
-			phases = masterReconcilePhases(includeCARotation)
-		}
+		phases = masterPhases()
 	case config.RoleWorker:
-		switch operation {
-		case config.OperationCreate:
-			phases = workerCreatePhases()
-		default:
-			phases = workerReconcilePhases(includeCARotation)
-		}
+		phases = workerPhases()
 	default:
 		phases = []Phase{
 			newPhase("prereq-validation", "validate desired node input and prerequisites", false),
@@ -44,7 +36,7 @@ func Build(cfg config.Config) Plan {
 
 	return Plan{
 		Role:      role,
-		Operation: operation,
+		Operation: cfg.Operation(),
 		Phases:    phases,
 	}
 }

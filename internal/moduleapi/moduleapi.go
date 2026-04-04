@@ -19,6 +19,11 @@ type Request struct {
 	Logger       *logging.Logger
 	Paths        paths.Paths
 
+	// PreviousKubeTag is the KUBE_TAG from the last successful reconcile run.
+	// Used by stop-services/start-services to detect actual upgrades (KUBE_TAG
+	// changed) vs stale IS_UPGRADE=true that never resets in heat-params.
+	PreviousKubeTag string
+
 	// Restarts is a shared tracker that modules use to signal which systemd
 	// services need a restart.  Config-writing modules call Restarts.Add()
 	// when they change a file that affects a running service.  The "services"
