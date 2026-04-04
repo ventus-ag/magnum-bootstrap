@@ -7,6 +7,9 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/app"
 )
 
+// version is set at build time via -ldflags.
+var version = "dev"
+
 func main() {
 	os.Exit(app.Main(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
