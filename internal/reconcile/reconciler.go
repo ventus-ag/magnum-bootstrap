@@ -42,6 +42,15 @@ import (
 //
 // If eventCh is non-nil, Pulumi engine events are streamed to it for real-time
 // display. The caller should drain the channel in a separate goroutine.
+// refreshRetries is the number of times to retry a failed Pulumi refresh
+// before falling back to a non-fatal warning.  During CA rotation the
+// Kubernetes API may be temporarily unreachable (other masters restarting
+// etcd/apiserver), which causes the K8s provider in Pulumi to fail.
+const refreshRetries = 2
+
+// refreshRetryDelay is the pause between refresh retry attempts.
+const refreshRetryDelay = 15 * time.Second
+
 func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
 	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, mode, diff, runtimePaths.HeatParamsFile)
 	acc := pulumipkg.NewRunAccumulator()
@@ -103,17 +112,31 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		if pulumiDebugOpts != nil {
 			refreshOpts = append(refreshOpts, optrefresh.DebugLogging(*pulumiDebugOpts))
 		}
-		refreshRes, err := runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "refresh", func() (auto.RefreshResult, error) {
-			return stack.Refresh(ctx, refreshOpts...)
-		})
-		stopHeartbeat()
-		if err != nil {
-			if req.Logger != nil {
-				req.Logger.Errorf("pulumi refresh failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+
+		var refreshRes auto.RefreshResult
+		var refreshErr error
+		for attempt := 0; attempt <= refreshRetries; attempt++ {
+			if attempt > 0 {
+				if req.Logger != nil {
+					req.Logger.Warnf("retrying pulumi refresh attempt=%d/%d stack=%s after=%s",
+						attempt+1, refreshRetries+1, cfg.StackName(), refreshRetryDelay)
+				}
+				time.Sleep(refreshRetryDelay)
 			}
-			return result.Result{}, state.State{}, fmt.Errorf("failed to refresh stack state: %w", err)
+			refreshRes, refreshErr = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "refresh", func() (auto.RefreshResult, error) {
+				return stack.Refresh(ctx, refreshOpts...)
+			})
+			if refreshErr == nil {
+				break
+			}
 		}
-		if req.Logger != nil {
+		stopHeartbeat()
+		if refreshErr != nil {
+			if req.Logger != nil {
+				req.Logger.Warnf("pulumi refresh failed stack=%s duration=%s err=%v; continuing without refresh",
+					cfg.StackName(), formatDuration(time.Since(start)), refreshErr)
+			}
+		} else if req.Logger != nil {
 			req.Logger.Infof("pulumi refresh completed stack=%s duration=%s changes=%s",
 				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(refreshRes.Summary.ResourceChanges))
 		}

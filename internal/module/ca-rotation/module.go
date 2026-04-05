@@ -59,6 +59,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
+	var warnings []string
 	certDir := "/etc/kubernetes/certs"
 
 	if !req.Apply {
@@ -172,7 +173,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Patch all workloads to trigger rollout with new CA (master only).
 	if cfg.Role() == config.RoleMaster {
-		changes = append(changes, patchWorkloads(executor, rotationID)...)
+		patchChanges, patchWarnings := patchWorkloads(executor, rotationID)
+		changes = append(changes, patchChanges...)
+		warnings = append(warnings, patchWarnings...)
 	}
 
 	// Record rotation ID.
@@ -188,7 +191,8 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	_ = os.RemoveAll(stageDir)
 
 	return moduleapi.Result{
-		Changes: changes,
+		Changes:  changes,
+		Warnings: warnings,
 		Outputs: map[string]string{
 			"caRotationId": rotationID,
 			"role":         cfg.Role().String(),
@@ -467,9 +471,28 @@ func restartServices(cfg config.Config, executor *host.Executor) ([]host.Change,
 			return nil, fmt.Errorf("restart %s after CA rotation: %w", svc, err)
 		}
 		changes = append(changes, host.Change{Action: host.ActionRestart, Summary: fmt.Sprintf("restart %s (CA rotation)", svc)})
+
+		// Wait for the service to become active before restarting the next
+		// one.  This is critical for etcd and kube-apiserver: the API
+		// server cannot start successfully if etcd is not yet ready, and
+		// other control-plane components depend on a healthy API server.
+		if !executor.WaitForSystemctlActive(svc, serviceStartTimeout(svc), 2*time.Second) {
+			return nil, fmt.Errorf("service %s did not become active after restart during CA rotation", svc)
+		}
 	}
 
 	return changes, nil
+}
+
+func serviceStartTimeout(svc string) time.Duration {
+	switch svc {
+	case "etcd":
+		return 120 * time.Second
+	case "kube-apiserver":
+		return 90 * time.Second
+	default:
+		return 60 * time.Second
+	}
 }
 
 func waitForHealthy(cfg config.Config, executor *host.Executor) error {
@@ -499,8 +522,11 @@ func waitForHealthy(cfg config.Config, executor *host.Executor) error {
 		}
 	}
 
-	// Check API server health.
-	for i := 0; i < 60; i++ {
+	// Check API server health.  During multi-master CA rotation the API
+	// server may need extra time while etcd quorum is being re-established
+	// across masters that are rotating simultaneously.
+	apiAttempts := 90 // 90 * 5s = 7.5 minutes
+	for i := 0; i < apiAttempts; i++ {
 		err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
 		if err == nil {
 			return nil
@@ -526,16 +552,28 @@ func computeServiceIP(cidr string) string {
 
 // patchWorkloads annotates all Deployments and DaemonSets to trigger pod
 // rollouts so workloads pick up the new CA. Matches bash behavior.
-func patchWorkloads(executor *host.Executor, rotationID string) []host.Change {
+func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, []string) {
 	var changes []host.Change
+	var warnings []string
 	kubeconfig := "/etc/kubernetes/admin.conf"
 	annotation := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"magnum.openstack.org/ca-rotation":"%s"}}}}}`, rotationID)
 
+	// The API server may still be stabilising after cert rotation.  Retry
+	// namespace listing a few times before giving up so transient errors
+	// during multi-master rotation don't silently skip all patching.
 	for _, kind := range []string{"deployment", "daemonset"} {
-		// Get all namespaces.
-		out, err := executor.RunCapture("kubectl", "--kubeconfig="+kubeconfig,
-			"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}")
+		var out string
+		var err error
+		for attempt := 0; attempt < 6; attempt++ {
+			out, err = executor.RunCapture("kubectl", "--kubeconfig="+kubeconfig,
+				"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}")
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Second)
+		}
 		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("failed to list namespaces for %s patching: %v", kind, err))
 			continue
 		}
 		for _, ns := range splitFields(out) {
@@ -554,7 +592,7 @@ func patchWorkloads(executor *host.Executor, rotationID string) []host.Change {
 			Summary: fmt.Sprintf("patch %ss with ca-rotation annotation", kind),
 		})
 	}
-	return changes
+	return changes, warnings
 }
 
 func splitFields(s string) []string {
