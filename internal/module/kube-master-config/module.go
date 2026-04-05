@@ -364,19 +364,18 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		dnsClusterDomain = "cluster.local"
 	}
 
-	// Get instance ID for providerID.
+	// Get instance ID for providerID.  Always fetch (even in preview)
+	// so the generated content matches what is on disk — otherwise
+	// preview shows a false diff every time.
 	instanceID := ""
-	if executor.Apply {
-		out, err := executor.RunCapture("curl", "-s", "http://169.254.169.254/openstack/latest/meta_data.json")
-		if err == nil {
-			// Extract uuid using simple string parsing.
-			if idx := strings.Index(out, `"uuid"`); idx >= 0 {
-				rest := out[idx+7:]
-				if start := strings.Index(rest, `"`); start >= 0 {
-					rest = rest[start+1:]
-					if end := strings.Index(rest, `"`); end >= 0 {
-						instanceID = rest[:end]
-					}
+	out, err := executor.RunCapture("curl", "-s", "--max-time", "5", "http://169.254.169.254/openstack/latest/meta_data.json")
+	if err == nil {
+		if idx := strings.Index(out, `"uuid"`); idx >= 0 {
+			rest := out[idx+7:]
+			if start := strings.Index(rest, `"`); start >= 0 {
+				rest = rest[start+1:]
+				if end := strings.Index(rest, `"`); end >= 0 {
+					instanceID = rest[:end]
 				}
 			}
 		}

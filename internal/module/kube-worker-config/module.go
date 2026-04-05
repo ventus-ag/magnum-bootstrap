@@ -331,17 +331,16 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		dnsClusterDomain = "cluster.local"
 	}
 
+	// Always fetch instance ID (even in preview) so generated content
+	// matches what is on disk — otherwise preview shows a false diff.
 	instanceID := ""
-	if executor.Apply {
-		out, err := executor.RunCapture("curl", "-s", "http://169.254.169.254/openstack/latest/meta_data.json")
-		if err == nil {
-			if idx := strings.Index(out, `"uuid"`); idx >= 0 {
-				rest := out[idx+7:]
-				if start := strings.Index(rest, `"`); start >= 0 {
-					rest = rest[start+1:]
-					if end := strings.Index(rest, `"`); end >= 0 {
-						instanceID = rest[:end]
-					}
+	if out, err := executor.RunCapture("curl", "-s", "--max-time", "5", "http://169.254.169.254/openstack/latest/meta_data.json"); err == nil {
+		if idx := strings.Index(out, `"uuid"`); idx >= 0 {
+			rest := out[idx+7:]
+			if start := strings.Index(rest, `"`); start >= 0 {
+				rest = rest[start+1:]
+				if end := strings.Index(rest, `"`); end >= 0 {
+					instanceID = rest[:end]
 				}
 			}
 		}

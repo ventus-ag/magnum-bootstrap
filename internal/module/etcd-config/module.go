@@ -62,10 +62,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes = append(changes, cs...)
 
 	if !req.Apply {
-		changes = append(changes, host.Change{
-			Action:  host.ActionOther,
-			Summary: "etcd cluster join/creation (planned)",
-		})
+		// Only report a planned change if etcd hasn't been configured yet.
+		// On a converged node, preview should show zero etcd changes.
+		_, configErr := os.Stat("/etc/etcd/etcd.conf.yaml")
+		if configErr != nil {
+			changes = append(changes, host.Change{
+				Action:  host.ActionOther,
+				Summary: "etcd cluster join/creation (planned)",
+			})
+		}
 		return moduleapi.Result{Changes: changes}, nil
 	}
 
