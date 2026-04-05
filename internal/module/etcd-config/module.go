@@ -488,12 +488,14 @@ func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, e
 		changes = append(changes, *change)
 	}
 
+	started := false
 	if configChanged {
 		_ = executor.Run("systemctl", "daemon-reload")
 		if err := executor.Run("systemctl", "restart", "etcd"); err != nil {
 			return nil, fmt.Errorf("restart etcd: %w", err)
 		}
 		changes = append(changes, host.Change{Action: host.ActionRestart, Summary: "restart etcd (config changed)"})
+		started = true
 	} else if !executor.SystemctlIsActive("etcd") {
 		// Drift: etcd should be running but isn't.
 		_ = executor.Run("systemctl", "daemon-reload")
@@ -501,6 +503,33 @@ func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, e
 			return nil, fmt.Errorf("start etcd: %w", err)
 		}
 		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: "start etcd (was not running)"})
+		started = true
+	}
+
+	// Wait for etcd to be functionally healthy after start.  In a
+	// multi-master setup the discovery process and quorum election can
+	// take significant time.  Without this wait, downstream phases
+	// (kube-apiserver, controller-manager) fail because etcd isn't ready.
+	if started && executor.Apply {
+		healthy := false
+		for i := 0; i < 60; i++ {
+			// Check local endpoint health via etcdctl.
+			args := []string{"ETCDCTL_API=3", "/usr/local/bin/etcdctl",
+				"--endpoints=https://127.0.0.1:2379", "--command-timeout=5s",
+				"--cacert=/etc/etcd/certs/ca.crt",
+				"--cert=/etc/etcd/certs/server.crt",
+				"--key=/etc/etcd/certs/server.key",
+				"endpoint", "health"}
+			_, err := executor.RunCapture("env", args...)
+			if err == nil {
+				healthy = true
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+		if !healthy {
+			return nil, fmt.Errorf("etcd did not become healthy within 5 minutes after start")
+		}
 	}
 
 	return changes, nil

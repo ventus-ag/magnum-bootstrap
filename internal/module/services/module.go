@@ -124,6 +124,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
+	// Wait for API server to be functionally healthy before labeling.
+	// SystemctlIsActive only checks the process — the API may not be
+	// serving yet (etcd quorum forming, post-start hooks running).
+	if cfg.Role() == config.RoleMaster && req.Apply {
+		for i := 0; i < 60; i++ {
+			err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "get", "--raw=/healthz")
+			if err == nil {
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}
+
 	// Label control-plane node if needed.
 	if cfg.Role() == config.RoleMaster && cfg.Shared.LeadNodeRoleName == "control-plane" {
 		_ = executor.Run("kubectl",

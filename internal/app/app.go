@@ -69,10 +69,15 @@ func buildRoot(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.
 }
 
 // addRunFlags attaches the common reconcile flags to a command.
-func addRunFlags(cmd *cobra.Command, f *runFlags) {
+// refreshDefault controls whether --refresh defaults to true or false.
+// Heat-triggered commands (run-once) default to false because modules
+// already check actual state and refresh can fail when the K8s API is
+// temporarily unavailable (e.g. during multi-master CA rotation).
+// Periodic commands (run-periodic) default to true for drift detection.
+func addRunFlags(cmd *cobra.Command, f *runFlags, refreshDefault bool) {
 	cmd.Flags().BoolVar(&f.diff, "diff", false, "show diff-oriented output")
 	cmd.Flags().BoolVar(&f.allowPartial, "allow-partial", false, "allow missing phase implementations and run only implemented modules")
-	cmd.Flags().BoolVar(&f.refresh, "refresh", true, "run pulumi refresh before preview or up to sync state with actual node state (default: true)")
+	cmd.Flags().BoolVar(&f.refresh, "refresh", refreshDefault, "run pulumi refresh before preview or up to sync state with actual node state")
 	cmd.Flags().StringVar(&f.targetPhase, "target-phase", "", "run only the specified phase (empty means all phases in the plan)")
 	cmd.Flags().IntVar(&f.parallelism, "parallelism", 10, "maximum number of phases to execute in parallel")
 	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
@@ -90,7 +95,7 @@ func newPreviewCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *co
 			return nil
 		},
 	}
-	addRunFlags(cmd, &f)
+	addRunFlags(cmd, &f, true)
 	return cmd
 }
 
@@ -104,7 +109,7 @@ func newUpCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.C
 			return nil
 		},
 	}
-	addRunFlags(cmd, &f)
+	addRunFlags(cmd, &f, true)
 	return cmd
 }
 
@@ -118,7 +123,7 @@ func newRunOnceCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *co
 			return nil
 		},
 	}
-	addRunFlags(cmd, &f)
+	addRunFlags(cmd, &f, false)
 	return cmd
 }
 
@@ -132,7 +137,7 @@ func newRunPeriodicCmd(ctx context.Context, code *int, stdout, stderr io.Writer)
 			return nil
 		},
 	}
-	addRunFlags(cmd, &f)
+	addRunFlags(cmd, &f, true)
 	return cmd
 }
 

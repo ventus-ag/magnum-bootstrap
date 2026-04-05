@@ -51,7 +51,20 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		} else {
 			failures = append(failures, "service not enabled "+service)
 		}
-		if executor.SystemctlIsActive(service) {
+		// Retry active check: services may still be stabilising after a
+		// fresh create or CA rotation (e.g. kube-apiserver crash-looping
+		// while etcd quorum forms across multiple masters).
+		active := executor.SystemctlIsActive(service)
+		if !active && req.Apply {
+			for i := 0; i < 30; i++ {
+				time.Sleep(2 * time.Second)
+				if executor.SystemctlIsActive(service) {
+					active = true
+					break
+				}
+			}
+		}
+		if active {
 			checks = append(checks, "active="+service)
 		} else {
 			failures = append(failures, "service not active "+service)
