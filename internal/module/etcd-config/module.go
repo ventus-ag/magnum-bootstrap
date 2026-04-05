@@ -82,14 +82,23 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	lbEndpoint := fmt.Sprintf("%s://%s:2379", protocol, cfg.Master.EtcdLBVIP)
 	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 
-	lbOK := etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
-	localOK := etcdHealthy(executor, localEndpoint, certDir, cfg.Shared.TLSDisabled)
-	discoveryOK := checkDiscoveryURL(executor, cfg.Master.EtcdDiscoveryURL)
-
+	// Skip expensive endpoint health checks on first create — etcd
+	// hasn't been configured yet so connections always fail, wasting
+	// ~40 seconds on retries.  If a config file exists, etcd was
+	// previously set up and we need to check membership/health for
+	// rejoin decisions.
+	lbOK := false
+	localOK := false
 	isMember := false
-	if lbOK {
-		isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
+	_, configErr := os.Stat("/etc/etcd/etcd.conf.yaml")
+	if configErr == nil {
+		lbOK = etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+		localOK = etcdHealthy(executor, localEndpoint, certDir, cfg.Shared.TLSDisabled)
+		if lbOK {
+			isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
+		}
 	}
+	discoveryOK := checkDiscoveryURL(executor, cfg.Master.EtcdDiscoveryURL)
 
 	switch {
 	case isMember && localOK:
@@ -510,15 +519,15 @@ func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, e
 	// multi-master setup the discovery process and quorum election can
 	// take significant time.  Without this wait, downstream phases
 	// (kube-apiserver, controller-manager) fail because etcd isn't ready.
+	//
+	// Use the HTTP loopback listener (http://127.0.0.1:2379) which is
+	// always configured without TLS, avoiding cert mismatch issues
+	// during initial cluster formation.
 	if started && executor.Apply {
 		healthy := false
 		for i := 0; i < 60; i++ {
-			// Check local endpoint health via etcdctl.
 			args := []string{"ETCDCTL_API=3", "/usr/local/bin/etcdctl",
-				"--endpoints=https://127.0.0.1:2379", "--command-timeout=5s",
-				"--cacert=/etc/etcd/certs/ca.crt",
-				"--cert=/etc/etcd/certs/server.crt",
-				"--key=/etc/etcd/certs/server.key",
+				"--endpoints=http://127.0.0.1:2379", "--command-timeout=5s",
 				"endpoint", "health"}
 			_, err := executor.RunCapture("env", args...)
 			if err == nil {
