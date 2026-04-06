@@ -100,9 +100,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		changes = append(changes, *change)
 	}
 
-	// Mount only if not yet mounted.
+	// Mount only the target device — avoid mount -a which would mount all fstab entries.
 	if !executor.IsMountpoint(storageDir) {
-		if err := executor.Run("mount", "-a"); err != nil {
+		if err := executor.Run("mount", storageDir); err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, host.Change{Action: host.ActionCreate, Path: storageDir,

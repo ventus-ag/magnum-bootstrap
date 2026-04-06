@@ -126,16 +126,24 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	// Atomically replace certs: copy staged certs to the real cert dir.
-	_ = executor.Run("cp", "-a", stageCertDir+"/.", certDir+"/")
+	if err := executor.Run("cp", "-a", stageCertDir+"/.", certDir+"/"); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("ca-rotation: copy staged certs to %s: %w", certDir, err)
+	}
 	changes = append(changes, host.Change{Action: host.ActionReplace, Path: certDir, Summary: "replace certificates with rotated versions"})
 
 	// Copy to etcd certs if master.
 	if cfg.Role() == config.RoleMaster {
 		etcdCertDir := "/etc/etcd/certs"
-		_ = executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/")
+		if err := executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/"); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("ca-rotation: copy certs to etcd dir %s: %w", etcdCertDir, err)
+		}
 		// Fix ownership.
-		_ = executor.Run("chown", "-R", "kube:kube_etcd", certDir)
-		_ = executor.Run("chown", "-R", "etcd:kube_etcd", etcdCertDir)
+		if err := executor.Run("chown", "-R", "kube:kube_etcd", certDir); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("ca-rotation: chown %s: %w", certDir, err)
+		}
+		if err := executor.Run("chown", "-R", "etcd:kube_etcd", etcdCertDir); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("ca-rotation: chown %s: %w", etcdCertDir, err)
+		}
 		changes = append(changes, host.Change{Action: host.ActionUpdate, Path: etcdCertDir, Summary: "update etcd certificates"})
 	}
 
@@ -405,12 +413,25 @@ func updateAdminKubeconfig(cfg config.Config, executor *host.Executor) ([]host.C
 	}
 
 	// Read certs and encode as base64, matching the admin-kubeconfig module format.
-	readB64 := func(path string) string {
+	readB64 := func(path string) (string, error) {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return ""
+			return "", fmt.Errorf("ca-rotation: read %s for admin kubeconfig: %w", path, err)
 		}
-		return base64.StdEncoding.EncodeToString(data)
+		return base64.StdEncoding.EncodeToString(data), nil
+	}
+
+	caB64, err := readB64(certDir + "/ca.crt")
+	if err != nil {
+		return nil, err
+	}
+	adminCertB64, err := readB64(certDir + "/admin.crt")
+	if err != nil {
+		return nil, err
+	}
+	adminKeyB64, err := readB64(certDir + "/admin.key")
+	if err != nil {
+		return nil, err
 	}
 
 	content := fmt.Sprintf(`apiVersion: v1
@@ -432,9 +453,9 @@ users:
   user:
     client-certificate-data: %s
     client-key-data: %s
-`, readB64(certDir+"/ca.crt"), apiPort, cfg.Shared.ClusterUUID,
+`, caB64, apiPort, cfg.Shared.ClusterUUID,
 		cfg.Shared.ClusterUUID,
-		readB64(certDir+"/admin.crt"), readB64(certDir+"/admin.key"))
+		adminCertB64, adminKeyB64)
 
 	var changes []host.Change
 	change, err := executor.EnsureFile("/etc/kubernetes/admin.conf", []byte(content), 0o600)
@@ -457,7 +478,9 @@ users:
 
 func restartServices(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	var changes []host.Change
-	_ = executor.Run("systemctl", "daemon-reload")
+	if err := executor.Run("systemctl", "daemon-reload"); err != nil {
+		return nil, fmt.Errorf("ca-rotation: systemctl daemon-reload: %w", err)
+	}
 
 	var services []string
 	if cfg.Role() == config.RoleMaster {
@@ -576,6 +599,7 @@ func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, 
 			warnings = append(warnings, fmt.Sprintf("failed to list namespaces for %s patching: %v", kind, err))
 			continue
 		}
+		var patchFailures int
 		for _, ns := range splitFields(out) {
 			resources, err := executor.RunCapture("kubectl", "--kubeconfig="+kubeconfig,
 				"get", kind, "-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
@@ -583,9 +607,14 @@ func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, 
 				continue
 			}
 			for _, name := range splitFields(resources) {
-				_ = executor.Run("kubectl", "--kubeconfig="+kubeconfig,
-					"patch", kind, name, "-n", ns, "-p", annotation)
+				if err := executor.Run("kubectl", "--kubeconfig="+kubeconfig,
+					"patch", kind, name, "-n", ns, "-p", annotation); err != nil {
+					patchFailures++
+				}
 			}
+		}
+		if patchFailures > 0 {
+			warnings = append(warnings, fmt.Sprintf("failed to patch %d %s(s) during CA rotation rollout", patchFailures, kind))
 		}
 		changes = append(changes, host.Change{
 			Action:  host.ActionUpdate,
@@ -597,12 +626,6 @@ func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, 
 
 func splitFields(s string) []string {
 	var result []string
-	for _, f := range []byte(s) {
-		if f == ' ' || f == '\n' || f == '\t' {
-			continue
-		}
-	}
-	// Use simple space splitting.
 	start := 0
 	for i := 0; i <= len(s); i++ {
 		if i == len(s) || s[i] == ' ' || s[i] == '\n' || s[i] == '\t' {

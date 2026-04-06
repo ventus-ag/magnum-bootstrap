@@ -207,12 +207,27 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	// Create etcd and kube users/groups and set permissions.
-	_ = executor.Run("useradd", "-s", "/sbin/nologin", "--system", "etcd")
-	_ = executor.Run("useradd", "-s", "/sbin/nologin", "--system", "kube")
-	_ = executor.Run("groupadd", "-f", "kube_etcd")
-	_ = executor.Run("usermod", "-a", "-G", "kube_etcd", "etcd")
-	_ = executor.Run("usermod", "-a", "-G", "kube_etcd", "kube")
-	_ = executor.Run("chown", "-R", "kube:kube_etcd", certDir)
+	// useradd/groupadd/usermod may fail if the user/group already exists — log
+	// the output for debugging but do not treat as fatal.
+	if err := executor.Run("useradd", "-s", "/sbin/nologin", "--system", "etcd"); err != nil {
+		req.Logger.Infof("master-certificates: useradd etcd (non-fatal): %v", err)
+	}
+	if err := executor.Run("useradd", "-s", "/sbin/nologin", "--system", "kube"); err != nil {
+		req.Logger.Infof("master-certificates: useradd kube (non-fatal): %v", err)
+	}
+	if err := executor.Run("groupadd", "-f", "kube_etcd"); err != nil {
+		req.Logger.Infof("master-certificates: groupadd kube_etcd (non-fatal): %v", err)
+	}
+	if err := executor.Run("usermod", "-a", "-G", "kube_etcd", "etcd"); err != nil {
+		req.Logger.Infof("master-certificates: usermod etcd (non-fatal): %v", err)
+	}
+	if err := executor.Run("usermod", "-a", "-G", "kube_etcd", "kube"); err != nil {
+		req.Logger.Infof("master-certificates: usermod kube (non-fatal): %v", err)
+	}
+	// chown MUST succeed — wrong permissions will break services.
+	if err := executor.Run("chown", "-R", "kube:kube_etcd", certDir); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("master-certificates: set cert dir ownership: %w", err)
+	}
 
 	// Copy certs to etcd certs directory.
 	etcdCertDir := "/etc/etcd/certs"
@@ -223,7 +238,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	if change != nil {
 		changes = append(changes, *change)
 	}
-	_ = executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/")
+	// cp MUST succeed — etcd needs its own copy of the cert material.
+	if err := executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/"); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("master-certificates: copy certs to etcd dir: %w", err)
+	}
 
 	// Any certificate material change requires consumers to reload it.
 	if len(changes) > 0 && req.Restarts != nil {

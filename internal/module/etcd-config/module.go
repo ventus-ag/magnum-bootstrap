@@ -108,7 +108,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	switch {
 	case isMember && localOK:
 		// Already healthy member — rebuild config if needed for TLS/proxy.
-		rebuildConfigIfNeeded(cfg, executor, nodeIP, protocol, certDir)
+		if err := rebuildConfigIfNeeded(cfg, executor, nodeIP, protocol, certDir); err != nil {
+			return moduleapi.Result{}, err
+		}
 
 	case isMember && !localOK:
 		// Member but unhealthy — rejoin.
@@ -354,14 +356,27 @@ func checkDiscoveryURL(executor *host.Executor, url string) bool {
 func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
 	// Remove ourselves and re-add.
 	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
-	out, _ := runEtcdctl(executor, append(args, "member", "list")...)
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, cfg.Shared.InstanceName) || strings.Contains(line, nodeIP) {
-			parts := strings.SplitN(line, ",", 2)
-			if len(parts) > 0 {
-				memberID := strings.TrimSpace(parts[0])
-				runEtcdctl(executor, append(args, "member", "remove", memberID)...)
+	out, err := runEtcdctl(executor, append(args, "member", "list")...)
+	if err != nil {
+		// During initial cluster formation or quorum loss, member list can
+		// transiently fail. Log and skip the remove step — the subsequent
+		// member add will still work if the cluster accepts us.
+		executor.Logger.Warnf("etcd rejoin: member list failed (cluster may be forming quorum), skipping remove: %v", err)
+	} else {
+		lines := strings.Split(out, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, cfg.Shared.InstanceName) || strings.Contains(line, nodeIP) {
+				parts := strings.SplitN(line, ",", 2)
+				if len(parts) > 0 {
+					memberID := strings.TrimSpace(parts[0])
+					if _, rmErr := runEtcdctl(executor, append(args, "member", "remove", memberID)...); rmErr != nil {
+						if cfg.Shared.IsResize {
+							executor.Logger.Errorf("etcd rejoin: member remove failed during resize (member %s): %v", memberID, rmErr)
+						} else {
+							executor.Logger.Warnf("etcd rejoin: member remove failed (member %s, may be transient): %v", memberID, rmErr)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -549,25 +564,26 @@ func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, e
 	return changes, nil
 }
 
-func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir string) {
+func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir string) error {
 	data, err := os.ReadFile("/etc/etcd/etcd.conf.yaml")
 	if err != nil {
-		return
+		return nil
 	}
 
 	needsTLS := !cfg.Shared.TLSDisabled && !strings.Contains(string(data), "client-transport-security")
 	needsProxy := cfg.Shared.HTTPProxy != "" && !strings.Contains(string(data), "discovery-proxy")
 
 	if !needsTLS && !needsProxy {
-		return
+		return nil
 	}
 
 	// Determine mode and rebuild.
 	content := string(data)
 	if strings.Contains(content, "discovery:") {
 		conf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		_ = executor.Run("systemctl", "daemon-reload")
-		executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644)
+		if _, err := executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644); err != nil {
+			return fmt.Errorf("rebuild etcd config (discovery mode): %w", err)
+		}
 	} else if strings.Contains(content, "initial-cluster:") {
 		// Extract initial-cluster value.
 		for _, line := range strings.Split(content, "\n") {
@@ -575,7 +591,9 @@ func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, p
 				ic := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "initial-cluster:"))
 				ic = strings.Trim(ic, "\"")
 				conf := buildConfig(cfg, nodeIP, protocol, "existing", ic)
-				executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644)
+				if _, err := executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644); err != nil {
+					return fmt.Errorf("rebuild etcd config (existing cluster mode): %w", err)
+				}
 				break
 			}
 		}
@@ -583,6 +601,7 @@ func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, p
 
 	_ = executor.Run("systemctl", "daemon-reload")
 	_ = executor.Run("systemctl", "restart", "etcd")
+	return nil
 }
 
 func buildConfig(cfg config.Config, nodeIP, protocol, mode, initialCluster string) string {
@@ -663,6 +682,7 @@ func runEtcdctl(executor *host.Executor, args ...string) (string, error) {
 
 func extractInitialCluster(addOutput string) string {
 	for _, line := range strings.Split(addOutput, "\n") {
+		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "ETCD_INITIAL_CLUSTER=") {
 			val := strings.TrimPrefix(line, "ETCD_INITIAL_CLUSTER=")
 			return strings.Trim(val, "\"")

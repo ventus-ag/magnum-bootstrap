@@ -60,11 +60,17 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	var changes []host.Change
 	configChanged := false
+	tarballExtracted := false
 
 	// Only stop/disable docker if it's actually running and we want containerd.
+	// Docker may already be stopped or not installed — log but don't fail.
 	if executor.SystemctlIsActive("docker") {
-		_ = executor.Run("systemctl", "stop", "docker")
-		_ = executor.Run("systemctl", "disable", "docker")
+		if err := executor.Run("systemctl", "stop", "docker"); err != nil {
+			executor.Logger.Warnf("failed to stop docker (may already be stopped): %v", err)
+		}
+		if err := executor.Run("systemctl", "disable", "docker"); err != nil {
+			executor.Logger.Warnf("failed to disable docker: %v", err)
+		}
 		changes = append(changes, host.Change{Action: host.ActionOther, Summary: "disable docker in favour of containerd"})
 	}
 
@@ -97,7 +103,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			); err != nil {
 				return nil, fmt.Errorf("extract containerd tarball: %w", err)
 			}
-			configChanged = true
+			tarballExtracted = true
 		}
 	}
 
@@ -122,8 +128,9 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		configChanged = true
 	}
 
-	// Only daemon-reload if config files changed.
-	if configChanged {
+	// Daemon-reload when tarball was extracted (may contain updated service
+	// files) or when config.toml changed.
+	if tarballExtracted || configChanged {
 		_ = executor.Run("systemctl", "daemon-reload")
 	}
 

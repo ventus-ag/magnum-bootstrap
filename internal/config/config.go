@@ -192,6 +192,11 @@ type WorkerConfig struct {
 
 type TriggerConfig struct {
 	CARotationID string `json:"caRotationId"`
+
+	// AppliedCARotationID is set from the previous reconciler state.
+	// When it matches CARotationID, the rotation was already applied
+	// and the operation falls back to normal create/reconcile.
+	AppliedCARotationID string `json:"-"`
 }
 
 func (c Config) Role() Role {
@@ -218,7 +223,8 @@ func (c Config) Operation() Operation {
 		return OperationUpgrade
 	case c.Shared.IsResize:
 		return OperationResize
-	case c.Trigger.CARotationID != "":
+	case c.Trigger.CARotationID != "" &&
+		c.Trigger.CARotationID != c.Trigger.AppliedCARotationID:
 		return OperationCARotate
 	default:
 		return OperationCreate

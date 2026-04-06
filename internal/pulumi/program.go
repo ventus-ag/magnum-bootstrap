@@ -192,15 +192,9 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 				actualReq.Logger.Infof("running phase=%s apply=%t", phase.ID, actualReq.Apply)
 			}
 
-			// Imperative execution: Run() does the actual host operations.
-			phaseResult, err := mod.Run(goCtx, cfg, actualReq)
-			if err != nil {
-				acc.RecordFailure(phase.ID, err)
-				return err
-			}
-			acc.RecordPhase(phase.ID, phaseResult)
-
 			// Build Pulumi DependsOn from the module's declared dependencies.
+			// This is computed before Run() so that Register() can be called
+			// even when Run() fails — keeping the DAG intact for later phases.
 			regOpts := []gopulumi.ResourceOption{gopulumi.Parent(heat)}
 			var deps []gopulumi.Resource
 			for _, depID := range mod.Dependencies() {
@@ -211,6 +205,29 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 			if len(deps) > 0 {
 				regOpts = append(regOpts, gopulumi.DependsOn(deps))
 			}
+
+			// Imperative execution: Run() does the actual host operations.
+			phaseResult, runErr := mod.Run(goCtx, cfg, actualReq)
+			if runErr != nil {
+				acc.RecordFailure(phase.ID, runErr)
+
+				// Still register the component so phaseResources[phase.ID]
+				// is populated and downstream phases retain their dependency
+				// edges in the Pulumi DAG.
+				if phaseRes, regErr := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...); regErr != nil {
+					if actualReq.Logger != nil {
+						actualReq.Logger.Warnf("phase=%s Register() also failed after Run() error: %v", phase.ID, regErr)
+					}
+				} else {
+					phaseResources[phase.ID] = phaseRes
+				}
+
+				if !actualReq.AllowPartial {
+					return runErr
+				}
+				continue
+			}
+			acc.RecordPhase(phase.ID, phaseResult)
 
 			phaseRes, err := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...)
 			if err != nil {

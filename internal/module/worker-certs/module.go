@@ -165,10 +165,16 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Set permissions.
-	_ = executor.Run("chmod", "550", certDir)
-	_ = executor.Run("chmod", "440", certDir+"/kubelet.key")
-	_ = executor.Run("chmod", "440", certDir+"/proxy.key")
+	// Set permissions — chmod MUST succeed, kubelet cannot read certs without correct perms.
+	if err := executor.Run("chmod", "550", certDir); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod cert dir: %w", err)
+	}
+	if err := executor.Run("chmod", "440", certDir+"/kubelet.key"); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod kubelet key: %w", err)
+	}
+	if err := executor.Run("chmod", "440", certDir+"/proxy.key"); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod proxy key: %w", err)
+	}
 
 	// Kubelet and kube-proxy must reload certificate changes on workers.
 	if len(changes) > 0 && req.Restarts != nil {

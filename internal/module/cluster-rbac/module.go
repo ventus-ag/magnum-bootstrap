@@ -175,7 +175,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	caBundle := ""
 	if data, err := os.ReadFile("/etc/kubernetes/ca-bundle.crt"); err == nil {
 		caBundle = base64.StdEncoding.EncodeToString(data)
+	} else if data, err := os.ReadFile("/etc/kubernetes/certs/ca.crt"); err == nil {
+		// Fallback: use the cluster CA cert if the bundle is not yet available.
+		caBundle = base64.StdEncoding.EncodeToString(data)
 	}
+	// If both paths fail, continue with empty CA bundle — certs may not be
+	// generated yet during early cluster creation.
 	_, err = corev1.NewSecret(ctx, name+"-os-trustee", &corev1.SecretArgs{
 		Metadata: mergeMetadata("os-trustee", "kube-system"),
 		StringData: pulumi.StringMap{

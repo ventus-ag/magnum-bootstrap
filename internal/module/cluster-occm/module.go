@@ -123,7 +123,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 					"readOnly":  true,
 				},
 			},
-			"controllerExtraArgs": "- --use-service-account-credentials=false",
+			"controllerExtraArgs": "- --use-service-account-credentials=true",
 			"cluster": map[string]interface{}{
 				"name": cfg.Shared.ClusterUUID,
 			},

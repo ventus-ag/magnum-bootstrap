@@ -228,6 +228,12 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 		return 1
 	}
 
+	// Load previous state early so Operation() can detect already-applied
+	// CA rotations and fall back to normal reconcile instead of re-running
+	// the full ca-rotate plan on every periodic timer tick.
+	previousState, _ := state.Load(runtimePaths.StateFile)
+	cfg.Trigger.AppliedCARotationID = previousState.LastCARotationID
+
 	reconcilePlan := plan.Build(cfg)
 	if f.targetPhase != "" {
 		reconcilePlan = reconcilePlan.FilterToPhase(f.targetPhase)
@@ -257,9 +263,7 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	}
 	logger.Infof("recorded running state runStateFile=%s", runtimePaths.RunStateFile)
 
-	// Load previous successful state to detect actual changes (e.g. KUBE_TAG
-	// changed vs stale IS_UPGRADE=true).
-	previousState, _ := state.Load(runtimePaths.StateFile)
+	// previousState was already loaded above for Operation() detection.
 
 	// Stream Pulumi resource-level diff output only when requested.
 	var eventCh chan events.EngineEvent
