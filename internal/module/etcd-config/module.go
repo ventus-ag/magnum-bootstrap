@@ -87,21 +87,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	lbEndpoint := fmt.Sprintf("%s://%s:2379", protocol, cfg.Master.EtcdLBVIP)
 	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 
-	// Skip expensive endpoint health checks on first create — etcd
-	// hasn't been configured yet so connections always fail, wasting
-	// ~40 seconds on retries.  If a config file exists, etcd was
-	// previously set up and we need to check membership/health for
-	// rejoin decisions.
-	lbOK := false
+	// Always check the LB endpoint — an existing cluster may be running
+	// (e.g. scaling 1→2 masters) even if this node has never had etcd.
+	// Only skip the LOCAL endpoint check when there's no config — local
+	// etcd isn't running so the check just wastes time on retries.
+	lbOK := etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
 	localOK := false
 	isMember := false
 	_, configErr := os.Stat("/etc/etcd/etcd.conf.yaml")
 	if configErr == nil {
-		lbOK = etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
 		localOK = etcdHealthy(executor, localEndpoint, certDir, cfg.Shared.TLSDisabled)
-		if lbOK {
-			isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
-		}
+	}
+	if lbOK {
+		isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
 	}
 	discoveryOK := checkDiscoveryURL(executor, cfg.Master.EtcdDiscoveryURL)
 
@@ -133,7 +131,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		// New cluster via discovery URL.
 		cleanupEtcd(executor)
 		etcdConf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		cs, err := writeAndStartEtcd(executor, etcdConf)
+		cs, err := writeAndStartEtcd(executor, etcdConf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
@@ -391,7 +389,7 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 
 	initialCluster := extractInitialCluster(addOut)
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
-	return writeAndStartEtcd(executor, conf)
+	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
 }
 
 func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
@@ -405,7 +403,7 @@ func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, pro
 
 	initialCluster := extractInitialCluster(addOut)
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
-	return writeAndStartEtcd(executor, conf)
+	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
 }
 
 func cleanupEtcd(executor *host.Executor) {
@@ -498,7 +496,7 @@ func extractMasterIndex(memberLine string) int {
 	return n
 }
 
-func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, error) {
+func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDir string, tlsDisabled bool) ([]host.Change, error) {
 	change, err := executor.EnsureDir("/etc/etcd", 0o755)
 	if err != nil {
 		return nil, err
@@ -540,17 +538,15 @@ func writeAndStartEtcd(executor *host.Executor, config string) ([]host.Change, e
 	// take significant time.  Without this wait, downstream phases
 	// (kube-apiserver, controller-manager) fail because etcd isn't ready.
 	//
-	// Use the HTTP loopback listener (http://127.0.0.1:2379) which is
-	// always configured without TLS, avoiding cert mismatch issues
-	// during initial cluster formation.
+	// Use the proper protocol endpoint with TLS certs (matching the bash
+	// script).  The HTTP loopback (http://127.0.0.1:2379) cannot be used
+	// because etcd's client-transport-security with client-cert-auth
+	// enforces TLS on all client listeners.
 	if started && executor.Apply {
 		healthy := false
+		localEP := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 		for i := 0; i < 60; i++ {
-			args := []string{"ETCDCTL_API=3", "/usr/local/bin/etcdctl",
-				"--endpoints=http://127.0.0.1:2379", "--command-timeout=5s",
-				"endpoint", "health"}
-			_, err := executor.RunCapture("env", args...)
-			if err == nil {
+			if etcdHealthy(executor, localEP, certDir, tlsDisabled) {
 				healthy = true
 				break
 			}
