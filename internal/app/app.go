@@ -269,7 +269,7 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	var eventCh chan events.EngineEvent
 	done := make(chan struct{})
 	if f.diff || f.debug {
-		eventCh = make(chan events.EngineEvent, 100)
+		eventCh = make(chan events.EngineEvent, 1000)
 		go func() {
 			renderer.StreamEvents(eventCh)
 			close(done)

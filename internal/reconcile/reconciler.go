@@ -80,14 +80,20 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		envVars["PULUMI_BACKEND_URL"] = runtimePaths.PulumiBackend
 	}
 
-	stack, err := auto.UpsertStackInlineSource(ctx,
-		cfg.StackName(),
-		"magnum-bootstrap",
-		program,
+	// Try to select the existing stack first — avoids recreating stack
+	// metadata on every run.  Fall back to upsert if the stack doesn't
+	// exist yet (first run on a new node).
+	stackOpts := []auto.LocalWorkspaceOption{
 		auto.Pulumi(pulumiCmd),
 		auto.WorkDir(workspaceDir),
 		auto.EnvVars(envVars),
-	)
+	}
+	stack, err := auto.SelectStackInlineSource(ctx,
+		cfg.StackName(), "magnum-bootstrap", program, stackOpts...)
+	if err != nil {
+		stack, err = auto.UpsertStackInlineSource(ctx,
+			cfg.StackName(), "magnum-bootstrap", program, stackOpts...)
+	}
 	if err != nil {
 		return result.Result{}, state.State{}, fmt.Errorf("failed to initialize pulumi stack: %w", err)
 	}
@@ -143,7 +149,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	}
 
 	if parallelism < 1 {
-		parallelism = 10
+		parallelism = 50
 	}
 
 	previewPlanText := ""
