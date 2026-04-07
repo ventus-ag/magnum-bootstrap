@@ -77,6 +77,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			"shareProtocols": []interface{}{
 				map[string]interface{}{
 					"protocolSelector": "NFS",
+					"fsGroupPolicy":    "None",
 					"fwdNodePluginEndpoint": map[string]interface{}{
 						"dir":      "/var/lib/kubelet/plugins/csi-nfsplugin",
 						"sockFile": "csi.sock",
