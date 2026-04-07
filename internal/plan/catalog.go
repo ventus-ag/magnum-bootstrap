@@ -12,7 +12,6 @@ package plan
 func masterPhases() []Phase {
 	return []Phase{
 		newPhase("prereq-validation", "validate desired master input and prerequisites", false),
-		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 		newPhase("ca-rotation", "rotate cluster CA material if rotation ID changed", true),
 		newPhase("container-runtime", "reconcile the container runtime to desired state", true),
 		newPhase("client-tools", "reconcile kubernetes client binaries", false),
@@ -39,6 +38,7 @@ func masterPhases() []Phase {
 		newPhase("cluster-auto-healer", "reconcile node problem detector and auto-healer", false),
 		newPhase("cluster-autoscaler", "reconcile cluster autoscaler via Helm", false),
 		newPhase("cluster-health", "verify cluster pods are healthy, restart crashlooping pods", false),
+		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 	}
 }
 
@@ -46,7 +46,6 @@ func masterPhases() []Phase {
 func workerPhases() []Phase {
 	return []Phase{
 		newPhase("prereq-validation", "validate desired worker input and prerequisites", false),
-		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 		newPhase("ca-rotation", "rotate cluster CA material if rotation ID changed", true),
 		newPhase("container-runtime", "reconcile the container runtime to desired state", true),
 		newPhase("client-tools", "reconcile kubernetes client binaries", false),
@@ -61,5 +60,6 @@ func workerPhases() []Phase {
 		newPhase("services", "reconcile worker services to desired state", true),
 		newPhase("start-services", "uncordon node after disruptive changes (upgrade/resize only)", true),
 		newPhase("health", "verify worker health after reconciliation", false),
+		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 	}
 }
