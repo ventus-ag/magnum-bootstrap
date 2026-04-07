@@ -6,7 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
-	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -16,7 +16,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cluster-occm" }
+func (Module) PhaseID() string        { return "cluster-occm" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -133,7 +133,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 					"readOnly":  true,
 				},
 			},
-			"controllerExtraArgs": "- --use-service-account-credentials=true",
+			"controllerExtraArgs": "- --use-service-account-credentials=false",
 			"cluster": map[string]interface{}{
 				"name": cfg.Shared.ClusterUUID,
 			},

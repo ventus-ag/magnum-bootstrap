@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -19,11 +18,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string      { return "cluster-health" }
+func (Module) PhaseID() string        { return "cluster-health" }
 func (Module) Dependencies() []string { return []string{"cluster-autoscaler"} }
-
-// namespacesToCheck lists the namespaces scanned for crashlooping pods.
-var namespacesToCheck = []string{"kube-system", "kube-flannel"}
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() {
@@ -34,37 +30,26 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	kubectl := "/srv/magnum/bin/kubectl"
 	kubeconfig := "/etc/kubernetes/admin.conf"
 
+	pods, err := allCrashLoopPods(executor, kubectl, kubeconfig)
+	if err != nil {
+		return moduleapi.Result{
+			Warnings: []string{fmt.Sprintf("failed to scan for crashlooping pods: %v", err)},
+		}, nil
+	}
+
 	var deleted []string
 	var warnings []string
 
-	for _, ns := range namespacesToCheck {
-		pods, err := crashLoopPods(executor, kubectl, kubeconfig, ns)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("failed to list pods in %s: %v", ns, err))
-			continue
-		}
-		for _, pod := range pods {
-			if req.Apply {
-				if err := executor.Run(kubectl, "--kubeconfig="+kubeconfig, "delete", "pod", pod, "-n", ns); err != nil {
-					warnings = append(warnings, fmt.Sprintf("failed to delete pod %s/%s: %v", ns, pod, err))
-					continue
-				}
-			}
-			deleted = append(deleted, ns+"/"+pod)
-			if req.Logger != nil {
-				req.Logger.Infof("cluster-health: deleted crashlooping pod %s/%s", ns, pod)
+	for _, pod := range pods {
+		if req.Apply {
+			if err := executor.Run(kubectl, "--kubeconfig="+kubeconfig, "delete", "pod", pod.name, "-n", pod.namespace, "--wait=false"); err != nil {
+				warnings = append(warnings, fmt.Sprintf("failed to delete pod %s/%s: %v", pod.namespace, pod.name, err))
+				continue
 			}
 		}
-	}
-
-	// Brief wait for deleted pods to be recreated, then verify no crashloops remain.
-	if req.Apply && len(deleted) > 0 {
-		time.Sleep(15 * time.Second)
-		for _, ns := range namespacesToCheck {
-			remaining, _ := crashLoopPods(executor, kubectl, kubeconfig, ns)
-			for _, pod := range remaining {
-				warnings = append(warnings, fmt.Sprintf("pod %s/%s still crashlooping after restart", ns, pod))
-			}
+		deleted = append(deleted, pod.namespace+"/"+pod.name)
+		if req.Logger != nil {
+			req.Logger.Infof("cluster-health: deleted crashlooping pod %s/%s", pod.namespace, pod.name)
 		}
 	}
 
@@ -81,35 +66,37 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	return res, nil
 }
 
-// crashLoopPods returns pod names that have crashlooping containers within the
-// given namespace.  It detects both pods currently in CrashLoopBackOff/Error
-// waiting state AND pods that are momentarily Running between crash cycles
-// (high restart count with a recent terminated error).
-func crashLoopPods(executor *host.Executor, kubectl, kubeconfig, namespace string) ([]string, error) {
-	// For each container we collect: waitingReason, lastTerminatedReason, restartCount.
+type podRef struct {
+	namespace string
+	name      string
+}
+
+// allCrashLoopPods scans all namespaces for pods with crashlooping containers.
+func allCrashLoopPods(executor *host.Executor, kubectl, kubeconfig string) ([]podRef, error) {
 	out, err := executor.RunCapture(
 		kubectl, "--kubeconfig="+kubeconfig,
-		"get", "pods", "-n", namespace,
+		"get", "pods", "--all-namespaces",
 		"--field-selector=status.phase!=Succeeded",
-		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{"|"}{.lastState.terminated.reason}{"|"}{.restartCount}{" "}{end}{"\n"}{end}`,
+		"-o", `jsonpath={range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{"|"}{.lastState.terminated.reason}{"|"}{.restartCount}{" "}{end}{"\n"}{end}`,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	var pods []string
+	var pods []podRef
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
 			continue
 		}
-		podName := parts[0]
-		containers := parts[1]
+		ns := parts[0]
+		name := parts[1]
+		containers := parts[2]
 		if isCrashLooping(containers) {
-			pods = append(pods, podName)
+			pods = append(pods, podRef{namespace: ns, name: name})
 		}
 	}
 	return pods, nil
@@ -171,7 +158,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
-		"namespaces": pulumi.String(strings.Join(namespacesToCheck, ",")),
+		"scope": pulumi.String("all-namespaces"),
 	}); err != nil {
 		return nil, err
 	}
