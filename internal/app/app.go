@@ -265,18 +265,14 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 
 	// previousState was already loaded above for Operation() detection.
 
-	// Stream Pulumi resource-level diff output only when requested.
-	var eventCh chan events.EngineEvent
+	// Always stream Pulumi resource-level events so create/update/delete
+	// operations are visible. The --diff flag controls property-level diffs.
+	eventCh := make(chan events.EngineEvent, 5000)
 	done := make(chan struct{})
-	if f.diff || f.debug {
-		eventCh = make(chan events.EngineEvent, 1000)
-		go func() {
-			renderer.StreamEvents(eventCh)
-			close(done)
-		}()
-	} else {
+	go func() {
+		renderer.StreamEvents(eventCh)
 		close(done)
-	}
+	}()
 
 	runResult, reconcileState, err := reconcile.Run(ctx, mode, f.diff, f.refresh, f.debug, f.parallelism, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
 		Apply:                mode != "preview",

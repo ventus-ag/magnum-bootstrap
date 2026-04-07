@@ -18,6 +18,7 @@ type Result struct {
 	Changed          []string          `json:"changed,omitempty"`
 	Operations       []host.Change     `json:"operations,omitempty"`
 	PreviewPlan      string            `json:"previewPlan,omitempty"`
+	PulumiSummary    string            `json:"pulumiSummary,omitempty"`
 	Warnings         []string          `json:"warnings,omitempty"`
 	ErrorCode        string            `json:"errorCode,omitempty"`
 	Details          map[string]string `json:"details,omitempty"`

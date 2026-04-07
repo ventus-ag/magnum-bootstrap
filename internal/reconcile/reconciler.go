@@ -99,6 +99,13 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	}
 
 	progressWriters, errorProgressWriters := pulumiProgressWriters(req.Logger, debugEnabled)
+	// When diff mode is enabled, also capture Pulumi stdout so the preview
+	// plan text (resource-level create/update/delete summary) is available.
+	var diffBuf *strings.Builder
+	if diff && !debugEnabled {
+		diffBuf = &strings.Builder{}
+		progressWriters = []io.Writer{diffBuf}
+	}
 	pulumiDebugOpts := pulumiDebugLogging(debugEnabled)
 
 	if refresh {
@@ -153,6 +160,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	}
 
 	previewPlanText := ""
+	pulumiSummaryText := ""
 
 	switch mode {
 	case "preview":
@@ -163,7 +171,6 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "preview", cfg.StackName(), start)
 		previewOpts := []optpreview.Option{
 			optpreview.Parallel(parallelism),
-			optpreview.SuppressProgress(),
 			optpreview.ProgressStreams(progressWriters...),
 			optpreview.ErrorProgressStreams(errorProgressWriters...),
 		}
@@ -178,13 +185,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		var previewRes auto.PreviewResult
 		var err error
-		if eventCh == nil {
-			previewRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "preview", func() (auto.PreviewResult, error) {
-				return stack.Preview(ctx, previewOpts...)
-			})
-		} else {
-			previewRes, err = stack.Preview(ctx, previewOpts...)
-		}
+		previewRes, err = stack.Preview(ctx, previewOpts...)
 		stopHeartbeat()
 		if err != nil {
 			if req.Logger != nil {
@@ -198,7 +199,13 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		if diff {
 			previewPlanText = strings.TrimSpace(previewRes.StdOut)
+			// StdOut may be empty when SuppressProgress is active.
+			// Fall back to the captured buffer.
+			if previewPlanText == "" && diffBuf != nil {
+				previewPlanText = strings.TrimSpace(diffBuf.String())
+			}
 		}
+		pulumiSummaryText = formatPreviewSummaryLine(previewRes.ChangeSummary)
 
 	case "up":
 		start := time.Now()
@@ -208,7 +215,6 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "up", cfg.StackName(), start)
 		upOpts := []optup.Option{
 			optup.Parallel(parallelism),
-			optup.SuppressProgress(),
 			optup.ProgressStreams(progressWriters...),
 			optup.ErrorProgressStreams(errorProgressWriters...),
 		}
@@ -223,13 +229,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		var upRes auto.UpResult
 		var err error
-		if eventCh == nil {
-			upRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "up", func() (auto.UpResult, error) {
-				return stack.Up(ctx, upOpts...)
-			})
-		} else {
-			upRes, err = stack.Up(ctx, upOpts...)
-		}
+		upRes, err = stack.Up(ctx, upOpts...)
 		stopHeartbeat()
 		if err != nil {
 			if req.Logger != nil {
@@ -241,6 +241,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
 				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(upRes.Summary.ResourceChanges))
 		}
+		pulumiSummaryText = formatUpdateSummaryLine(upRes.Summary.ResourceChanges)
 
 	default:
 		return result.Result{}, state.State{}, fmt.Errorf("unknown reconcile mode: %s", mode)
@@ -271,6 +272,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	if mode == "preview" {
 		res.PreviewPlan = previewPlanText
 	}
+	res.PulumiSummary = pulumiSummaryText
 	return res, reconcileState, nil
 }
 
@@ -493,6 +495,63 @@ func effectiveCARotationStateID(cfg config.Config, previousID string) string {
 		return currentID
 	}
 	return previousID
+}
+
+// formatPreviewSummaryLine builds a one-line summary from a preview change map:
+//
+//	"Pulumi: 3 to create, 1 to update, 2 to delete, 34 unchanged"
+func formatPreviewSummaryLine(summary map[apitype.OpType]int) string {
+	if len(summary) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if n := summary[apitype.OpCreate]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d to create", n))
+	}
+	if n := summary[apitype.OpUpdate]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d to update", n))
+	}
+	if n := summary[apitype.OpDelete]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d to delete", n))
+	}
+	if n := summary[apitype.OpReplace]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d to replace", n))
+	}
+	if n := summary[apitype.OpSame]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d unchanged", n))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Pulumi: " + strings.Join(parts, ", ")
+}
+
+// formatUpdateSummaryLine builds a one-line summary from an up result change map.
+func formatUpdateSummaryLine(summary *map[string]int) string {
+	if summary == nil || len(*summary) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	m := *summary
+	if n := m["create"]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d created", n))
+	}
+	if n := m["update"]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d updated", n))
+	}
+	if n := m["delete"]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d deleted", n))
+	}
+	if n := m["replace"]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d replaced", n))
+	}
+	if n := m["same"]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d unchanged", n))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Pulumi: " + strings.Join(parts, ", ")
 }
 
 // truncateError trims a Pulumi error to a reasonable length for Heat signals.

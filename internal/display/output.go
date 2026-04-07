@@ -271,9 +271,19 @@ func (r *Renderer) PrintResult(res result.Result) {
 		return
 	}
 	r.printPreviewPlan(res.PreviewPlan)
+	r.printPulumiSummary(res.PulumiSummary)
 	r.printOperations(res.Operations)
 	r.printWarnings(res.Warnings)
 	r.printSummary(res)
+}
+
+func (r *Renderer) printPulumiSummary(summary string) {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return
+	}
+	fmt.Fprintln(r.writer)
+	fmt.Fprintln(r.writer, r.colorize(summary, colorCyan))
 }
 
 func (r *Renderer) printPreviewPlan(plan string) {
