@@ -35,19 +35,21 @@ type pulumiEvent struct {
 }
 
 type Renderer struct {
-	writer     io.Writer
-	enableANSI bool
-	debug      bool
-	prePrinted map[string]bool
-	collected  []pulumiEvent
+	writer       io.Writer
+	enableANSI   bool
+	debug        bool
+	prePrinted   map[string]bool
+	collected    []pulumiEvent
+	collectedSet map[string]bool // dedup by URN+op
 }
 
 func NewRenderer(writer io.Writer, debug bool) *Renderer {
 	return &Renderer{
-		writer:     writer,
-		enableANSI: supportsColor(writer),
-		debug:      debug,
-		prePrinted: make(map[string]bool),
+		writer:       writer,
+		enableANSI:   supportsColor(writer),
+		debug:        debug,
+		prePrinted:   make(map[string]bool),
+		collectedSet: make(map[string]bool),
 	}
 }
 
@@ -77,12 +79,7 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 				continue
 			}
 			r.markPrePrinted(meta)
-			r.collected = append(r.collected, pulumiEvent{
-				op:       op,
-				resType:  string(meta.Type),
-				detailed: meta.DetailedDiff,
-				meta:     meta,
-			})
+			r.collectEvent(op, meta)
 
 		case ev.EngineEvent.ResOutputsEvent != nil:
 			meta := ev.EngineEvent.ResOutputsEvent.Metadata
@@ -97,12 +94,7 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			if r.consumePrePrinted(meta) {
 				continue
 			}
-			r.collected = append(r.collected, pulumiEvent{
-				op:       op,
-				resType:  string(meta.Type),
-				detailed: meta.DetailedDiff,
-				meta:     meta,
-			})
+			r.collectEvent(op, meta)
 
 		case ev.EngineEvent.DiagnosticEvent != nil:
 			diag := ev.EngineEvent.DiagnosticEvent
@@ -278,6 +270,21 @@ func (r *Renderer) PrintResult(res result.Result) {
 	r.printOperations(res.Operations)
 	r.printWarnings(res.Warnings)
 	r.printSummary(res)
+}
+
+// collectEvent appends a Pulumi event, deduplicating by URN+op.
+func (r *Renderer) collectEvent(op string, meta apitype.StepEventMetadata) {
+	key := fmt.Sprintf("%s|%s", meta.URN, op)
+	if r.collectedSet[key] {
+		return
+	}
+	r.collectedSet[key] = true
+	r.collected = append(r.collected, pulumiEvent{
+		op:       op,
+		resType:  string(meta.Type),
+		detailed: meta.DetailedDiff,
+		meta:     meta,
+	})
 }
 
 // printCollectedEvents renders Pulumi resource events that were collected
