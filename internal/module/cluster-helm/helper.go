@@ -62,8 +62,15 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	adopted := adoptedMarkerPath(namespace, releaseName)
 	importing := importMarkerPath(namespace, releaseName)
 
-	// Already adopted by Pulumi → skip.
+	// Already adopted by Pulumi. Still check for stale releases left behind
+	// by a previous Pulumi up that crashed after Helm install but before
+	// state was saved — the release exists in Helm but not in Pulumi state.
 	if _, err := os.Stat(adopted); err == nil {
+		if _, helmErr := executor.RunCapture("helm", "status", releaseName, "-n", namespace); helmErr == nil {
+			// Release exists despite adopted marker — uninstall the stale
+			// copy so Pulumi can create a fresh managed release.
+			_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace, "--no-hooks")
+		}
 		return
 	}
 
@@ -154,6 +161,11 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 		CreateNamespace: pulumi.Bool(true),
 		SkipAwait:       pulumi.BoolPtr(true),
 		WaitForJobs:     pulumi.BoolPtr(false),
+		// Replace handles the case where a Helm release exists but Pulumi
+		// state doesn't know about it (e.g. previous up crashed after Helm
+		// install but before state was saved). Without this, Helm rejects
+		// the install with "cannot re-use a name that is still in use".
+		Replace: pulumi.BoolPtr(true),
 		RepositoryOpts: &helmv3.RepositoryOptsArgs{
 			Repo: pulumi.String(args.RepoURL),
 		},
