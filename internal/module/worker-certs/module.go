@@ -225,6 +225,16 @@ func parseSANIPs(values []string) []net.IP {
 	return ips
 }
 
+// Destroy removes all certificate files from the kubernetes cert directory.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("worker-certificates destroy: removing all files in /etc/kubernetes/certs/")
+	}
+	_ = os.RemoveAll("/etc/kubernetes/certs/")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

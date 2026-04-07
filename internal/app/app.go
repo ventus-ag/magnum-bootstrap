@@ -62,6 +62,7 @@ func buildRoot(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.
 	root.AddCommand(newUpCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newRunOnceCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newRunPeriodicCmd(ctx, code, stdout, stderr))
+	root.AddCommand(newDestroyCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newCancelCmd(ctx, code, stdout, stderr))
 	root.AddCommand(newValidateInputCmd(code, stdout, stderr))
 	root.AddCommand(newPrintLastResultCmd(code, stdout, stderr))
@@ -139,6 +140,76 @@ func newRunPeriodicCmd(ctx context.Context, code *int, stdout, stderr io.Writer)
 	}
 	addRunFlags(cmd, &f, true)
 	return cmd
+}
+
+func newDestroyCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.Command {
+	var heatParamsFile string
+	var backendURL string
+	cmd := &cobra.Command{
+		Use:   "destroy",
+		Short: "Destroy all Pulumi-managed resources and run module cleanup",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*code = runDestroy(ctx, heatParamsFile, backendURL, stdout, stderr)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&heatParamsFile, "heat-params-file", "", "override heat-params file path")
+	cmd.Flags().StringVar(&backendURL, "backend-url", "", "override Pulumi backend URL")
+	return cmd
+}
+
+func runDestroy(ctx context.Context, heatParamsFileOverride, backendURLOverride string, stdout, stderr io.Writer) int {
+	runtimePaths := paths.LoadFromEnv()
+	if backendURLOverride != "" {
+		runtimePaths.PulumiBackend = backendURLOverride
+	}
+	if heatParamsFileOverride != "" {
+		runtimePaths.HeatParamsFile = heatParamsFileOverride
+	}
+
+	renderer := display.NewRenderer(stdout, false)
+
+	logger, err := logging.New(runtimePaths.LogFile, stderr, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "failed to initialize log: %v\n", err)
+		return 1
+	}
+	defer logger.Close()
+
+	cfg, err := config.Load(runtimePaths.HeatParamsFile)
+	if err != nil {
+		logger.Errorf("failed to load heat params: %v", err)
+		fmt.Fprintf(stderr, "failed to load heat params: %v\n", err)
+		return 1
+	}
+
+	reconcilePlan := plan.Build(cfg)
+	logger.Infof("starting destroy instance=%s role=%s stack=%s", cfg.Shared.InstanceName, cfg.Role(), cfg.StackName())
+
+	eventCh := make(chan events.EngineEvent, 5000)
+	done := make(chan struct{})
+	go func() {
+		renderer.StreamEvents(eventCh)
+		close(done)
+	}()
+
+	destroyResult, err := reconcile.Destroy(ctx, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
+		Apply:  true,
+		Logger: logger,
+		Paths:  runtimePaths,
+	}, eventCh)
+	safeCloseEngineEvents(eventCh)
+	<-done
+
+	renderer.PrintResult(destroyResult)
+
+	if err != nil {
+		logger.Errorf("destroy failed: %v", err)
+		return 1
+	}
+
+	logger.Infof("destroy completed summary=%s", destroyResult.Summary)
+	return 0
 }
 
 func newValidateInputCmd(code *int, stdout, stderr io.Writer) *cobra.Command {

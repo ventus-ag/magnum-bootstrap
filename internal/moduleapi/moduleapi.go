@@ -165,6 +165,7 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		// state between runs and show meaningful plan output.
 		"cloudProviderEnabled":  pulumi.Bool(cfg.Shared.CloudProviderEnabled),
 		"metricsServerEnabled":  pulumi.Bool(cfg.Shared.MetricsServerEnabled),
+		"npdEnabled":            pulumi.Bool(cfg.Shared.NPDEnabled),
 		"autoHealingEnabled":    pulumi.Bool(cfg.Shared.AutoHealingEnabled),
 		"autoScalingEnabled":    pulumi.Bool(cfg.Shared.AutoScalingEnabled),
 		"cinderCsiPluginEnabled": pulumi.Bool(cfg.Shared.CinderCSIPluginEnabled),
@@ -226,4 +227,13 @@ type Module interface {
 	// dependency edge so the state JSON records which config inputs drove
 	// each phase and Pulumi can diff them between runs.
 	Register(ctx *pulumi.Context, name string, heat *HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error)
+}
+
+// Destroyer is an optional interface that modules can implement to provide
+// cleanup logic during bootstrap destroy. After Pulumi stack.Destroy()
+// removes K8s resources, modules implementing Destroyer get their Destroy()
+// called in reverse phase order to clean up host-level state (stop services,
+// remove data directories, remove cluster membership, etc.).
+type Destroyer interface {
+	Destroy(ctx context.Context, cfg config.Config, req Request) error
 }

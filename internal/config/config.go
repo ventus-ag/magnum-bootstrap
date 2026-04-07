@@ -149,10 +149,13 @@ type SharedConfig struct {
 	MetricsServerEnabled  bool   `json:"metricsServerEnabled"`
 	MetricsServerChartTag string `json:"metricsServerChartTag"`
 
-	// Auto-healing
+	// NPD (Node Problem Detector)
+	NPDEnabled  bool   `json:"npdEnabled"`
+	NPDChartTag string `json:"npdChartTag"`
+
+	// Auto-healing (magnum-auto-healer)
 	AutoHealingEnabled    bool   `json:"autoHealingEnabled"`
 	AutoHealingController string `json:"autoHealingController"`
-	NPDChartTag           string `json:"npdChartTag"`
 
 	// Auto-scaling
 	AutoScalingEnabled   bool   `json:"autoScalingEnabled"`

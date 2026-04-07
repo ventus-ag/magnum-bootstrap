@@ -2,6 +2,7 @@ package certapimanager
 
 import (
 	"context"
+	"os"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -50,6 +51,16 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		Changes: changes,
 		Outputs: map[string]string{"certManagerApi": "true"},
 	}, nil
+}
+
+// Destroy removes the CA private key.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("cert-api-manager destroy: removing /etc/kubernetes/certs/ca.key")
+	}
+	_ = os.Remove("/etc/kubernetes/certs/ca.key")
+
+	return nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

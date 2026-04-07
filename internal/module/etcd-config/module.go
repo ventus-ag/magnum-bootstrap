@@ -687,6 +687,62 @@ func extractInitialCluster(addOutput string) string {
 	return ""
 }
 
+// Destroy removes this node from the etcd cluster and stops the etcd service.
+// Called during bootstrap destroy in reverse phase order.
+func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Request) error {
+	if cfg.Master == nil {
+		return nil // not a master, nothing to do
+	}
+
+	executor := host.NewExecutor(req.Apply, req.Logger)
+	nodeIP := cfg.ResolveNodeIP()
+	certDir := "/etc/kubernetes"
+
+	protocol := "https"
+	if cfg.Shared.TLSDisabled {
+		protocol = "http"
+	}
+
+	// Try to remove self from etcd cluster via the LB endpoint.
+	lbEndpoint := fmt.Sprintf("%s://%s:2379", protocol, cfg.Master.EtcdLBVIP)
+	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+	out, err := runEtcdctl(executor, append(args, "member", "list")...)
+	if err != nil {
+		if req.Logger != nil {
+			req.Logger.Warnf("etcd destroy: member list failed: %v (etcd may already be down)", err)
+		}
+	} else {
+		// Find our member ID and remove ourselves.
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, cfg.Shared.InstanceName) || strings.Contains(line, nodeIP) {
+				parts := strings.SplitN(line, ",", 2)
+				if len(parts) > 0 {
+					memberID := strings.TrimSpace(parts[0])
+					if req.Logger != nil {
+						req.Logger.Infof("etcd destroy: removing member=%s from cluster", memberID)
+					}
+					removeArgs := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+					_, _ = runEtcdctl(executor, append(removeArgs, "member", "remove", memberID)...)
+				}
+				break
+			}
+		}
+	}
+
+	// Stop etcd service.
+	_ = executor.Run("systemctl", "stop", "etcd")
+	_ = executor.Run("systemctl", "disable", "etcd")
+
+	// Clean etcd data directory.
+	etcdDataDir := "/var/lib/etcd"
+	if req.Logger != nil {
+		req.Logger.Infof("etcd destroy: cleaning data dir=%s", etcdDataDir)
+	}
+	_ = executor.Run("rm", "-rf", etcdDataDir)
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

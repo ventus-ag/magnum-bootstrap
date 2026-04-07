@@ -13,6 +13,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/auto"
 	autodebug "github.com/pulumi/pulumi/sdk/v3/go/auto/debug"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
+	"github.com/pulumi/pulumi/sdk/v3/go/auto/optdestroy"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optpreview"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optrefresh"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optup"
@@ -295,6 +296,118 @@ func extractFailureResult(acc *pulumipkg.RunAccumulator, mode string, cfg config
 			"logFile": runtimePaths.LogFile,
 		},
 	}, attemptedState(cfg, req, reconcilePlan), runErr
+}
+
+// Destroy removes all Pulumi-managed resources (K8s resources, Helm releases)
+// and then runs module-level Destroy() for modules that implement Destroyer
+// (e.g., etcd removes cluster membership and cleans data directories).
+func Destroy(ctx context.Context, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, error) {
+	workspaceDir := filepath.Join(runtimePaths.PulumiStateDir, "workspace")
+	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
+		return result.Result{}, fmt.Errorf("failed to create pulumi workspace dir: %w", err)
+	}
+
+	pulumiRoot := filepath.Join(runtimePaths.PulumiStateDir, "cli")
+	pulumiCmd, err := auto.InstallPulumiCommand(ctx, &auto.PulumiCommandOptions{
+		Root: pulumiRoot,
+	})
+	if err != nil {
+		return result.Result{}, fmt.Errorf("failed to install pulumi cli: %w", err)
+	}
+
+	envVars := map[string]string{
+		"PULUMI_CONFIG_PASSPHRASE": "",
+	}
+	if runtimePaths.PulumiBackend != "" {
+		envVars["PULUMI_BACKEND_URL"] = runtimePaths.PulumiBackend
+	}
+
+	// We need a program function for SelectStackInlineSource even though
+	// destroy doesn't run it. Use the normal program so the stack can be found.
+	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, "destroy", false, runtimePaths.HeatParamsFile)
+	acc := pulumipkg.NewRunAccumulator()
+	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc)
+
+	stackOpts := []auto.LocalWorkspaceOption{
+		auto.Pulumi(pulumiCmd),
+		auto.WorkDir(workspaceDir),
+		auto.EnvVars(envVars),
+	}
+	stack, err := auto.SelectStackInlineSource(ctx,
+		cfg.StackName(), "magnum-bootstrap", program, stackOpts...)
+	if err != nil {
+		return result.Result{
+			Status:  "failed",
+			Step:    "destroy",
+			Summary: fmt.Sprintf("stack not found: %v", err),
+		}, fmt.Errorf("stack not found (nothing to destroy?): %w", err)
+	}
+
+	// Destroy all Pulumi-managed resources (Helm releases, K8s resources).
+	if req.Logger != nil {
+		req.Logger.Infof("destroying pulumi stack stack=%s", cfg.StackName())
+	}
+	start := time.Now()
+	destroyOpts := []optdestroy.Option{
+		optdestroy.ProgressStreams(io.Discard),
+		optdestroy.ErrorProgressStreams(io.Discard),
+	}
+	if eventCh != nil {
+		destroyOpts = append(destroyOpts, optdestroy.EventStreams(eventCh))
+	}
+
+	destroyRes, err := stack.Destroy(ctx, destroyOpts...)
+	if err != nil {
+		if req.Logger != nil {
+			req.Logger.Errorf("pulumi destroy failed stack=%s duration=%s err=%v",
+				cfg.StackName(), formatDuration(time.Since(start)), err)
+		}
+		return result.Result{
+			Status:    "failed",
+			Step:      "destroy",
+			Summary:   fmt.Sprintf("pulumi destroy failed: %v", truncateError(err.Error(), 300)),
+			ErrorCode: "destroy_failed",
+		}, err
+	}
+
+	pulumiSummary := formatUpdateSummaryLine(destroyRes.Summary.ResourceChanges)
+	if req.Logger != nil {
+		req.Logger.Infof("pulumi destroy completed stack=%s duration=%s changes=%s",
+			cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(destroyRes.Summary.ResourceChanges))
+	}
+
+	// Run module-level Destroy() for modules implementing Destroyer.
+	// Execute in reverse phase order so dependents clean up before dependencies.
+	registry := module.BuildRegistry(cfg)
+	var warnings []string
+	for i := len(reconcilePlan.Phases) - 1; i >= 0; i-- {
+		phase := reconcilePlan.Phases[i]
+		mod, ok := registry[phase.ID]
+		if !ok {
+			continue
+		}
+		destroyer, ok := mod.(moduleapi.Destroyer)
+		if !ok {
+			continue
+		}
+		if req.Logger != nil {
+			req.Logger.Infof("destroying phase=%s", phase.ID)
+		}
+		if err := destroyer.Destroy(ctx, cfg, req); err != nil {
+			if req.Logger != nil {
+				req.Logger.Warnf("phase=%s destroy failed: %v", phase.ID, err)
+			}
+			warnings = append(warnings, fmt.Sprintf("phase %s destroy: %v", phase.ID, err))
+		}
+	}
+
+	return result.Result{
+		Status:        "succeeded",
+		Step:          "destroy",
+		Summary:       fmt.Sprintf("destroyed stack %s", cfg.StackName()),
+		PulumiSummary: pulumiSummary,
+		Warnings:      warnings,
+	}, nil
 }
 
 func buildSuccessResult(mode string, _ bool, cfg config.Config, _ paths.Paths, reconcilePlan plan.Plan, phaseChanges []string, changeLog []host.Change, warnings []string, _ map[string]string, missing []string) result.Result {

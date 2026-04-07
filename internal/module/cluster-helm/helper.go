@@ -22,49 +22,91 @@ func SkipResult() (moduleapi.Result, error) {
 // RunNoop is a standard Run implementation for Helm-based addons that only
 // need Pulumi Register.
 // releaseName and namespace identify the Helm release to adopt — if it already
-// exists (from legacy bash scripts), it is uninstalled first so Pulumi can
-// create a fresh managed release.
+// exists (from legacy bash scripts), it is prepared for Pulumi import.
 func RunNoop(_ context.Context, cfg config.Config, req moduleapi.Request, featureEnabled bool, releaseName, namespace string) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() || !featureEnabled {
 		return SkipResult()
 	}
-	if req.Apply {
-		// Adopt existing Helm release: uninstall the old release so Pulumi
-		// can create a managed one. This handles migration from bash scripts
-		// that installed charts via `helm install`.
-		if releaseName != "" {
-			executor := host.NewExecutor(req.Apply, req.Logger)
-			AdoptHelmRelease(executor, releaseName, namespace)
-		}
+	if req.Apply && releaseName != "" {
+		executor := host.NewExecutor(req.Apply, req.Logger)
+		AdoptHelmRelease(executor, releaseName, namespace)
 	}
 	return moduleapi.Result{
 		Outputs: map[string]string{"firstMaster": "true"},
 	}, nil
 }
 
-// AdoptHelmRelease checks if a Helm release exists but is NOT yet managed by
-// Pulumi (i.e. from legacy bash scripts). If so, it uninstalls it so Pulumi
-// can create a fresh managed release. On subsequent runs where Pulumi already
-// manages the release, this is a no-op (the marker file prevents re-uninstall).
-func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
-	markerFile := fmt.Sprintf("/var/lib/magnum/helm-adopted-%s-%s", namespace, releaseName)
+// adoptedMarkerPath returns the path for the "already adopted" marker file.
+func adoptedMarkerPath(namespace, releaseName string) string {
+	return fmt.Sprintf("/var/lib/magnum/helm-adopted-%s-%s", namespace, releaseName)
+}
 
-	// If marker exists, Pulumi already adopted this release — skip.
-	if _, err := os.Stat(markerFile); err == nil {
+// importMarkerPath returns the path for the "needs import" marker file.
+func importMarkerPath(namespace, releaseName string) string {
+	return fmt.Sprintf("/var/lib/magnum/helm-import-%s-%s", namespace, releaseName)
+}
+
+// AdoptHelmRelease prepares a legacy Helm release for Pulumi adoption.
+//
+// On first migration run:
+//   - If the release exists in Helm but not yet managed by Pulumi, writes an
+//     import marker. Register() will use pulumi.Import() to adopt it in-place.
+//
+// On second run (if import failed):
+//   - Import marker still present, release still exists → uninstalls the release
+//     (fallback) so Pulumi can create a fresh managed release.
+//
+// On subsequent runs:
+//   - Adopted marker exists → no-op.
+func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
+	adopted := adoptedMarkerPath(namespace, releaseName)
+	importing := importMarkerPath(namespace, releaseName)
+
+	// Already adopted by Pulumi → skip.
+	if _, err := os.Stat(adopted); err == nil {
 		return
 	}
 
-	// Check if release exists in Helm.
+	// Check if the release exists in Helm.
 	_, err := executor.RunCapture("helm", "status", releaseName, "-n", namespace)
 	if err != nil {
-		// Release doesn't exist — write marker and let Pulumi create it.
-		_ = os.WriteFile(markerFile, []byte("adopted"), 0o644)
+		// Release doesn't exist → write adopted marker, Pulumi will create fresh.
+		_ = os.WriteFile(adopted, []byte("adopted"), 0o644)
+		_ = os.Remove(importing)
 		return
 	}
 
-	// Release exists from legacy bash — uninstall it.
-	_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
-	_ = os.WriteFile(markerFile, []byte("adopted"), 0o644)
+	// Release exists. Check if a previous import attempt failed.
+	if _, err := os.Stat(importing); err == nil {
+		// Import marker exists from a previous run → import already failed once.
+		// Fallback: uninstall the release so Pulumi can create a fresh one.
+		_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
+		_ = os.WriteFile(adopted, []byte("adopted"), 0o644)
+		_ = os.Remove(importing)
+		return
+	}
+
+	// First attempt: write import marker. Register() will try pulumi.Import().
+	_ = os.WriteFile(importing, []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
+}
+
+// MarkAdopted writes the adopted marker and removes the import marker after a
+// successful Pulumi run. Called from Register() when import succeeds.
+func MarkAdopted(releaseName, namespace string) {
+	_ = os.WriteFile(adoptedMarkerPath(namespace, releaseName), []byte("adopted"), 0o644)
+	_ = os.Remove(importMarkerPath(namespace, releaseName))
+}
+
+// NeedsImport returns true if the release should be imported into Pulumi state
+// (import marker exists but adopted marker does not).
+func NeedsImport(releaseName, namespace string) bool {
+	if _, err := os.Stat(adoptedMarkerPath(namespace, releaseName)); err == nil {
+		return false
+	}
+	if _, err := os.Stat(importMarkerPath(namespace, releaseName)); err == nil {
+		return true
+	}
+	return false
 }
 
 // RegisterSkipped registers an empty component for phases that are skipped
@@ -94,11 +136,17 @@ type HelmReleaseArgs struct {
 	Values      map[string]interface{}
 }
 
-// DeployHelmRelease creates a Pulumi Helm Release resource. Pre-existing
-// releases from legacy bash scripts are uninstalled by RunNoop/AdoptHelmRelease
-// before this runs, so no Replace/ForceUpdate is needed.
+// DeployHelmRelease creates a Pulumi Helm Release resource. If the release
+// needs adoption from legacy bash scripts (import marker exists), it uses
+// pulumi.Import() to adopt the existing release in-place. On success the
+// adopted marker is written.
 func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, opts ...pulumi.ResourceOption) (*helmv3.Release, error) {
-	return helmv3.NewRelease(ctx, name, &helmv3.ReleaseArgs{
+	if NeedsImport(args.ReleaseName, args.Namespace) {
+		importID := fmt.Sprintf("%s/%s", args.Namespace, args.ReleaseName)
+		opts = append(opts, pulumi.Import(pulumi.ID(importID)))
+	}
+
+	rel, err := helmv3.NewRelease(ctx, name, &helmv3.ReleaseArgs{
 		Name:            pulumi.String(args.ReleaseName),
 		Namespace:       pulumi.String(args.Namespace),
 		Chart:           pulumi.String(args.Chart),
@@ -111,6 +159,13 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 		},
 		Values: pulumi.Map(toStringMap(args.Values)),
 	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Mark as adopted after successful registration.
+	MarkAdopted(args.ReleaseName, args.Namespace)
+	return rel, err
 }
 
 func toStringMap(m map[string]interface{}) map[string]pulumi.Input {

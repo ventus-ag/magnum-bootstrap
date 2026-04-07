@@ -83,6 +83,17 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
+// Destroy removes admin kubeconfig files.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("admin-kubeconfig destroy: removing kubeconfig files")
+	}
+	_ = os.Remove("/etc/kubernetes/admin.conf")
+	_ = os.Remove("/root/.kube/config")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

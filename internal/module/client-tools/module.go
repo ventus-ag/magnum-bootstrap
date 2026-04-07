@@ -154,6 +154,18 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	}, nil
 }
 
+// Destroy removes kubelet and kubectl binaries.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("client-tools destroy: removing kubelet and kubectl binaries")
+	}
+	_ = os.Remove("/usr/local/bin/kubelet")
+	_ = os.Remove("/usr/local/bin/kubectl")
+	_ = os.Remove("/srv/magnum/bin/kubectl")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

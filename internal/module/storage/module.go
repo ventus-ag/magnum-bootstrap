@@ -164,6 +164,23 @@ func findDevicePath(cfg config.Config, executor *host.Executor, logger *logging.
 	return "", fmt.Errorf("storage: disk device for volume %s did not appear after 30s", volume)
 }
 
+// Destroy unmounts the storage directory.
+func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Request) error {
+	executor := host.NewExecutor(req.Apply, req.Logger)
+
+	storageDir := "/var/lib/containerd"
+	if cfg.Shared.ContainerRuntime != "containerd" {
+		storageDir = "/var/lib/docker"
+	}
+
+	if req.Logger != nil {
+		req.Logger.Infof("storage destroy: unmounting %s", storageDir)
+	}
+	_ = executor.Run("umount", storageDir)
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:Storage", name, res, opts...); err != nil {

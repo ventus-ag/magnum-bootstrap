@@ -368,6 +368,17 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
+// Destroy removes all certificate files from the kubernetes and etcd cert directories.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("master-certificates destroy: removing all files in /etc/kubernetes/certs/ and /etc/etcd/certs/")
+	}
+	_ = os.RemoveAll("/etc/kubernetes/certs/")
+	_ = os.RemoveAll("/etc/etcd/certs/")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

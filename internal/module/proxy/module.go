@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -109,6 +110,18 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			"runtimeService":   runtimeService,
 		},
 	}, nil
+}
+
+// Destroy removes proxy drop-in configuration files.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("proxy-env destroy: removing docker service proxy drop-ins")
+	}
+	_ = os.Remove("/etc/systemd/system/docker.service.d/http_proxy.conf")
+	_ = os.Remove("/etc/systemd/system/docker.service.d/https_proxy.conf")
+	_ = os.Remove("/etc/systemd/system/docker.service.d/no_proxy.conf")
+
+	return nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

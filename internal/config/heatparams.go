@@ -116,9 +116,11 @@ func Load(path string) (Config, error) {
 			MetricsServerEnabled:  parseBool(raw["METRICS_SERVER_ENABLED"]),
 			MetricsServerChartTag: raw["METRICS_SERVER_CHART_TAG"],
 
+			NPDEnabled:  !parseFalse(raw["NPD_ENABLED"]),
+			NPDChartTag: raw["NPD_CHART_TAG"],
+
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
-			NPDChartTag:           raw["NPD_CHART_TAG"],
 
 			AutoScalingEnabled:   parseBool(raw["AUTO_SCALING_ENABLED"]),
 			AutoscalerChartTag:   raw["AUTOSCALER_CHART_TAG"],

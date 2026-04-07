@@ -233,6 +233,27 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// Destroy stops container runtime services and removes runtime data.
+func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Request) error {
+	executor := host.NewExecutor(req.Apply, req.Logger)
+
+	if req.Logger != nil {
+		req.Logger.Infof("container-runtime destroy: stopping containerd and docker services")
+	}
+	_ = executor.Run("systemctl", "stop", "containerd")
+	_ = executor.Run("systemctl", "disable", "containerd")
+	_ = executor.Run("systemctl", "stop", "docker")
+	_ = executor.Run("systemctl", "disable", "docker")
+
+	if req.Logger != nil {
+		req.Logger.Infof("container-runtime destroy: removing config and data")
+	}
+	_ = os.Remove("/etc/containerd/config.toml")
+	_ = os.RemoveAll("/var/lib/containerd")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

@@ -3,6 +3,7 @@ package dockerregistry
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -109,6 +110,25 @@ ExecStop=/usr/bin/docker rm -f registry
 [Install]
 WantedBy=multi-user.target
 `, cfg.Worker.RegistryPort)
+}
+
+// Destroy stops the registry service and removes its configuration.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	executor := host.NewExecutor(req.Apply, req.Logger)
+
+	if req.Logger != nil {
+		req.Logger.Infof("registry destroy: stopping and disabling registry service")
+	}
+	_ = executor.Run("systemctl", "stop", "registry")
+	_ = executor.Run("systemctl", "disable", "registry")
+
+	if req.Logger != nil {
+		req.Logger.Infof("registry destroy: removing registry config and service files")
+	}
+	_ = os.Remove("/etc/sysconfig/registry-config.yml")
+	_ = os.Remove("/etc/systemd/system/registry.service")
+
+	return nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

@@ -9,6 +9,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
@@ -23,7 +24,17 @@ func (Module) PhaseID() string        { return "cluster-manila-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	return clusterhelm.RunNoop(ctx, cfg, req, cfg.Shared.ManilaCSIPluginEnabled, "openstack-manila-csi", "kube-system")
+	if !cfg.IsFirstMaster() || !cfg.Shared.ManilaCSIPluginEnabled {
+		return clusterhelm.SkipResult()
+	}
+	if req.Apply {
+		executor := host.NewExecutor(req.Apply, req.Logger)
+		clusterhelm.AdoptHelmRelease(executor, "nfs-driver", "kube-system")
+		clusterhelm.AdoptHelmRelease(executor, "openstack-manila-csi", "kube-system")
+	}
+	return moduleapi.Result{
+		Outputs: map[string]string{"firstMaster": "true"},
+	}, nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

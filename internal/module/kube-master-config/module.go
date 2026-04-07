@@ -808,6 +808,29 @@ WantedBy=multi-user.target
 `, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
 
+// Destroy removes master kubernetes configuration files and CNI binaries.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("kube-master-config destroy: removing config files and CNI binaries")
+	}
+	_ = os.Remove("/etc/sysctl.d/k8s_custom.conf")
+	_ = os.Remove("/etc/modules-load.d/flannel.conf")
+	_ = os.Remove("/etc/kubernetes/proxy-kubeconfig.yaml")
+	_ = os.Remove("/etc/kubernetes/controller-kubeconfig.yaml")
+	_ = os.Remove("/etc/kubernetes/scheduler-kubeconfig.yaml")
+	_ = os.Remove("/etc/kubernetes/kubelet.conf")
+	_ = os.Remove("/etc/kubernetes/kubelet-config.yaml")
+	_ = os.Remove("/etc/kubernetes/kubelet.env")
+	_ = os.Remove("/etc/kubernetes/config")
+	_ = os.Remove("/etc/kubernetes/apiserver")
+	_ = os.Remove("/etc/kubernetes/controller-manager")
+	_ = os.Remove("/etc/kubernetes/scheduler")
+	_ = os.Remove("/etc/kubernetes/proxy")
+	_ = os.RemoveAll("/opt/cni/bin")
+
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}

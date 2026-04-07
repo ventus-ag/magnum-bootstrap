@@ -3,6 +3,7 @@ package kubeosconfig
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -84,6 +85,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			"occmConfig":      occmConfig,
 		},
 	}, nil
+}
+
+// Destroy removes OpenStack cloud config files.
+func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request) error {
+	if req.Logger != nil {
+		req.Logger.Infof("kube-os-config destroy: removing cloud config files")
+	}
+	_ = os.Remove("/etc/kubernetes/cloud-config")
+	_ = os.Remove("/etc/kubernetes/kube_openstack_config")
+	_ = os.Remove("/etc/kubernetes/cloud-config-occm")
+	_ = os.Remove("/etc/kubernetes/ca-bundle.crt")
+
+	return nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

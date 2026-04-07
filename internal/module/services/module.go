@@ -152,6 +152,27 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
+// Destroy stops all kubernetes services on the node.
+func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Request) error {
+	executor := host.NewExecutor(req.Apply, req.Logger)
+
+	var services []string
+	if cfg.Role() == config.RoleMaster {
+		services = []string{"kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet", "kube-proxy"}
+	} else {
+		services = []string{"kubelet", "kube-proxy"}
+	}
+
+	for _, svc := range services {
+		if req.Logger != nil {
+			req.Logger.Infof("services destroy: stopping %s", svc)
+		}
+		_ = executor.Run("systemctl", "stop", svc)
+		_ = executor.Run("systemctl", "disable", svc)
+	}
+	return nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:Services", name, res, opts...); err != nil {
