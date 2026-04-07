@@ -66,6 +66,7 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 				continue
 			}
 			op := string(meta.Op)
+			// Only show operations that represent real changes.
 			if op == "same" && !r.debug {
 				continue
 			}
@@ -73,9 +74,7 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			color := pulumiColor(op)
 			fmt.Fprintf(r.writer, "%s\n", r.colorize(
 				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
-			if op == "update" || op == "replace" {
-				r.markPrePrinted(meta)
-			}
+			r.markPrePrinted(meta)
 
 			// Show property-level diffs for update/replace operations.
 			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
@@ -87,14 +86,12 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			if meta.Type == "pulumi:pulumi:Stack" {
 				continue
 			}
-			// If we already printed from ResPreEvent, skip the duplicate.
-			// Only print ResOutputsEvent for ops that don't have a PreEvent
-			// or when there's no detailed diff.
 			op := string(meta.Op)
 			if op == "same" && !r.debug {
 				continue
 			}
-			if (op == "update" || op == "replace") && r.consumePrePrinted(meta) {
+			// Skip if already printed from ResourcePreEvent.
+			if r.consumePrePrinted(meta) {
 				continue
 			}
 			sigil := pulumiSigil(op)
