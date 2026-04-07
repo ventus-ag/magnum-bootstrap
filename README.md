@@ -5,11 +5,15 @@ Kubernetes node reconciliation engine for OpenStack Magnum. Replaces legacy bash
 ## Features
 
 - **28 native modules** covering full node lifecycle: create, upgrade, resize, CA rotation
+- **Unified phase plan** — same phases for all operations; each module decides internally whether to act
 - **Cluster-level addons** via Pulumi Kubernetes/Helm providers (Flannel, CoreDNS, OCCM, Cinder CSI, Manila CSI, metrics-server, autoscaler, auto-healer)
 - **Desired-state reconciliation** — idempotent, drift-detecting, change-driven restarts
-- **Real-time output** — colored Pulumi event streaming (k8s-pulumi style)
+- **Crash recovery** — stale Pulumi lock detection, PID verification, auto-cancel
+- **Resilient refresh** — 2 retries, non-fatal on failure (K8s API may be down during rotation)
+- **Real-time output** — colored Pulumi event streaming with 30s heartbeat
 - **Heat-compatible** — result JSON with `deploy_status_code`/`deploy_stdout`/`deploy_stderr`
 - **Self-contained** — auto-installs Pulumi CLI, no external dependencies
+- **Periodic drift correction** — daily at midnight via systemd timer
 - **Log rotation** — auto-trims log file at 100MB
 
 ## Quick Start
@@ -53,7 +57,7 @@ make build
 --allow-partial        Skip unimplemented modules, run only implemented ones
 --refresh              Pulumi refresh to detect drift (default: true)
 --target-phase STRING  Execute only the specified phase
---parallelism INT      Pulumi resource operation parallelism (default: 10)
+--parallelism INT      Pulumi resource operation parallelism (default: 50)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
@@ -83,16 +87,8 @@ prereq-validation → container-runtime → client-tools → kube-os-config →
 worker-certificates → registry → admin-kubeconfig → kube-worker-config →
 proxy-env → storage → services → health
 
-### Master Reconcile (upgrade/resize)
-
-prereq-validation → [ca-rotation] → etcd → admin-kubeconfig → stop-services →
-client-tools → container-runtime → kube-master-config → start-services →
-health → cluster-addons
-
-### Worker Reconcile (upgrade/resize)
-
-prereq-validation → [ca-rotation] → admin-kubeconfig → stop-services →
-client-tools → container-runtime → kube-worker-config → start-services → health
+All operations (create, upgrade, resize, CA rotation, periodic) use the same
+unified phase list per role.  Each module internally decides whether to act.
 
 ## Runtime Contract
 
@@ -129,9 +125,11 @@ result.Write() → Heat-compatible JSON
 
 Key design:
 - **RestartTracker** — config modules signal which services need restart; services module only restarts what changed
-- **Drift detection** — `--refresh` (default on) syncs Pulumi state; services module starts crashed services
+- **Drift detection** — `--refresh` syncs Pulumi state; services module starts crashed services
 - **Migration** — `patchForce` annotation adopts existing K8s resources; Helm releases auto-adopted from bash
 - **Idempotent** — second run with same config = zero changes
+- **Error handling** — critical ops (cert copy, config write) fail hard; expected failures (useradd, etcd quorum) log and continue
+- **CA rotation** — staged certs, verified before swap, rotation ID tracking prevents re-runs on periodic timer
 
 ## Layout
 

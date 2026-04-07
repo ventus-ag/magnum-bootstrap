@@ -39,7 +39,7 @@ bootstrap print-last-result # Print last result JSON
 --allow-partial        Skip unimplemented modules and continue
 --refresh              Pulumi refresh before run (default: true, detects drift)
 --target-phase STRING  Execute only specified phase
---parallelism INT      Pulumi resource operation parallelism (default: 10)
+--parallelism INT      Pulumi resource operation parallelism (default: 50)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
@@ -50,16 +50,20 @@ bootstrap print-last-result # Print last result JSON
 ### Reconciliation Flow
 
 1. Parse `heat-params` → typed `config.Config` (~80 typed fields)
-2. Detect role (master/worker) and operation (create/upgrade/resize/ca-rotate)
-3. Build ordered phase plan from catalog
-4. Recover interrupted runs (PID-based detection)
-5. Create Pulumi stack with inline program:
-   - `stack.Refresh()` syncs Pulumi state with actual node state (default: on)
+2. Load previous state → set `AppliedCARotationID` so completed rotations
+   don't re-trigger on periodic runs
+3. Detect role (master/worker) and operation (create/upgrade/resize/ca-rotate)
+4. Build ordered phase plan from unified catalog (same phases for all operations;
+   each module decides internally whether to act)
+5. Recover interrupted runs (PID-based detection)
+6. Select or create Pulumi stack (select-first, upsert on 404):
+   - `stack.Refresh()` syncs Pulumi state with actual node state
+     (run-once: off, run-periodic/up: on; 2 retries, non-fatal on failure)
    - `stack.Preview()` (preview mode) or `stack.Up()` (apply mode)
-   - Parallelism controls concurrent Pulumi resource operations
-6. Stream Pulumi engine events to terminal (colored, real-time)
-7. Persist reconciler state + result JSON
-8. Exit with code for Heat signal transport
+   - Stale lock detection via `runWithAutoCancel()`
+7. Stream Pulumi engine events to terminal (colored, real-time)
+8. Persist reconciler state + result JSON
+9. Exit with code for Heat signal transport
 
 ### Desired-State Model
 
@@ -78,14 +82,22 @@ Every module follows the desired-state pattern:
 
 ### Pulumi Integration
 
-- **Automation API**: `auto.UpsertStackInlineSource` with inline `RunFunc`
+- **Automation API**: `auto.SelectStackInlineSource` (fast path) with fallback to
+  `auto.UpsertStackInlineSource` (first run)
 - **Self-bootstrapping CLI**: `auto.InstallPulumiCommand()` on first run
 - **Local file backend**: `file:///var/lib/magnum/pulumi` (no cloud, no secrets)
 - **Stack naming**: `node-{sanitized-instance-name}`
-- **Dependency chain**: Each phase `DependsOn` the previous phase's Pulumi component
+- **DAG dependencies**: Each module declares `Dependencies()` → Pulumi `DependsOn`
+  edges. Failed modules still call `Register()` to keep the DAG intact for
+  downstream phases.
+- **Stale lock recovery**: `runWithAutoCancel()` detects
+  `IsConcurrentUpdateError`, extracts PID, verifies liveness, auto-cancels stale
+  locks
 - **Kubernetes provider**: Used by cluster-addon modules for RBAC, Secrets, Helm
 - **patchForce**: Cluster-addon K8s resources use `pulumi.com/patchForce` annotation
   to adopt pre-existing resources created by legacy kubectl scripts
+- **Event buffer**: 1000-capacity channel prevents Pulumi blocking on slow consumers
+- **Heartbeat**: 30s ticker logs "still running..." for long operations
 
 ### Module System
 
@@ -175,52 +187,51 @@ internal/
 
 ## Phase Catalog
 
-### Master Create (22 phases)
+All operations (create, upgrade, resize, ca-rotate, periodic) use the **same
+unified phase list** per role.  Each module internally decides whether to act
+based on current vs desired state.
+
+### Master (25 phases)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|
 | 1 | prereq-validation | no | |
-| 2 | container-runtime | yes | |
-| 3 | client-tools | no | |
-| 4 | master-certificates | yes | |
-| 5 | cert-api-manager | yes | |
-| 6 | etcd | yes | |
-| 7 | kube-os-config | no | |
+| 2 | ca-rotation | yes | No-op unless rotation ID changed |
+| 3 | container-runtime | yes | |
+| 4 | client-tools | no | |
+| 5 | master-certificates | yes | Errors from useradd non-fatal (may exist) |
+| 6 | cert-api-manager | yes | |
+| 7 | etcd | yes | LB always checked for join detection (scaling) |
+| 8 | kube-os-config | no | |
+| 9 | admin-kubeconfig | no | |
+| 10 | stop-services | yes | Only drain/uncordon during upgrade/resize |
+| 11 | kube-master-config | yes | Signals restart for kube services |
+| 12 | storage | yes | Skips if already mounted; mounts specific device |
+| 13 | services | yes | RestartTracker-driven |
+| 14 | start-services | yes | Only drain/uncordon during upgrade/resize |
+| 15 | proxy-env | no | |
+| 16 | health | no | |
+| 17-25 | cluster-* addons | no | Master-0 only, skip on other masters |
+
+### Worker (15 phases)
+
+| # | Phase | Disruptive | Notes |
+|---|-------|------------|-------|
+| 1 | prereq-validation | no | |
+| 2 | ca-rotation | yes | No-op unless rotation ID changed |
+| 3 | container-runtime | yes | |
+| 4 | client-tools | no | |
+| 5 | kube-os-config | no | |
+| 6 | worker-certificates | yes | chmod errors are fatal |
+| 7 | registry | no | |
 | 8 | admin-kubeconfig | no | |
-| 9 | kube-master-config | yes | Signals restart for kube services |
-| 10 | storage | yes | |
-| 11 | services | yes | RestartTracker-driven |
-| 12 | proxy-env | no | |
-| 13 | health | no | |
-| 14-22 | cluster-* addons | no | Master-0 only, skip on other masters |
-
-### Worker Create (12 phases)
-
-| # | Phase | Disruptive |
-|---|-------|------------|
-| 1 | prereq-validation | no |
-| 2 | container-runtime | yes |
-| 3 | client-tools | no |
-| 4 | kube-os-config | no |
-| 5 | worker-certificates | yes |
-| 6 | registry | no |
-| 7 | admin-kubeconfig | no |
-| 8 | kube-worker-config | yes |
-| 9 | proxy-env | no |
-| 10 | storage | yes |
-| 11 | services | yes |
-| 12 | health | no |
-
-### Master Reconcile (9-10 + cluster addons)
-
-prereq-validation → [ca-rotation] → etcd → admin-kubeconfig → stop-services →
-client-tools → container-runtime → kube-master-config → start-services →
-health → cluster-* addons
-
-### Worker Reconcile (8-9 phases)
-
-prereq-validation → [ca-rotation] → admin-kubeconfig → stop-services →
-client-tools → container-runtime → kube-worker-config → start-services → health
+| 9 | stop-services | yes | Only drain/uncordon during upgrade/resize |
+| 10 | kube-worker-config | yes | |
+| 11 | proxy-env | no | |
+| 12 | storage | yes | |
+| 13 | services | yes | |
+| 14 | start-services | yes | |
+| 15 | health | no | |
 
 ## Key Design Decisions
 
@@ -250,10 +261,28 @@ client-tools → container-runtime → kube-worker-config → start-services →
 ### CA Rotation Safety
 - Staged cert generation in `/var/lib/magnum/ca-rotation/{id}/`
 - All certs verified (exist + non-empty) before replacing
-- Admin kubeconfig updated with new certs (base64 inline)
-- Service health check after restart (API /healthz)
-- Workload patching (Deployments/DaemonSets) for pod rollout
-- Rotation ID tracking prevents duplicate rotation
+- Cert swap errors (cp, chown) are fatal — prevents silent broken state
+- Admin kubeconfig updated with new certs; read errors are fatal
+- Service health check after restart (API /healthz, 7.5 min timeout)
+- Workload patching (Deployments/DaemonSets) with failure counting in warnings
+- Rotation ID tracking prevents duplicate rotation on periodic runs
+- Completed rotation detected at operation-detection time → falls back to
+  normal create/reconcile plan instead of re-running full ca-rotate phases
+
+### Error Handling Philosophy
+- **Must succeed** (cert copy, config write, chmod): return error, halt phase
+- **Expected failure** (useradd existing user, etcd during quorum formation,
+  kubectl during API restart): log warning, continue
+- **Informational** (daemon-reload, docker already stopped): log, don't block
+
+## Systemd Timer
+
+The periodic reconciler runs via `magnum-reconcile.timer`:
+- **First tick**: 5 min after timer activation (`OnActiveSec=5min`)
+- **Subsequent**: daily at midnight (`OnCalendar=*-*-* 00:00:00`)
+- **Persistent**: fires on next boot if node was off at midnight
+
+The timer is started AFTER the synchronous Heat-triggered run to avoid racing.
 
 ## Remaining Work
 
@@ -263,8 +292,6 @@ client-tools → container-runtime → kube-worker-config → start-services →
 - [ ] Add golden tests for rendered files (cloud-config, kubeconfig, kubelet-config, etcd.conf)
 - [ ] Add state backup before disruptive apply steps
 - [ ] Add Pulumi state backup before apply steps
-- [ ] Integration test on real master/worker nodes (create, upgrade, resize, CA rotation)
-- [ ] Verify Heat signal transport end-to-end
-- [ ] Test etcd cluster join/rejoin/scale-down logic with multi-master setups
-- [ ] Test cluster-addon Helm chart deployment and adoption of existing releases
 - [ ] Reduce binary size (K8s provider adds ~80MB)
+- [ ] Implement dual-CA trust model for zero-downtime CA rotation (see caimprove.md)
+- [ ] Make cluster-addon chart versions configurable (currently hardcoded in some modules)
