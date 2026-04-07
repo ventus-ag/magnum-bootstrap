@@ -157,7 +157,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	}
 
 	if parallelism < 1 {
-		parallelism = 50
+		parallelism = 10
 	}
 
 	previewPlanText := ""

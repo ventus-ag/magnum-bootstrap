@@ -8,6 +8,7 @@ import (
 	clienttools "github.com/ventus-ag/magnum-bootstrap/internal/module/client-tools"
 	clusterautohealer "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-auto-healer"
 	clusterautoscaler "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-autoscaler"
+	clusterhealth "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-health"
 	clustercindercsi "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-cinder-csi"
 	clustercoredns "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-coredns"
 	clusterflannel "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-flannel"
@@ -64,6 +65,7 @@ func BuildRegistry(_ config.Config) map[string]Module {
 		"cluster-metrics-server": clustermetricsserver.Module{},
 		"cluster-auto-healer":    clusterautohealer.Module{},
 		"cluster-autoscaler":     clusterautoscaler.Module{},
+		"cluster-health":         clusterhealth.Module{},
 	}
 }
 

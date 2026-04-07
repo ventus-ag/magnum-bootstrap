@@ -37,6 +37,7 @@ func masterPhases() []Phase {
 		newPhase("cluster-metrics-server", "reconcile metrics server via Helm", false),
 		newPhase("cluster-auto-healer", "reconcile node problem detector and auto-healer", false),
 		newPhase("cluster-autoscaler", "reconcile cluster autoscaler via Helm", false),
+		newPhase("cluster-health", "verify cluster pods are healthy, restart crashlooping pods", false),
 	}
 }
 
