@@ -40,12 +40,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/"
 	}
 
+	chartVersion := cfg.Shared.NPDChartTag
+	if chartVersion == "" {
+		chartVersion = "2.3.4"
+	}
+
 	// Node Problem Detector via Helm.
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-npd", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "npd",
 		Namespace:   "kube-system",
 		Chart:       "node-problem-detector",
-		Version:     "2.3.4",
+		Version:     chartVersion,
 		RepoURL:     "https://charts.deliveryhero.io/",
 		Values: map[string]interface{}{
 			"fullnameOverride": "node-problem-detector",

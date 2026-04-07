@@ -45,11 +45,16 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/autoscaling/"
 	}
 
+	chartVersion := cfg.Shared.AutoscalerChartTag
+	if chartVersion == "" {
+		chartVersion = "9.29.1"
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "openstack-autoscaler",
 		Namespace:   "kube-system",
 		Chart:       "cluster-autoscaler",
-		Version:     "9.29.1",
+		Version:     chartVersion,
 		RepoURL:     "https://kubernetes.github.io/autoscaler",
 		Values: map[string]interface{}{
 			"magnumClusterName": cfg.Shared.ClusterUUID,

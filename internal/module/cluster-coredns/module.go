@@ -52,11 +52,16 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	// kubernetes plugin parameters: cluster domain + reverse zones.
 	kubeParams := clusterDomain + " in-addr.arpa " + portalCIDR + " " + podsCIDR
 
+	chartVersion := cfg.Shared.CoreDNSChartTag
+	if chartVersion == "" {
+		chartVersion = "1.22.0"
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "coredns",
 		Namespace:   "kube-system",
 		Chart:       "coredns",
-		Version:     "1.22.0",
+		Version:     chartVersion,
 		RepoURL:     "https://coredns.github.io/helm",
 		Values: map[string]interface{}{
 			"replicaCount": 2,

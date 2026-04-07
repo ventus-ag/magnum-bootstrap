@@ -138,7 +138,12 @@ type SharedConfig struct {
 	FlannelNetworkCIDR string `json:"flannelNetworkCidr"`
 
 	// CoreDNS
-	CorednsTag string `json:"corednsTag"`
+	CorednsTag       string `json:"corednsTag"`
+	CoreDNSChartTag  string `json:"corednsChartTag"`
+
+	// OCCM
+	OCCMChartTag string `json:"occmChartTag"`
+	OCCMImageTag string `json:"occmImageTag"`
 
 	// Metrics server
 	MetricsServerEnabled  bool   `json:"metricsServerEnabled"`
@@ -147,16 +152,21 @@ type SharedConfig struct {
 	// Auto-healing
 	AutoHealingEnabled    bool   `json:"autoHealingEnabled"`
 	AutoHealingController string `json:"autoHealingController"`
+	NPDChartTag           string `json:"npdChartTag"`
 
 	// Auto-scaling
-	AutoScalingEnabled bool `json:"autoScalingEnabled"`
-	MinNodeCount       int  `json:"minNodeCount"`
-	MaxNodeCount       int  `json:"maxNodeCount"`
+	AutoScalingEnabled   bool   `json:"autoScalingEnabled"`
+	AutoscalerChartTag   string `json:"autoscalerChartTag"`
+	MinNodeCount         int    `json:"minNodeCount"`
+	MaxNodeCount         int    `json:"maxNodeCount"`
 
 	// Volume / CSI
-	VolumeDriver          string `json:"volumeDriver"`
-	CinderCSIPluginEnabled bool  `json:"cinderCsiPluginEnabled"`
-	ManilaCSIPluginEnabled bool  `json:"manilaCSIPluginEnabled"`
+	VolumeDriver           string `json:"volumeDriver"`
+	CinderCSIPluginEnabled bool   `json:"cinderCsiPluginEnabled"`
+	CinderCSIChartTag      string `json:"cinderCsiChartTag"`
+	ManilaCSIPluginEnabled bool   `json:"manilaCSIPluginEnabled"`
+	ManilaCSIChartTag      string `json:"manilaCSIChartTag"`
+	NFSCSIChartTag         string `json:"nfsCsiChartTag"`
 
 	// Post-install
 	PostInstallManifestURL string `json:"postInstallManifestUrl"`

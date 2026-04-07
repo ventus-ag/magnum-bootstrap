@@ -51,11 +51,16 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		pluginPrefix = "registry.k8s.io/provider-os/"
 	}
 
+	chartVersion := cfg.Shared.CinderCSIChartTag
+	if chartVersion == "" {
+		chartVersion = "2.27.1"
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "cinder-csi",
 		Namespace:   "kube-system",
 		Chart:       "openstack-cinder-csi",
-		Version:     "2.27.1",
+		Version:     chartVersion,
 		RepoURL:     "https://kubernetes.github.io/cloud-provider-openstack",
 		Values: map[string]interface{}{
 			"csi": map[string]interface{}{

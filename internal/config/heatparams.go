@@ -107,21 +107,30 @@ func Load(path string) (Config, error) {
 			FlannelBackend:     raw["FLANNEL_BACKEND"],
 			FlannelNetworkCIDR: raw["FLANNEL_NETWORK_CIDR"],
 
-			CorednsTag: raw["COREDNS_TAG"],
+			CorednsTag:      raw["COREDNS_TAG"],
+			CoreDNSChartTag: raw["COREDNS_CHART_TAG"],
+
+			OCCMChartTag: raw["OCCM_CHART_TAG"],
+			OCCMImageTag: raw["CLOUD_PROVIDER_TAG"],
 
 			MetricsServerEnabled:  parseBool(raw["METRICS_SERVER_ENABLED"]),
 			MetricsServerChartTag: raw["METRICS_SERVER_CHART_TAG"],
 
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
+			NPDChartTag:           raw["NPD_CHART_TAG"],
 
-			AutoScalingEnabled: parseBool(raw["AUTO_SCALING_ENABLED"]),
-			MinNodeCount:       parseInt(raw["MIN_NODE_COUNT"]),
-			MaxNodeCount:       parseInt(raw["MAX_NODE_COUNT"]),
+			AutoScalingEnabled:   parseBool(raw["AUTO_SCALING_ENABLED"]),
+			AutoscalerChartTag:   raw["AUTOSCALER_CHART_TAG"],
+			MinNodeCount:         parseInt(raw["MIN_NODE_COUNT"]),
+			MaxNodeCount:         parseInt(raw["MAX_NODE_COUNT"]),
 
 			VolumeDriver:           raw["VOLUME_DRIVER"],
 			CinderCSIPluginEnabled: parseBool(raw["CINDER_CSI_PLUGIN_ENABLED"]),
+			CinderCSIChartTag:      raw["CINDER_CSI_CHART_TAG"],
 			ManilaCSIPluginEnabled: parseBool(raw["MANILA_CSI_PLUGIN_ENABLED"]),
+			ManilaCSIChartTag:      raw["MANILA_CSI_CHART_TAG"],
+			NFSCSIChartTag:         raw["NFS_CSI_CHART_TAG"],
 
 			PostInstallManifestURL: raw["POST_INSTALL_MANIFEST_URL"],
 			MasterIndex:            parseInt(raw["MASTER_INDEX"]),

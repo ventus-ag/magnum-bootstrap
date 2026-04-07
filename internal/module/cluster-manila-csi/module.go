@@ -38,12 +38,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	childOpts := append(opts, pulumi.Parent(res))
 
+	nfsChartVersion := cfg.Shared.NFSCSIChartTag
+	if nfsChartVersion == "" {
+		nfsChartVersion = "4.5.0"
+	}
+
 	// NFS CSI driver (dependency for Manila).
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-nfs-driver", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "nfs-driver",
 		Namespace:   "kube-system",
 		Chart:       "csi-driver-nfs",
-		Version:     "4.5.0",
+		Version:     nfsChartVersion,
 		RepoURL:     "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts",
 		Values: map[string]interface{}{
 			"controller": map[string]interface{}{
@@ -55,12 +60,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
+	manilaChartVersion := cfg.Shared.ManilaCSIChartTag
+	if manilaChartVersion == "" {
+		manilaChartVersion = "2.27.1"
+	}
+
 	// Manila CSI plugin via Helm.
 	_, err = clusterhelm.DeployHelmRelease(ctx, name+"-manila-plugin", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "openstack-manila-csi",
 		Namespace:   "kube-system",
 		Chart:       "openstack-manila-csi",
-		Version:     "2.27.1",
+		Version:     manilaChartVersion,
 		RepoURL:     "https://kubernetes.github.io/cloud-provider-openstack",
 		Values: map[string]interface{}{
 			"fullnameOverride": "",

@@ -45,16 +45,26 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/provider-os/openstack-cloud-controller-manager"
 	}
 
+	chartVersion := cfg.Shared.OCCMChartTag
+	if chartVersion == "" {
+		chartVersion = "2.27.1"
+	}
+
+	imageTag := cfg.Shared.OCCMImageTag
+	if imageTag == "" {
+		imageTag = "v1.24.6"
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "openstack-ccm",
 		Namespace:   "kube-system",
 		Chart:       "openstack-cloud-controller-manager",
-		Version:     "2.27.1",
+		Version:     chartVersion,
 		RepoURL:     "https://kubernetes.github.io/cloud-provider-openstack",
 		Values: map[string]interface{}{
 			"image": map[string]interface{}{
 				"repository": prefix,
-				"tag":        "v1.24.6",
+				"tag":        imageTag,
 			},
 			"secret": map[string]interface{}{
 				"create": true,
