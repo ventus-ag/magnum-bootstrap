@@ -278,6 +278,11 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 		runtimePaths.HeatParamsFile = f.heatParamsFile
 	}
 
+	if err := runtimePaths.EnsureDirs(); err != nil {
+		fmt.Fprintf(stderr, "failed to create required directories: %v\n", err)
+		return 1
+	}
+
 	renderer := display.NewRenderer(stdout, f.debug)
 
 	logger, err := logging.New(runtimePaths.LogFile, stderr, f.debug)

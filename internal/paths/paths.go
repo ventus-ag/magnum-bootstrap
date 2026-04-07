@@ -1,6 +1,9 @@
 package paths
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+)
 
 type Paths struct {
 	HeatParamsFile  string
@@ -26,6 +29,25 @@ func LoadFromEnv() Paths {
 		PulumiBackend:   envOrDefault("MAGNUM_PULUMI_BACKEND_URL", "file:///var/lib/magnum/pulumi"),
 		PulumiBackupDir: envOrDefault("MAGNUM_PULUMI_BACKUP_DIR", "/var/lib/magnum/pulumi-backups"),
 	}
+}
+
+// EnsureDirs creates all directories required by the reconciler.
+func (p Paths) EnsureDirs() error {
+	dirs := []string{
+		filepath.Dir(p.ResultFile),
+		filepath.Dir(p.LogFile),
+		filepath.Dir(p.StateFile),
+		filepath.Dir(p.RunStateFile),
+		p.StateBackupDir,
+		p.PulumiStateDir,
+		p.PulumiBackupDir,
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
