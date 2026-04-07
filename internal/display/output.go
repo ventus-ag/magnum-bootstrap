@@ -26,11 +26,20 @@ const (
 	colorReset   = "\x1b[0m"
 )
 
+// pulumiEvent is a collected Pulumi resource event for deferred summary output.
+type pulumiEvent struct {
+	op       string
+	resType  string
+	detailed map[string]apitype.PropertyDiff
+	meta     apitype.StepEventMetadata
+}
+
 type Renderer struct {
 	writer     io.Writer
 	enableANSI bool
 	debug      bool
 	prePrinted map[string]bool
+	collected  []pulumiEvent
 }
 
 func NewRenderer(writer io.Writer, debug bool) *Renderer {
@@ -42,11 +51,10 @@ func NewRenderer(writer io.Writer, debug bool) *Renderer {
 	}
 }
 
-// StreamEvents processes Pulumi engine events and prints real-time resource
-// changes in colored k8s-pulumi style:
-//
-//   - create  TYPE=magnum:module:PrereqValidation
-//     = same    TYPE=magnum:index:HeatParams
+// StreamEvents processes Pulumi engine events. Resource-level events
+// (create, update, replace, delete) are collected silently and printed
+// later in the summary via PrintResult. Only errors and diagnostics are
+// printed immediately so that failures are visible during the run.
 func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 	if r == nil || r.writer == nil {
 		for range ch {
@@ -60,26 +68,21 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 		}
 		switch {
 		case ev.EngineEvent.ResourcePreEvent != nil:
-			// Pre-event carries the diff details before the operation executes.
 			meta := ev.EngineEvent.ResourcePreEvent.Metadata
 			if meta.Type == "pulumi:pulumi:Stack" {
 				continue
 			}
 			op := string(meta.Op)
-			// Only show operations that represent real changes.
-			if op == "same" && !r.debug {
+			if op == "same" {
 				continue
 			}
-			sigil := pulumiSigil(op)
-			color := pulumiColor(op)
-			fmt.Fprintf(r.writer, "%s\n", r.colorize(
-				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
 			r.markPrePrinted(meta)
-
-			// Show property-level diffs for update/replace operations.
-			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
-				r.printDetailedDiff(meta)
-			}
+			r.collected = append(r.collected, pulumiEvent{
+				op:       op,
+				resType:  string(meta.Type),
+				detailed: meta.DetailedDiff,
+				meta:     meta,
+			})
 
 		case ev.EngineEvent.ResOutputsEvent != nil:
 			meta := ev.EngineEvent.ResOutputsEvent.Metadata
@@ -87,20 +90,19 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 				continue
 			}
 			op := string(meta.Op)
-			if op == "same" && !r.debug {
+			if op == "same" {
 				continue
 			}
-			// Skip if already printed from ResourcePreEvent.
+			// Skip duplicate from ResourcePreEvent.
 			if r.consumePrePrinted(meta) {
 				continue
 			}
-			sigil := pulumiSigil(op)
-			color := pulumiColor(op)
-			fmt.Fprintf(r.writer, "%s\n", r.colorize(
-				fmt.Sprintf("  %s %-8s TYPE=%s", sigil, op, meta.Type), color))
-			if (op == "update" || op == "replace") && len(meta.DetailedDiff) > 0 {
-				r.printDetailedDiff(meta)
-			}
+			r.collected = append(r.collected, pulumiEvent{
+				op:       op,
+				resType:  string(meta.Type),
+				detailed: meta.DetailedDiff,
+				meta:     meta,
+			})
 
 		case ev.EngineEvent.DiagnosticEvent != nil:
 			diag := ev.EngineEvent.DiagnosticEvent
@@ -117,7 +119,9 @@ func (r *Renderer) StreamEvents(ch <-chan events.EngineEvent) {
 			case "warning":
 				fmt.Fprintf(r.writer, "%s\n", r.colorize("  diag: "+msg, colorYellow))
 			default:
-				fmt.Fprintf(r.writer, "%s\n", r.colorize("  diag: "+msg, colorGray))
+				if r.debug {
+					fmt.Fprintf(r.writer, "%s\n", r.colorize("  diag: "+msg, colorGray))
+				}
 			}
 
 		case ev.EngineEvent.ResOpFailedEvent != nil:
@@ -262,16 +266,47 @@ func formatValue(v interface{}) string {
 	return fmt.Sprintf("%q", s)
 }
 
-// PrintResult renders the final result: operations, warnings, and a short summary.
+// PrintResult renders the final result: Pulumi resource events, host operations,
+// warnings, and a short summary — all in one block at the end of the run.
 func (r *Renderer) PrintResult(res result.Result) {
 	if r == nil || r.writer == nil {
 		return
 	}
 	r.printPreviewPlan(res.PreviewPlan)
 	r.printPulumiSummary(res.PulumiSummary)
+	r.printCollectedEvents()
 	r.printOperations(res.Operations)
 	r.printWarnings(res.Warnings)
 	r.printSummary(res)
+}
+
+// printCollectedEvents renders Pulumi resource events that were collected
+// during StreamEvents.
+func (r *Renderer) printCollectedEvents() {
+	if len(r.collected) == 0 {
+		return
+	}
+	fmt.Fprintln(r.writer)
+	for _, ev := range r.collected {
+		sigil := pulumiSigil(ev.op)
+		color := pulumiColor(ev.op)
+		name := shortResourceName(string(ev.meta.URN))
+		fmt.Fprintf(r.writer, "%s\n", r.colorize(
+			fmt.Sprintf("  %s %-8s %s  %s", sigil, ev.op, ev.resType, name), color))
+		if (ev.op == "update" || ev.op == "replace") && len(ev.detailed) > 0 {
+			r.printDetailedDiff(ev.meta)
+		}
+	}
+}
+
+// shortResourceName extracts the last name segment from a Pulumi URN.
+// URN format: urn:pulumi:stack::project::type$type::name
+// Returns just the final "name" part after the last "::".
+func shortResourceName(urn string) string {
+	if idx := strings.LastIndex(urn, "::"); idx >= 0 && idx+2 < len(urn) {
+		return urn[idx+2:]
+	}
+	return urn
 }
 
 func (r *Renderer) printPulumiSummary(summary string) {
@@ -405,6 +440,18 @@ func sigilForAction(action string) string {
 	default:
 		return "?"
 	}
+}
+
+// isVisibleOp returns true for operations that should appear in the event stream.
+// Only update, replace, delete, and import represent real state changes worth
+// showing. "create" is Pulumi state tracking noise (host-level creates are
+// reported separately via module Run() results). "same" is no change.
+func isVisibleOp(op string) bool {
+	switch op {
+	case "update", "replace", "delete", "import":
+		return true
+	}
+	return false
 }
 
 func pulumiSigil(op string) string {
