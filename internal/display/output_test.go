@@ -104,7 +104,7 @@ func TestPrintDetailedDiffParsesIndexedPropertyPaths(t *testing.T) {
 	}
 }
 
-func TestStreamEventsPrintsUpdateFromResOutputsWhenPreEventMissing(t *testing.T) {
+func TestStreamEventsCollectsUpdateAndPrintsInSummary(t *testing.T) {
 	var out bytes.Buffer
 	renderer := NewRenderer(&out, false)
 	ch := make(chan autoevents.EngineEvent, 1)
@@ -132,12 +132,27 @@ func TestStreamEventsPrintsUpdateFromResOutputsWhenPreEventMissing(t *testing.T)
 	close(ch)
 
 	renderer.StreamEvents(ch)
+
+	// Events are collected, not printed during streaming.
+	if out.Len() != 0 {
+		t.Fatalf("expected no output during streaming, got %q", out.String())
+	}
+
+	// PrintResult renders collected events in the summary.
+	renderer.PrintResult(result.Result{
+		Status:  "succeeded",
+		Step:    "up",
+		Summary: "test",
+	})
 	got := out.String()
-	if !strings.Contains(got, "TYPE=magnum:module:InstallClients") {
-		t.Fatalf("expected update line in output, got %q", got)
+	if !strings.Contains(got, "magnum:module:InstallClients") {
+		t.Fatalf("expected update line in summary output, got %q", got)
+	}
+	if !strings.Contains(got, "node-test-client-tools") {
+		t.Fatalf("expected resource name in summary output, got %q", got)
 	}
 	if !strings.Contains(got, `~ kubeletUrl: "old" => "new"`) {
-		t.Fatalf("expected detailed diff in output, got %q", got)
+		t.Fatalf("expected detailed diff in summary output, got %q", got)
 	}
 }
 
