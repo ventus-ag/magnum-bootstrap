@@ -168,6 +168,7 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		"npdEnabled":            pulumi.Bool(cfg.Shared.NPDEnabled),
 		"autoHealingEnabled":    pulumi.Bool(cfg.Shared.AutoHealingEnabled),
 		"autoScalingEnabled":    pulumi.Bool(cfg.Shared.AutoScalingEnabled),
+		"osAutoUpgradeEnabled":  pulumi.Bool(cfg.Shared.OSAutoUpgradeEnabled),
 		"cinderCsiPluginEnabled": pulumi.Bool(cfg.Shared.CinderCSIPluginEnabled),
 		"manilaCSIPluginEnabled": pulumi.Bool(cfg.Shared.ManilaCSIPluginEnabled),
 

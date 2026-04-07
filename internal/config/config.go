@@ -171,6 +171,9 @@ type SharedConfig struct {
 	ManilaCSIChartTag      string `json:"manilaCSIChartTag"`
 	NFSCSIChartTag         string `json:"nfsCsiChartTag"`
 
+	// OS auto-upgrade (Zincati on Fedora CoreOS)
+	OSAutoUpgradeEnabled bool `json:"osAutoUpgradeEnabled"`
+
 	// Post-install
 	PostInstallManifestURL string `json:"postInstallManifestUrl"`
 

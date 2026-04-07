@@ -12,6 +12,7 @@ package plan
 func masterPhases() []Phase {
 	return []Phase{
 		newPhase("prereq-validation", "validate desired master input and prerequisites", false),
+		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 		newPhase("ca-rotation", "rotate cluster CA material if rotation ID changed", true),
 		newPhase("container-runtime", "reconcile the container runtime to desired state", true),
 		newPhase("client-tools", "reconcile kubernetes client binaries", false),
@@ -45,6 +46,7 @@ func masterPhases() []Phase {
 func workerPhases() []Phase {
 	return []Phase{
 		newPhase("prereq-validation", "validate desired worker input and prerequisites", false),
+		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 		newPhase("ca-rotation", "rotate cluster CA material if rotation ID changed", true),
 		newPhase("container-runtime", "reconcile the container runtime to desired state", true),
 		newPhase("client-tools", "reconcile kubernetes client binaries", false),

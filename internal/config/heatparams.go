@@ -134,6 +134,8 @@ func Load(path string) (Config, error) {
 			ManilaCSIChartTag:      raw["MANILA_CSI_CHART_TAG"],
 			NFSCSIChartTag:         raw["NFS_CSI_CHART_TAG"],
 
+			OSAutoUpgradeEnabled:   parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
+
 			PostInstallManifestURL: raw["POST_INSTALL_MANIFEST_URL"],
 			MasterIndex:            parseInt(raw["MASTER_INDEX"]),
 		},

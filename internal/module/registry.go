@@ -31,6 +31,7 @@ import (
 	stopservices "github.com/ventus-ag/magnum-bootstrap/internal/module/stop-services"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module/storage"
 	workercerts "github.com/ventus-ag/magnum-bootstrap/internal/module/worker-certs"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/zincati"
 	"github.com/ventus-ag/magnum-bootstrap/internal/plan"
 )
 
@@ -55,6 +56,7 @@ func BuildRegistry(_ config.Config) map[string]Module {
 		"proxy-env":           proxy.Module{},
 		"health":              health.Module{},
 		"ca-rotation":         carotation.Module{},
+		"zincati":             zincati.Module{},
 		// Cluster-level addons (master-0 only).
 		"cluster-rbac":           clusterrbac.Module{},
 		"cluster-flannel":        clusterflannel.Module{},

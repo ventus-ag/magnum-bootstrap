@@ -274,6 +274,12 @@ func (e *Executor) SystemctlIsActive(unit string) bool {
 	return err == nil && strings.TrimSpace(out) == "active"
 }
 
+// SystemctlExists returns true if the given unit file is known to systemd.
+func (e *Executor) SystemctlExists(unit string) bool {
+	_, err := e.RunCapture("systemctl", "cat", unit)
+	return err == nil
+}
+
 // SystemctlIsEnabled returns true if the given unit is enabled.
 func (e *Executor) SystemctlIsEnabled(unit string) bool {
 	out, err := e.RunCapture("systemctl", "is-enabled", unit)
