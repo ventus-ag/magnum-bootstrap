@@ -160,6 +160,28 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 
 		// Trigger tokens
 		"caRotationId": pulumi.String(cfg.Trigger.CARotationID),
+
+		// Addon feature flags — tracked so Pulumi can diff enabled/disabled
+		// state between runs and show meaningful plan output.
+		"cloudProviderEnabled":  pulumi.Bool(cfg.Shared.CloudProviderEnabled),
+		"metricsServerEnabled":  pulumi.Bool(cfg.Shared.MetricsServerEnabled),
+		"autoHealingEnabled":    pulumi.Bool(cfg.Shared.AutoHealingEnabled),
+		"autoScalingEnabled":    pulumi.Bool(cfg.Shared.AutoScalingEnabled),
+		"cinderCsiPluginEnabled": pulumi.Bool(cfg.Shared.CinderCSIPluginEnabled),
+		"manilaCSIPluginEnabled": pulumi.Bool(cfg.Shared.ManilaCSIPluginEnabled),
+
+		// Addon chart versions — tracked so Pulumi detects version changes.
+		"flannelTag":          pulumi.String(cfg.Shared.FlannelTag),
+		"corednsTag":          pulumi.String(cfg.Shared.CorednsTag),
+		"corednsChartTag":     pulumi.String(cfg.Shared.CoreDNSChartTag),
+		"occmChartTag":        pulumi.String(cfg.Shared.OCCMChartTag),
+		"occmImageTag":        pulumi.String(cfg.Shared.OCCMImageTag),
+		"cinderCsiChartTag":   pulumi.String(cfg.Shared.CinderCSIChartTag),
+		"manilaCsiChartTag":   pulumi.String(cfg.Shared.ManilaCSIChartTag),
+		"nfsCsiChartTag":      pulumi.String(cfg.Shared.NFSCSIChartTag),
+		"metricsServerChartTag": pulumi.String(cfg.Shared.MetricsServerChartTag),
+		"autoscalerChartTag":  pulumi.String(cfg.Shared.AutoscalerChartTag),
+		"npdChartTag":         pulumi.String(cfg.Shared.NPDChartTag),
 	}
 
 	// Role-specific fields
