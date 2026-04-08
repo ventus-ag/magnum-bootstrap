@@ -50,7 +50,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Namespace:   "kubernetes-dashboard",
 		Chart:       "kubernetes-dashboard",
 		Version:     chartVersion,
-		RepoURL:     "https://kubernetes.github.io/dashboard",
+		RepoURL:     "https://kubernetes-retired.github.io/dashboard/",
 		Values: map[string]interface{}{
 			"app": map[string]interface{}{
 				"scheduling": map[string]interface{}{
