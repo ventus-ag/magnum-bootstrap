@@ -119,11 +119,11 @@ func Load(path string) (Config, error) {
 			MetricsServerEnabled:  parseBool(raw["METRICS_SERVER_ENABLED"]),
 			MetricsServerChartTag: raw["METRICS_SERVER_CHART_TAG"],
 
-			NPDEnabled:  parseBool(raw["NPD_ENABLED"]),
 			NPDChartTag: raw["NPD_CHART_TAG"],
 
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
+			AutoHealerTag:         raw["MAGNUM_AUTO_HEALER_TAG"],
 
 			AutoScalingEnabled:   parseBool(raw["AUTO_SCALING_ENABLED"]),
 			AutoscalerChartTag:   raw["AUTOSCALER_CHART_TAG"],
@@ -131,9 +131,9 @@ func Load(path string) (Config, error) {
 			MaxNodeCount:         parseInt(raw["MAX_NODE_COUNT"]),
 
 			VolumeDriver:           raw["VOLUME_DRIVER"],
-			CinderCSIPluginEnabled: parseBool(raw["CINDER_CSI_PLUGIN_ENABLED"]),
+			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
 			CinderCSIChartTag:      raw["CINDER_CSI_CHART_TAG"],
-			ManilaCSIPluginEnabled: parseBool(raw["MANILA_CSI_PLUGIN_ENABLED"]),
+			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
 			ManilaCSIChartTag:      raw["MANILA_CSI_CHART_TAG"],
 			NFSCSIChartTag:         raw["NFS_CSI_CHART_TAG"],
 

@@ -20,13 +20,13 @@ func (Module) PhaseID() string { return "cluster-cinder-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIPluginEnabled
+	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
 	return clusterhelm.RunNoop(ctx, cfg, req, enabled, "cinder-csi", "kube-system")
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
-	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIPluginEnabled
+	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
 	if !cfg.IsFirstMaster() || !enabled {
 		return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:CinderCSI", name, opts...)
 	}

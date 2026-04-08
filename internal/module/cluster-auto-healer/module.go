@@ -28,7 +28,7 @@ func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	// NPD and auto-healer are both managed via Register().
 	// Adopt NPD Helm release if it was installed by legacy bash.
-	if cfg.IsFirstMaster() && cfg.Shared.NPDEnabled {
+	if cfg.IsFirstMaster() && cfg.Shared.AutoHealingEnabled {
 		if req.Apply {
 			executor := host.NewExecutor(req.Apply, req.Logger)
 			clusterhelm.AdoptHelmRelease(executor, "npd", "kube-system")
@@ -40,8 +40,7 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 
-	// Skip entirely if not first master and neither feature is enabled.
-	if !cfg.IsFirstMaster() || (!cfg.Shared.NPDEnabled && !cfg.Shared.AutoHealingEnabled) {
+	if !cfg.IsFirstMaster() || !cfg.Shared.AutoHealingEnabled {
 		return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:AutoHealer", name, opts...)
 	}
 
@@ -52,22 +51,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	childOpts := append(opts, pulumi.Parent(res))
 
 	// --- NPD (Node Problem Detector) via Helm ---
-	if cfg.Shared.NPDEnabled {
-		if err := registerNPD(ctx, name, cfg, childOpts); err != nil {
-			return nil, err
-		}
+	if err := registerNPD(ctx, name, cfg, childOpts); err != nil {
+		return nil, err
 	}
 
 	// --- magnum-auto-healer DaemonSet ---
-	if cfg.Shared.AutoHealingEnabled {
-		if err := registerAutoHealer(ctx, name, cfg, childOpts); err != nil {
-			return nil, err
-		}
+	if err := registerAutoHealer(ctx, name, cfg, childOpts); err != nil {
+		return nil, err
 	}
 
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
-		"npdEnabled":         pulumi.Bool(cfg.Shared.NPDEnabled),
-		"autoHealingEnabled": pulumi.Bool(cfg.Shared.AutoHealingEnabled),
+		"autoHealingEnabled": pulumi.Bool(true),
 	}); err != nil {
 		return nil, err
 	}
@@ -139,6 +133,11 @@ func registerAutoHealer(ctx *pulumi.Context, name string, cfg config.Config, opt
 	prefix := cfg.Shared.ContainerInfraPrefix
 	if prefix == "" {
 		prefix = "registry.k8s.io/"
+	}
+
+	autoHealerTag := cfg.Shared.AutoHealerTag
+	if autoHealerTag == "" {
+		autoHealerTag = "v1.27.1"
 	}
 
 	roleName := cfg.Shared.LeadNodeRoleName
@@ -290,7 +289,7 @@ openstack:
 					Containers: corev1.ContainerArray{
 						&corev1.ContainerArgs{
 							Name:            pulumi.String("magnum-auto-healer"),
-							Image:           pulumi.String(prefix + "provider-os/magnum-auto-healer:v1.27.1"),
+							Image:           pulumi.String(prefix + "provider-os/magnum-auto-healer:" + autoHealerTag),
 							ImagePullPolicy: pulumi.String("Always"),
 							Args: pulumi.StringArray{
 								pulumi.String("/bin/magnum-auto-healer"),

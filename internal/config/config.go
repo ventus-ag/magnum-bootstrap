@@ -153,13 +153,13 @@ type SharedConfig struct {
 	MetricsServerEnabled  bool   `json:"metricsServerEnabled"`
 	MetricsServerChartTag string `json:"metricsServerChartTag"`
 
-	// NPD (Node Problem Detector)
-	NPDEnabled  bool   `json:"npdEnabled"`
+	// NPD (Node Problem Detector) — deployed when AutoHealingEnabled is true.
 	NPDChartTag string `json:"npdChartTag"`
 
 	// Auto-healing (magnum-auto-healer)
 	AutoHealingEnabled    bool   `json:"autoHealingEnabled"`
 	AutoHealingController string `json:"autoHealingController"`
+	AutoHealerTag         string `json:"autoHealerTag"`
 
 	// Auto-scaling
 	AutoScalingEnabled   bool   `json:"autoScalingEnabled"`
@@ -169,9 +169,9 @@ type SharedConfig struct {
 
 	// Volume / CSI
 	VolumeDriver           string `json:"volumeDriver"`
-	CinderCSIPluginEnabled bool   `json:"cinderCsiPluginEnabled"`
+	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
 	CinderCSIChartTag      string `json:"cinderCsiChartTag"`
-	ManilaCSIPluginEnabled bool   `json:"manilaCSIPluginEnabled"`
+	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
 	ManilaCSIChartTag      string `json:"manilaCSIChartTag"`
 	NFSCSIChartTag         string `json:"nfsCsiChartTag"`
 

@@ -24,7 +24,7 @@ func (Module) PhaseID() string        { return "cluster-manila-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	if !cfg.IsFirstMaster() || !cfg.Shared.ManilaCSIPluginEnabled {
+	if !cfg.IsFirstMaster() || !cfg.Shared.ManilaCSIEnabled {
 		return clusterhelm.SkipResult()
 	}
 	if req.Apply {
@@ -39,7 +39,7 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
-	if !cfg.IsFirstMaster() || !cfg.Shared.ManilaCSIPluginEnabled {
+	if !cfg.IsFirstMaster() || !cfg.Shared.ManilaCSIEnabled {
 		return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:ManilaCSI", name, opts...)
 	}
 
