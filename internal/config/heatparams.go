@@ -113,10 +113,13 @@ func Load(path string) (Config, error) {
 			OCCMChartTag: raw["OCCM_CHART_TAG"],
 			OCCMImageTag: raw["CLOUD_PROVIDER_TAG"],
 
+			KubeDashboardEnabled:  parseBool(raw["KUBE_DASHBOARD_ENABLED"]),
+			KubeDashboardChartTag: raw["KUBE_DASHBOARD_VERSION"],
+
 			MetricsServerEnabled:  parseBool(raw["METRICS_SERVER_ENABLED"]),
 			MetricsServerChartTag: raw["METRICS_SERVER_CHART_TAG"],
 
-			NPDEnabled:  !parseFalse(raw["NPD_ENABLED"]),
+			NPDEnabled:  parseBool(raw["NPD_ENABLED"]),
 			NPDChartTag: raw["NPD_CHART_TAG"],
 
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),

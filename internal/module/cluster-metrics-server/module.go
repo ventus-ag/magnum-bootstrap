@@ -47,7 +47,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.MetricsServerChartTag
 	if chartVersion == "" {
-		chartVersion = "3.11.0"
+		chartVersion = "3.12.2"
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{

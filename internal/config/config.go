@@ -145,6 +145,10 @@ type SharedConfig struct {
 	OCCMChartTag string `json:"occmChartTag"`
 	OCCMImageTag string `json:"occmImageTag"`
 
+	// Kubernetes Dashboard
+	KubeDashboardEnabled  bool   `json:"kubeDashboardEnabled"`
+	KubeDashboardChartTag string `json:"kubeDashboardChartTag"`
+
 	// Metrics server
 	MetricsServerEnabled  bool   `json:"metricsServerEnabled"`
 	MetricsServerChartTag string `json:"metricsServerChartTag"`

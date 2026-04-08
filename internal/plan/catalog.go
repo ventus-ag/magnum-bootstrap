@@ -35,6 +35,7 @@ func masterPhases() []Phase {
 		newPhase("cluster-cinder-csi", "reconcile Cinder CSI driver via Helm", false),
 		newPhase("cluster-manila-csi", "reconcile Manila CSI driver via Helm", false),
 		newPhase("cluster-metrics-server", "reconcile metrics server via Helm", false),
+		newPhase("cluster-dashboard", "reconcile Kubernetes Dashboard via Helm", false),
 		newPhase("cluster-auto-healer", "reconcile node problem detector and auto-healer", false),
 		newPhase("cluster-autoscaler", "reconcile cluster autoscaler via Helm", false),
 		newPhase("cluster-health", "verify cluster pods are healthy, restart crashlooping pods", false),
