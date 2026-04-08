@@ -53,7 +53,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.CinderCSIChartTag
 	if chartVersion == "" {
-		chartVersion = "2.27.1"
+		chartVersion = "2.35.0"
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
@@ -148,12 +148,6 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 							},
 						},
 						"kubeletDir": "/var/lib/kubelet",
-					},
-				},
-				"snapshotController": map[string]interface{}{
-					"enabled": true,
-					"image": map[string]interface{}{
-						"repository": csiPrefix + "snapshot-controller",
 					},
 				},
 			},

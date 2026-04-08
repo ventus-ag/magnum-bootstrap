@@ -167,6 +167,8 @@ net.ipv4.conf.all.promote_secondaries = 1
 net.ipv4.conf.*.accept_source_route = 1
 net.ipv4.ip_unprivileged_port_start = 0
 net.ipv4.ping_group_range = 0 2147483647
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 1048576
 `
 	change, err := executor.EnsureFile("/etc/sysctl.d/k8s_custom.conf", []byte(content), 0o644)
 	if err != nil {

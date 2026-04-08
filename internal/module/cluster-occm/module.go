@@ -47,7 +47,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.OCCMChartTag
 	if chartVersion == "" {
-		chartVersion = "2.27.1"
+		chartVersion = "2.35.0"
 	}
 
 	imageTag := cfg.Shared.OCCMImageTag
