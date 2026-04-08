@@ -2,6 +2,7 @@ package clusterdashboard
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -40,9 +41,29 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		roleName = "master"
 	}
 
-	chartVersion := cfg.Shared.KubeDashboardChartTag
+	chartVersion := strings.TrimPrefix(cfg.Shared.KubeDashboardChartTag, "v")
 	if chartVersion == "" {
 		chartVersion = "7.14.0"
+	}
+
+	nodeSelector := map[string]interface{}{
+		"node-role.kubernetes.io/" + roleName: "",
+	}
+	tolerations := []interface{}{
+		map[string]interface{}{
+			"key":      "node-role.kubernetes.io/control-plane",
+			"operator": "Exists",
+			"effect":   "NoSchedule",
+		},
+		map[string]interface{}{
+			"key":      "node-role.kubernetes.io/master",
+			"operator": "Exists",
+			"effect":   "NoSchedule",
+		},
+		map[string]interface{}{
+			"key":      "CriticalAddonsOnly",
+			"operator": "Exists",
+		},
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
@@ -54,24 +75,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Values: map[string]interface{}{
 			"app": map[string]interface{}{
 				"scheduling": map[string]interface{}{
-					"nodeSelector": map[string]interface{}{
-						"node-role.kubernetes.io/" + roleName: "",
-					},
-					"tolerations": []interface{}{
-						map[string]interface{}{
-							"effect":   "NoSchedule",
-							"operator": "Exists",
-						},
-						map[string]interface{}{
-							"key":      "CriticalAddonsOnly",
-							"operator": "Exists",
-						},
-						map[string]interface{}{
-							"effect":   "NoExecute",
-							"operator": "Exists",
-						},
-					},
+					"nodeSelector": nodeSelector,
 				},
+				"tolerations": tolerations,
+			},
+			"auth":           map[string]interface{}{"nodeSelector": nodeSelector},
+			"api":            map[string]interface{}{"nodeSelector": nodeSelector},
+			"web":            map[string]interface{}{"nodeSelector": nodeSelector},
+			"metricsScraper": map[string]interface{}{"nodeSelector": nodeSelector},
+			"kong": map[string]interface{}{
+				"nodeSelector": nodeSelector,
+				"tolerations":  tolerations,
 			},
 		},
 	}, childOpts...)
