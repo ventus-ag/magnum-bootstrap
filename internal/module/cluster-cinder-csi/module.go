@@ -6,7 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
-	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -16,7 +16,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cluster-cinder-csi" }
+func (Module) PhaseID() string        { return "cluster-cinder-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -53,7 +53,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.CinderCSIChartTag
 	if chartVersion == "" {
-		chartVersion = "2.35.0"
+		chartVersion = "2.30.0"
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
