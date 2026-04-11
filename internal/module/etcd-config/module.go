@@ -658,13 +658,14 @@ func etcdctlArgs(endpoint, certDir string, tlsDisabled bool) []string {
 	return args
 }
 
-// runEtcdctl runs etcdctl with ETCDCTL_API=3 and retry logic (3 attempts, 3s delay),
+// runEtcdctl runs etcdctl with retry logic (3 attempts, 3s delay),
 // matching bash's run_etcdctl function.
+// Note: ETCDCTL_API=3 is not set because etcd 3.5+ removed the v2 API
+// entirely — v3 is the only API and the env var is unrecognized.
 func runEtcdctl(executor *host.Executor, args ...string) (string, error) {
-	fullArgs := append([]string{"ETCDCTL_API=3", "/usr/local/bin/etcdctl"}, args...)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		out, err := executor.RunCapture("env", fullArgs...)
+		out, err := executor.RunCapture("/usr/local/bin/etcdctl", args...)
 		if err == nil {
 			return out, nil
 		}
