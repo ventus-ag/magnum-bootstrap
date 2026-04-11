@@ -148,11 +148,6 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 							"mountPath": "/etc/kubernetes/certs/ca-bundle.crt",
 							"readOnly":  true,
 						},
-						map[string]interface{}{
-							"name":      "cloud-config",
-							"mountPath": "/etc/kubernetes/config/",
-							"readOnly":  true,
-						},
 					},
 					"controllerPlugin": map[string]interface{}{
 						"nodeSelector": map[string]interface{}{
