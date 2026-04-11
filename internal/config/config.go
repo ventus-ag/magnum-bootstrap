@@ -162,10 +162,9 @@ type SharedConfig struct {
 	MaxNodeCount       int  `json:"maxNodeCount"`
 
 	// Volume / CSI
-	VolumeDriver           string `json:"volumeDriver"`
-	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
-	CinderCSIChartTag      string `json:"cinderCsiChartTag"`
-	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
+	VolumeDriver      string `json:"volumeDriver"`
+	CinderCSIEnabled  bool   `json:"cinderCsiEnabled"`
+	ManilaCSIEnabled  bool   `json:"manilaCSIEnabled"`
 	ManilaCSIChartTag      string `json:"manilaCSIChartTag"`
 	NFSCSIChartTag         string `json:"nfsCsiChartTag"`
 

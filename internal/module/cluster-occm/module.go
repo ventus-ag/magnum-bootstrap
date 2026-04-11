@@ -2,7 +2,6 @@ package clusteroccm
 
 import (
 	"context"
-	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -27,20 +26,6 @@ var occmImageTags = map[string]string{
 	"1.26": "v1.26.4",
 	"1.25": "v1.25.6",
 	"1.24": "v1.24.6",
-}
-
-// occmImageTagForKube returns the OCCM image tag that matches the given
-// Kubernetes version.
-func occmImageTagForKube(kubeVersion string) string {
-	v := strings.TrimPrefix(kubeVersion, "v")
-	parts := strings.SplitN(v, ".", 3)
-	if len(parts) >= 2 {
-		minor := parts[0] + "." + parts[1]
-		if tag, ok := occmImageTags[minor]; ok {
-			return tag
-		}
-	}
-	return "v1.24.6"
 }
 
 type Module struct{}
@@ -79,7 +64,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 
 	chartVersion := "2.35.0"
-	imageTag := occmImageTagForKube(cfg.Shared.KubeVersion)
+	imageTag := config.LookupByKubeVersion(occmImageTags, cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "openstack-ccm",

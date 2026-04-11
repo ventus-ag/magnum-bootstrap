@@ -125,9 +125,8 @@ func Load(path string) (Config, error) {
 			MinNodeCount:       parseInt(raw["MIN_NODE_COUNT"]),
 			MaxNodeCount:         parseInt(raw["MAX_NODE_COUNT"]),
 
-			VolumeDriver:           raw["VOLUME_DRIVER"],
+			VolumeDriver:     raw["VOLUME_DRIVER"],
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
-			CinderCSIChartTag:      raw["CINDER_CSI_CHART_TAG"],
 			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
 			ManilaCSIChartTag:      raw["MANILA_CSI_CHART_TAG"],
 			NFSCSIChartTag:         raw["NFS_CSI_CHART_TAG"],

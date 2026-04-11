@@ -10,6 +10,24 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+// cinderCSIChartVersions maps Kubernetes minor version to the matching
+// openstack-cinder-csi Helm chart version.
+// Update: https://github.com/kubernetes/cloud-provider-openstack/releases
+var cinderCSIChartVersions = map[string]string{
+	"1.35": "2.35.0",
+	"1.34": "2.34.3",
+	"1.33": "2.33.1",
+	"1.32": "2.32.2",
+	"1.31": "2.31.8",
+	"1.30": "2.30.3",
+	"1.29": "2.29.2",
+	"1.28": "2.28.3",
+	"1.27": "2.27.3",
+	"1.26": "2.26.4",
+	"1.25": "2.25.1",
+	"1.24": "2.24.0",
+}
+
 type Module struct{}
 
 type Resource struct {
@@ -51,10 +69,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		pluginPrefix = "registry.k8s.io/provider-os/"
 	}
 
-	chartVersion := cfg.Shared.CinderCSIChartTag
-	if chartVersion == "" {
-		chartVersion = "2.30.0"
-	}
+	chartVersion := config.LookupByKubeVersion(cinderCSIChartVersions, cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "cinder-csi",
