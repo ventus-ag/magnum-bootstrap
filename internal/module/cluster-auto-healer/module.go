@@ -58,6 +58,9 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		if req.Apply {
 			executor := host.NewExecutor(req.Apply, req.Logger)
 			clusterhelm.AdoptHelmRelease(executor, "npd", "kube-system")
+			// Clean up failed NPD release so Pulumi can recreate it cleanly
+			// (e.g. after PSA rejection with old privileged values).
+			clusterhelm.CleanupFailedRelease(executor, "npd", "kube-system")
 		}
 	}
 	return moduleapi.Result{}, nil
@@ -129,6 +132,9 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 			"logDir": map[string]interface{}{
 				"host": "/var/log/",
 				"pod":  "",
+			},
+			"securityContext": map[string]interface{}{
+				"privileged": false,
 			},
 			"tolerations": []interface{}{
 				map[string]interface{}{

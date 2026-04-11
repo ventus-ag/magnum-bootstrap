@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	helmv3 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -88,6 +89,21 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 
 	// First attempt: write import marker. Register() will try pulumi.Import().
 	_ = os.WriteFile(importing, []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
+}
+
+// CleanupFailedRelease checks if a Helm release is in "failed" or
+// "pending-install" state and uninstalls it so the next Pulumi up can
+// recreate it cleanly. This avoids the need for global ForceUpdate which
+// would disrupt healthy releases during normal value changes.
+func CleanupFailedRelease(executor *host.Executor, releaseName, namespace string) {
+	out, err := executor.RunCapture("helm", "status", releaseName, "-n", namespace, "-o", "json")
+	if err != nil {
+		return // release doesn't exist
+	}
+	// Quick check for failed/pending states without full JSON parsing.
+	if strings.Contains(out, `"status":"failed"`) || strings.Contains(out, `"status":"pending-install"`) {
+		_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
+	}
 }
 
 // MarkAdopted writes the adopted marker and removes the import marker after a
