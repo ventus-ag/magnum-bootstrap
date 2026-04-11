@@ -11,6 +11,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -40,10 +41,23 @@ type Resource struct {
 func (Module) PhaseID() string        { return "cluster-rbac" }
 func (Module) Dependencies() []string { return []string{"health"} }
 
-func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() {
 		return moduleapi.Result{}, nil
 	}
+
+	// Label kube-system namespace with Pod Security Admission "privileged"
+	// enforcement. K8s 1.25+ enables PSA by default — without this,
+	// infrastructure DaemonSets (CSI, OCCM) that need privileged containers
+	// are rejected. Applied imperatively here to guarantee it runs before
+	// any Helm releases in Register().
+	executor := host.NewExecutor(req.Apply, req.Logger)
+	_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+		"label", "namespace", "kube-system",
+		"pod-security.kubernetes.io/enforce=privileged",
+		"pod-security.kubernetes.io/audit=privileged",
+		"pod-security.kubernetes.io/warn=privileged",
+		"--overwrite")
 
 	return moduleapi.Result{
 		Outputs: map[string]string{"firstMaster": "true"},
@@ -62,29 +76,8 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	childOpts := append(opts, pulumi.Parent(res))
 
-	// Label kube-system namespace with Pod Security Admission "privileged"
-	// enforcement. K8s 1.25+ enables PSA by default — without this label,
-	// infrastructure DaemonSets (CSI drivers, OCCM, etc.) that need
-	// privileged containers are rejected.
-	_, err := corev1.NewNamespacePatch(ctx, name+"-kube-system-psa", &corev1.NamespacePatchArgs{
-		Metadata: &metav1.ObjectMetaPatchArgs{
-			Name: pulumi.String("kube-system"),
-			Labels: pulumi.StringMap{
-				"pod-security.kubernetes.io/enforce": pulumi.String("privileged"),
-				"pod-security.kubernetes.io/audit":   pulumi.String("privileged"),
-				"pod-security.kubernetes.io/warn":    pulumi.String("privileged"),
-			},
-			Annotations: pulumi.StringMap{
-				"pulumi.com/patchForce": pulumi.String("true"),
-			},
-		},
-	}, childOpts...)
-	if err != nil {
-		return nil, err
-	}
-
 	// ClusterRole: system:kube-apiserver-to-kubelet
-	_, err = rbacv1.NewClusterRole(ctx, name+"-apiserver-kubelet", &rbacv1.ClusterRoleArgs{
+	_, err := rbacv1.NewClusterRole(ctx, name+"-apiserver-kubelet", &rbacv1.ClusterRoleArgs{
 		Metadata: mergeMetadata("system:kube-apiserver-to-kubelet", ""),
 		Rules: rbacv1.PolicyRuleArray{
 			&rbacv1.PolicyRuleArgs{
