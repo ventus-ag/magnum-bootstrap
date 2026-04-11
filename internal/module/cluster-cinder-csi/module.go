@@ -6,6 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
@@ -39,7 +40,25 @@ func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
-	return clusterhelm.RunNoop(ctx, cfg, req, enabled, "cinder-csi", "kube-system")
+	if !cfg.IsFirstMaster() || !enabled {
+		return clusterhelm.SkipResult()
+	}
+	if req.Apply {
+		executor := host.NewExecutor(req.Apply, req.Logger)
+		clusterhelm.AdoptHelmRelease(executor, "cinder-csi", "kube-system")
+		clusterhelm.CleanupFailedRelease(executor, "cinder-csi", "kube-system")
+
+		// Write cloud.conf to host so chart can mount it via hostPath
+		// (works with both chart 2.24.x and 2.35.x).
+		cloudConf := "[Global]\nauth-url=" + cfg.Shared.AuthURL +
+			"\nuser-id=" + cfg.Shared.TrusteeUserID +
+			"\npassword=" + cfg.Shared.TrusteePassword +
+			"\ntrust-id=" + cfg.Shared.TrustID +
+			"\nregion=" + cfg.Shared.RegionName +
+			"\nca-file=/etc/kubernetes/ca-bundle.crt\n"
+		_, _ = executor.EnsureFile("/etc/kubernetes/cloud.conf", []byte(cloudConf), 0o600)
+	}
+	return moduleapi.Result{}, nil
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
@@ -167,14 +186,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				},
 			},
 			"secret": map[string]interface{}{
-				"enabled":   true,
-				"create":    true,
-				"hostMount": false,
-				"filename":  "cloud.conf",
-				"name":      "cinder-csi-cloud-config",
-				"data": map[string]interface{}{
-					"cloud.conf": "[Global]\nauth-url=" + cfg.Shared.AuthURL + "\nuser-id=" + cfg.Shared.TrusteeUserID + "\npassword=" + cfg.Shared.TrusteePassword + "\ntrust-id=" + cfg.Shared.TrustID + "\nregion=" + cfg.Shared.RegionName + "\nca-file=/etc/kubernetes/certs/ca-bundle.crt",
-				},
+				"enabled": false,
 			},
 			"storageClass": map[string]interface{}{
 				"enabled": true,
