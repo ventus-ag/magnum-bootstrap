@@ -6,6 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
@@ -54,7 +55,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.CoreDNSChartTag
 	if chartVersion == "" {
-		chartVersion = "1.22.0"
+		chartVersion = corednsChartDefault(cfg.Shared.KubeTag)
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
@@ -184,10 +185,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 							"name":       "forward",
 							"parameters": ". 1.1.1.1 1.0.0.1 /etc/resolv.conf",
 						},
-						map[string]interface{}{
-							"name":       "cache",
-							"parameters": "30",
-						},
+						corednsCachePlugin(cfg.Shared.KubeTag),
 						map[string]interface{}{
 							"name": "loop",
 						},
@@ -217,4 +215,49 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+// corednsChartVersions maps K8s minor version to a compatible CoreDNS Helm chart version.
+var corednsChartVersions = map[string]string{
+	"1.35": "1.36.2",
+	"1.34": "1.36.2",
+	"1.33": "1.32.0",
+	"1.32": "1.32.0",
+	"1.31": "1.31.0",
+	"1.30": "1.29.0",
+	"1.29": "1.29.0",
+	"1.28": "1.28.2",
+	"1.27": "1.24.0",
+	"1.26": "1.24.0",
+	"1.25": "1.22.0",
+	"1.24": "1.22.0",
+	"1.23": "1.22.0",
+	"1.22": "1.19.4",
+	"1.21": "1.19.4",
+	"1.20": "1.19.4",
+}
+
+func corednsChartDefault(kubeTag string) string {
+	v := config.LookupByKubeVersion(corednsChartVersions, kubeTag)
+	if v == "" {
+		return "1.36.2"
+	}
+	return v
+}
+
+// corednsCachePlugin returns the cache plugin entry for the CoreDNS Corefile.
+// K8s >= 1.32 (kubeadm) adds "disable success" and "disable denial" to prevent
+// conflicting cached responses during rolling updates.
+func corednsCachePlugin(kubeTag string) map[string]interface{} {
+	if kubeletconfig.KubeMinorAtLeast(kubeTag, 32) {
+		return map[string]interface{}{
+			"name":        "cache",
+			"parameters":  "30",
+			"configBlock": "disable success\ndisable denial",
+		}
+	}
+	return map[string]interface{}{
+		"name":       "cache",
+		"parameters": "30",
+	}
 }

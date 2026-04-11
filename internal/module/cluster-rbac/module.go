@@ -171,6 +171,55 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
+	// ClusterRole: system:pod-interactive-access
+	// K8s 1.35+ requires CREATE verb on pods/exec, pods/attach, pods/portforward
+	// subresources for WebSocket-based streaming operations.
+	_, err = rbacv1.NewClusterRole(ctx, name+"-pod-interactive", &rbacv1.ClusterRoleArgs{
+		Metadata: mergeMetadata("system:pod-interactive-access", ""),
+		Rules: rbacv1.PolicyRuleArray{
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.StringArray{pulumi.String("")},
+				Resources: pulumi.StringArray{
+					pulumi.String("pods/exec"),
+					pulumi.String("pods/attach"),
+					pulumi.String("pods/portforward"),
+				},
+				Verbs: pulumi.StringArray{
+					pulumi.String("create"),
+					pulumi.String("get"),
+				},
+			},
+		},
+	}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// ClusterRoleBinding: system:pod-interactive-access -> system:masters + system:nodes
+	_, err = rbacv1.NewClusterRoleBinding(ctx, name+"-pod-interactive-binding", &rbacv1.ClusterRoleBindingArgs{
+		Metadata: mergeMetadata("system:pod-interactive-access", ""),
+		RoleRef: &rbacv1.RoleRefArgs{
+			ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+			Kind:     pulumi.String("ClusterRole"),
+			Name:     pulumi.String("system:pod-interactive-access"),
+		},
+		Subjects: rbacv1.SubjectArray{
+			&rbacv1.SubjectArgs{
+				ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+				Kind:     pulumi.String("Group"),
+				Name:     pulumi.String("system:masters"),
+			},
+			&rbacv1.SubjectArgs{
+				ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+				Kind:     pulumi.String("Group"),
+				Name:     pulumi.String("system:nodes"),
+			},
+		},
+	}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
 	// Secret: os-trustee
 	caBundle := ""
 	if data, err := os.ReadFile("/etc/kubernetes/ca-bundle.crt"); err == nil {

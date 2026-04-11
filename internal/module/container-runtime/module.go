@@ -9,6 +9,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -108,7 +109,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Ensure directories.
-	for _, dir := range []string{"/etc/containerd", "/opt/cni/bin"} {
+	for _, dir := range []string{"/etc/containerd", "/etc/containerd/certs.d", "/opt/cni/bin"} {
 		change, err := executor.EnsureDir(dir, 0o755)
 		if err != nil {
 			return nil, err
@@ -119,13 +120,39 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Write containerd config.toml — EnsureFile is idempotent.
-	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(containerdConfig()), 0o644)
+	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(containerdConfig(cfg.Shared.KubeTag)), 0o644)
 	if err != nil {
 		return nil, err
 	}
 	if change != nil {
 		changes = append(changes, *change)
 		configChanged = true
+	}
+
+	// Write Docker Hub registry host config (containerd 2.x registry config_path).
+	// Only needed for containerd 2.x (K8s >= 1.35); older versions use inline
+	// registry.mirrors in config.toml.
+	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 35) {
+		dockerHubHost := `server = "https://registry-1.docker.io"
+
+[host."https://registry-1.docker.io"]
+  capabilities = ["pull", "resolve"]
+`
+		change, err = executor.EnsureDir("/etc/containerd/certs.d/docker.io", 0o755)
+		if err != nil {
+			return nil, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+		}
+		change, err = executor.EnsureFile("/etc/containerd/certs.d/docker.io/hosts.toml", []byte(dockerHubHost), 0o644)
+		if err != nil {
+			return nil, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+			configChanged = true
+		}
 	}
 
 	// Daemon-reload when tarball was extracted (may contain updated service
@@ -188,8 +215,81 @@ func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change,
 	return changes, nil
 }
 
-func containerdConfig() string {
-	return `version = 2
+// pauseImage returns the appropriate pause container image for the given K8s version.
+var pauseImageVersions = map[string]string{
+	"1.35": "3.10",
+	"1.34": "3.10",
+	"1.33": "3.10",
+	"1.32": "3.10",
+	"1.31": "3.9",
+	"1.30": "3.9",
+	"1.29": "3.9",
+	"1.28": "3.9",
+	"1.27": "3.9",
+	"1.26": "3.9",
+	"1.25": "3.8",
+	"1.24": "3.7",
+	"1.23": "3.6",
+	"1.22": "3.5",
+	"1.21": "3.4.1",
+	"1.20": "3.2",
+}
+
+func pauseImage(kubeTag string) string {
+	v := config.LookupByKubeVersion(pauseImageVersions, kubeTag)
+	if v == "" {
+		v = "3.10"
+	}
+	return "registry.k8s.io/pause:" + v
+}
+
+// containerdConfig returns the containerd config.toml for the given K8s version.
+// K8s >= 1.35 targets containerd 2.x (version = 3 config format).
+// Older versions use containerd 1.x (version = 2 config format).
+func containerdConfig(kubeTag string) string {
+	pause := pauseImage(kubeTag)
+
+	if kubeletconfig.KubeMinorAtLeast(kubeTag, 35) {
+		return containerdV3Config(pause)
+	}
+	return containerdV2Config(pause)
+}
+
+// containerdV3Config returns a containerd 2.x (config version 3) config.
+func containerdV3Config(pause string) string {
+	return fmt.Sprintf(`version = 3
+
+[plugins]
+  [plugins."io.containerd.cri.v1.images"]
+    sandbox_image = "%s"
+
+  [plugins."io.containerd.cri.v1.images".pinned_images]
+    sandbox = "%s"
+
+  [plugins."io.containerd.cri.v1.images".registry]
+    config_path = "/etc/containerd/certs.d"
+
+  [plugins."io.containerd.cri.v1.runtime"]
+    max_container_log_line_size = 16384
+    enable_unprivileged_ports = true
+    enable_unprivileged_icmp = true
+
+  [plugins."io.containerd.cri.v1.cni"]
+    bin_dir = "/opt/cni/bin"
+    conf_dir = "/etc/cni/net.d"
+
+  [plugins."io.containerd.snapshotter.v1.overlayfs"]
+
+  [plugins."io.containerd.runtime.v2.task"]
+
+[debug]
+  level = "info"
+`, pause, pause)
+}
+
+// containerdV2Config returns a containerd 1.x (config version 2) config.
+func containerdV2Config(pause string) string {
+	return fmt.Sprintf(`version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
 oom_score = 0
@@ -208,7 +308,7 @@ oom_score = 0
 
 [plugins]
   [plugins."io.containerd.grpc.v1.cri"]
-    sandbox_image = "registry.k8s.io/pause:3.9"
+    sandbox_image = "%s"
     max_container_log_line_size = 16384
     enable_unprivileged_ports = true
     enable_unprivileged_icmp = true
@@ -224,7 +324,7 @@ oom_score = 0
           endpoint = ["https://registry-1.docker.io"]
   [plugins."io.containerd.internal.v1.opt"]
     path = "/var/lib/containerd/opt"
-`
+`, pause)
 }
 
 // fileExists is a small helper that avoids importing os in the caller.

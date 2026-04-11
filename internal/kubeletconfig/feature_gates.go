@@ -16,7 +16,7 @@ func FeatureGatesYAML(kubeTag string) string {
 }
 
 func shouldDisableGracefulNodeShutdown(kubeTag string) bool {
-	major, minor, ok := parseKubeMajorMinor(kubeTag)
+	major, minor, ok := ParseKubeMajorMinor(kubeTag)
 	if !ok {
 		return false
 	}
@@ -26,7 +26,9 @@ func shouldDisableGracefulNodeShutdown(kubeTag string) bool {
 	return minor > 21 && minor < 35
 }
 
-func parseKubeMajorMinor(kubeTag string) (int, int, bool) {
+// ParseKubeMajorMinor extracts the major and minor version numbers from a
+// Kubernetes version string like "v1.32.0" or "1.32.0".
+func ParseKubeMajorMinor(kubeTag string) (int, int, bool) {
 	matches := kubeTagPattern.FindStringSubmatch(kubeTag)
 	if len(matches) != 3 {
 		return 0, 0, false
@@ -40,6 +42,15 @@ func parseKubeMajorMinor(kubeTag string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return major, minor, true
+}
+
+// KubeMinorAtLeast returns true if kubeTag parses to Kubernetes 1.N where N >= minMinor.
+func KubeMinorAtLeast(kubeTag string, minMinor int) bool {
+	major, minor, ok := ParseKubeMajorMinor(kubeTag)
+	if !ok {
+		return false
+	}
+	return major == 1 && minor >= minMinor
 }
 
 func parseDecimal(value string) (int, bool) {

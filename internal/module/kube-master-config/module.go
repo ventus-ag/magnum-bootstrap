@@ -167,18 +167,34 @@ net.ipv4.conf.all.promote_secondaries = 1
 net.ipv4.conf.*.accept_source_route = 1
 net.ipv4.ip_unprivileged_port_start = 0
 net.ipv4.ping_group_range = 0 2147483647
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
 fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 1048576
 `
+	// br_netfilter must be loaded for bridge-nf-call-iptables sysctl to work.
+	_ = executor.Run("modprobe", "br_netfilter")
+	modChange, modErr := executor.EnsureFile("/etc/modules-load.d/k8s-bridge.conf", []byte("br_netfilter\n"), 0o644)
+	if modErr != nil {
+		return nil, modErr
+	}
+
 	change, err := executor.EnsureFile("/etc/sysctl.d/k8s_custom.conf", []byte(content), 0o644)
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		_ = executor.Run("sysctl", "--system")
-		return []host.Change{*change}, nil
+	var changes []host.Change
+	if modChange != nil {
+		changes = append(changes, *modChange)
 	}
-	return nil, nil
+	if change != nil {
+		changes = append(changes, *change)
+	}
+	if len(changes) > 0 {
+		_ = executor.Run("sysctl", "--system")
+	}
+	return changes, nil
 }
 
 func writeServiceFiles(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -385,8 +401,10 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 
 	registerWithTaints := ""
 	if cfg.Shared.LeadNodeRoleName == "control-plane" {
-		registerWithTaints = `  - effect: "NoSchedule"
-    key: "node-role.kubernetes.io/control-plane"`
+		registerWithTaints = `registerWithTaints:
+  - effect: "NoSchedule"
+    key: "node-role.kubernetes.io/control-plane"
+`
 	}
 	featureGates := kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag)
 
@@ -411,14 +429,12 @@ clusterDNS:
 - %s
 clusterDomain: %s
 address: %s
-failSwapOn: True
+failSwapOn: true
 port: 10250
 readOnlyPort: 0
 containerLogMaxFiles: 5
 containerLogMaxSize: 10Mi
-registerWithTaints:
-%s
-maxPods: 110
+%smaxPods: 110
 podPidsLimit: -1
 providerID: openstack:///%s
 resolvConf: /run/systemd/resolve/resolv.conf
@@ -532,8 +548,13 @@ func buildAPIServerArgs(cfg config.Config) string {
 
 	args := []string{
 		"--runtime-config=api/all=true",
-		fmt.Sprintf("--allow-privileged=%s", cfg.Shared.KubeAllowPriv),
 		"--kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP",
+	}
+	// --allow-privileged was removed in K8s 1.27; only pass it for older versions.
+	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 27) {
+		args = append(args, fmt.Sprintf("--allow-privileged=%s", cfg.Shared.KubeAllowPriv))
+	}
+	args = append(args,
 		fmt.Sprintf("--authorization-mode=%s", authzMode),
 		fmt.Sprintf("--tls-cert-file=%s/server.crt", certDir),
 		fmt.Sprintf("--tls-private-key-file=%s/server.key", certDir),
@@ -551,7 +572,7 @@ func buildAPIServerArgs(cfg config.Config) string {
 		"--requestheader-extra-headers-prefix=X-Remote-Extra-",
 		"--requestheader-group-headers=X-Remote-Group",
 		"--requestheader-username-headers=X-Remote-User",
-	}
+	)
 	if cfg.Shared.KeystoneAuthEnabled {
 		args = append(args,
 			"--authentication-token-webhook-config-file=/etc/kubernetes/keystone_webhook_config.yaml",
@@ -575,6 +596,11 @@ func buildControllerManagerArgs(cfg config.Config) string {
 		fmt.Sprintf("--service-account-private-key-file=%s/service_account_private.key", certDir),
 		fmt.Sprintf("--root-ca-file=%s/ca.crt", certDir),
 		"--use-service-account-credentials=true",
+	}
+	// --secure-port=0 disabled the secure serving port. K8s >= 1.26 deprecated
+	// this pattern; keep it only for older versions.
+	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 26) {
+		args = append(args, "--secure-port=0")
 	}
 	if cfg.Shared.CloudProviderEnabled {
 		args = append(args, "--cloud-provider=external")
@@ -696,7 +722,6 @@ ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-controller-manager \
     --volume /etc/pki/tls/certs:/usr/share/ca-certificates:ro \
     %skube-controller-manager-%s:%s \
     kube-controller-manager \
-    --secure-port=0 \
     $KUBE_LOG_LEVEL $KUBE_MASTER $KUBE_CONTROLLER_MANAGER_ARGS'
 ExecStop=-/usr/bin/podman stop kube-controller-manager
 Delegate=yes
