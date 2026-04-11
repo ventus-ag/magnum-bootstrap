@@ -110,9 +110,6 @@ func Load(path string) (Config, error) {
 			CorednsTag:      raw["COREDNS_TAG"],
 			CoreDNSChartTag: raw["COREDNS_CHART_TAG"],
 
-			OCCMChartTag: raw["OCCM_CHART_TAG"],
-			OCCMImageTag: raw["CLOUD_PROVIDER_TAG"],
-
 			KubeDashboardEnabled:  parseBool(raw["KUBE_DASHBOARD_ENABLED"]),
 			KubeDashboardChartTag: raw["KUBE_DASHBOARD_VERSION"],
 
@@ -123,7 +120,6 @@ func Load(path string) (Config, error) {
 
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
-			AutoHealerTag:         raw["MAGNUM_AUTO_HEALER_TAG"],
 
 			AutoScalingEnabled: parseBool(raw["AUTO_SCALING_ENABLED"]),
 			MinNodeCount:       parseInt(raw["MIN_NODE_COUNT"]),

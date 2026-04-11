@@ -141,10 +141,6 @@ type SharedConfig struct {
 	CorednsTag       string `json:"corednsTag"`
 	CoreDNSChartTag  string `json:"corednsChartTag"`
 
-	// OCCM
-	OCCMChartTag string `json:"occmChartTag"`
-	OCCMImageTag string `json:"occmImageTag"`
-
 	// Kubernetes Dashboard
 	KubeDashboardEnabled  bool   `json:"kubeDashboardEnabled"`
 	KubeDashboardChartTag string `json:"kubeDashboardChartTag"`
@@ -159,7 +155,6 @@ type SharedConfig struct {
 	// Auto-healing (magnum-auto-healer)
 	AutoHealingEnabled    bool   `json:"autoHealingEnabled"`
 	AutoHealingController string `json:"autoHealingController"`
-	AutoHealerTag         string `json:"autoHealerTag"`
 
 	// Auto-scaling
 	AutoScalingEnabled bool `json:"autoScalingEnabled"`

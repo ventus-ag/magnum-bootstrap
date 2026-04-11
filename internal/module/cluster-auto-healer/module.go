@@ -3,6 +3,7 @@ package clusterautohealer
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/apps/v1"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
@@ -15,6 +16,61 @@ import (
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
+
+// npdImageTags maps Kubernetes minor version to the matching
+// node-problem-detector image tag.
+// Source: https://github.com/kubernetes/node-problem-detector/releases
+var npdImageTags = map[string]string{
+	"1.35": "v1.35.2",
+	"1.34": "v1.34.3",
+}
+
+// autoHealerTags maps Kubernetes minor version to the latest
+// magnum-auto-healer image tag.
+// Update: https://explore.ggcr.dev/?repo=registry.k8s.io%2Fprovider-os%2Fmagnum-auto-healer
+var autoHealerTags = map[string]string{
+	"1.35": "v1.35.0",
+	"1.34": "v1.34.1",
+	"1.33": "v1.33.1",
+	"1.32": "v1.32.1",
+	"1.31": "v1.31.4",
+	"1.30": "v1.30.3",
+	"1.29": "v1.29.1",
+	"1.28": "v1.28.3",
+	"1.27": "v1.27.3",
+	"1.26": "v1.26.4",
+	"1.25": "v1.25.6",
+	"1.24": "v1.24.6",
+}
+
+// kubeMinor extracts "major.minor" from a Kubernetes version string.
+func kubeMinor(kubeVersion string) string {
+	v := strings.TrimPrefix(kubeVersion, "v")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return ""
+}
+
+// npdImageTagForKube returns the node-problem-detector image tag that matches
+// the given Kubernetes version. v1.18–v1.33 all use v0.8.25; v1.34+ have
+// version-matched tags.
+func npdImageTagForKube(kubeVersion string) string {
+	if tag, ok := npdImageTags[kubeMinor(kubeVersion)]; ok {
+		return tag
+	}
+	return "v0.8.25"
+}
+
+// autoHealerTagForKube returns the magnum-auto-healer image tag that matches
+// the given Kubernetes version.
+func autoHealerTagForKube(kubeVersion string) string {
+	if tag, ok := autoHealerTags[kubeMinor(kubeVersion)]; ok {
+		return tag
+	}
+	return "v1.27.3"
+}
 
 type Module struct{}
 
@@ -76,8 +132,10 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 
 	chartVersion := cfg.Shared.NPDChartTag
 	if chartVersion == "" {
-		chartVersion = "2.3.4"
+		chartVersion = "2.4.0"
 	}
+
+	imageTag := npdImageTagForKube(cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-npd", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "npd",
@@ -89,6 +147,7 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 			"fullnameOverride": "node-problem-detector",
 			"image": map[string]interface{}{
 				"repository": prefix + "node-problem-detector/node-problem-detector",
+				"tag":        imageTag,
 			},
 			"priorityClassName": "system-node-critical",
 			"settings": map[string]interface{}{
@@ -135,10 +194,7 @@ func registerAutoHealer(ctx *pulumi.Context, name string, cfg config.Config, opt
 		prefix = "registry.k8s.io/"
 	}
 
-	autoHealerTag := cfg.Shared.AutoHealerTag
-	if autoHealerTag == "" {
-		autoHealerTag = "v1.27.1"
-	}
+	autoHealerTag := autoHealerTagForKube(cfg.Shared.KubeVersion)
 
 	roleName := cfg.Shared.LeadNodeRoleName
 	if roleName == "" {

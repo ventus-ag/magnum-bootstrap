@@ -2,6 +2,7 @@ package clusteroccm
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -9,6 +10,38 @@ import (
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
+
+// occmImageTags maps Kubernetes minor version to the latest
+// openstack-cloud-controller-manager image tag.
+// Update: https://explore.ggcr.dev/?repo=registry.k8s.io%2Fprovider-os%2Fopenstack-cloud-controller-manager
+var occmImageTags = map[string]string{
+	"1.35": "v1.35.0",
+	"1.34": "v1.34.1",
+	"1.33": "v1.33.1",
+	"1.32": "v1.32.1",
+	"1.31": "v1.31.4",
+	"1.30": "v1.30.3",
+	"1.29": "v1.29.1",
+	"1.28": "v1.28.3",
+	"1.27": "v1.27.3",
+	"1.26": "v1.26.4",
+	"1.25": "v1.25.6",
+	"1.24": "v1.24.6",
+}
+
+// occmImageTagForKube returns the OCCM image tag that matches the given
+// Kubernetes version.
+func occmImageTagForKube(kubeVersion string) string {
+	v := strings.TrimPrefix(kubeVersion, "v")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) >= 2 {
+		minor := parts[0] + "." + parts[1]
+		if tag, ok := occmImageTags[minor]; ok {
+			return tag
+		}
+	}
+	return "v1.24.6"
+}
 
 type Module struct{}
 
@@ -45,15 +78,8 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/provider-os/openstack-cloud-controller-manager"
 	}
 
-	chartVersion := cfg.Shared.OCCMChartTag
-	if chartVersion == "" {
-		chartVersion = "2.35.0"
-	}
-
-	imageTag := cfg.Shared.OCCMImageTag
-	if imageTag == "" {
-		imageTag = "v1.24.6"
-	}
+	chartVersion := "2.35.0"
+	imageTag := occmImageTagForKube(cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "openstack-ccm",
