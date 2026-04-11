@@ -372,10 +372,7 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 	}
 
 	nodeIP := cfg.ResolveNodeIP()
-	cgroupDriver := cfg.Shared.CgroupDriver
-	if cgroupDriver == "" {
-		cgroupDriver = "systemd"
-	}
+	cgroupDriver := cfg.ResolveCgroupDriver()
 	dnsServiceIP := cfg.Shared.DNSServiceIP
 	dnsClusterDomain := cfg.Shared.DNSClusterDomain
 	if dnsClusterDomain == "" {

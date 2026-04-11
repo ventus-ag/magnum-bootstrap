@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
-	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -75,17 +75,44 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		changes = append(changes, host.Change{Action: host.ActionOther, Summary: "disable docker in favour of containerd"})
 	}
 
-	// Determine tarball URL.
+	// Determine tarball URL and install layout.
+	//
+	// containerd 1.x published "cri-containerd-cni-VERSION-linux-amd64.tar.gz"
+	// which extracts to "/" and includes binaries, CNI, runc, systemd unit, and
+	// a default config.toml.
+	//
+	// containerd 2.x dropped the cri-containerd-cni bundle. It publishes
+	// "containerd-VERSION-linux-amd64.tar.gz" which contains only the containerd
+	// binaries under "bin/" and must be extracted to "/usr/local". CNI plugins
+	// and runc are installed separately (CNI is handled by the network driver
+	// module).
 	tarballURL := cfg.Shared.ContainerdTarballURL
+	useV2Layout := false
+
+	// Detect containerd major version from CONTAINERD_VERSION if available.
+	if cfg.Shared.ContainerdVersion != "" {
+		if major, _, ok := parseContainerdMajor(cfg.Shared.ContainerdVersion); ok && major >= 2 {
+			useV2Layout = true
+		}
+	}
+
 	if tarballURL == "" && cfg.Shared.ContainerdVersion != "" {
-		tarballURL = fmt.Sprintf(
-			"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
-			cfg.Shared.ContainerdVersion, cfg.Shared.ContainerdVersion,
-		)
+		if useV2Layout {
+			tarballURL = fmt.Sprintf(
+				"https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz",
+				cfg.Shared.ContainerdVersion, cfg.Shared.ContainerdVersion,
+			)
+		} else {
+			tarballURL = fmt.Sprintf(
+				"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
+				cfg.Shared.ContainerdVersion, cfg.Shared.ContainerdVersion,
+			)
+		}
 	}
 
 	if tarballURL != "" {
-		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, "/srv/magnum/cri-containerd-cni.tar.gz", 0o644, 5)
+		localPath := "/srv/magnum/containerd.tar.gz"
+		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
 		if err != nil {
 			return nil, fmt.Errorf("download containerd tarball: %w", err)
 		}
@@ -93,16 +120,27 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			changes = append(changes, *dl.Change)
 		}
 		if dl.Changed && executor.Apply {
-			if err := executor.Run("tar", "xzf", "/srv/magnum/cri-containerd-cni.tar.gz",
-				"-C", "/",
-				"--no-same-owner", "--touch", "--no-same-permissions",
-				"--exclude=etc/cni/net.d",
-				"--exclude=etc/containerd/config.toml",
-				"--exclude=opt/cni/bin",
-				"--exclude=*.txt",
-				"--exclude=opt/containerd/cluster/gce",
-			); err != nil {
-				return nil, fmt.Errorf("extract containerd tarball: %w", err)
+			if useV2Layout {
+				// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
+				if err := executor.Run("tar", "xzf", localPath,
+					"-C", "/usr/local",
+					"--no-same-owner", "--touch", "--no-same-permissions",
+				); err != nil {
+					return nil, fmt.Errorf("extract containerd tarball: %w", err)
+				}
+			} else {
+				// containerd 1.x cri-containerd-cni bundle: extract to /.
+				if err := executor.Run("tar", "xzf", localPath,
+					"-C", "/",
+					"--no-same-owner", "--touch", "--no-same-permissions",
+					"--exclude=etc/cni/net.d",
+					"--exclude=etc/containerd/config.toml",
+					"--exclude=opt/cni/bin",
+					"--exclude=*.txt",
+					"--exclude=opt/containerd/cluster/gce",
+				); err != nil {
+					return nil, fmt.Errorf("extract containerd tarball: %w", err)
+				}
 			}
 			tarballExtracted = true
 		}
@@ -120,7 +158,16 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Write containerd config.toml — EnsureFile is idempotent.
-	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(containerdConfig(cfg.Shared.KubeTag)), 0o644)
+	// Config format is driven by containerd version (not K8s version):
+	// containerd 2.x requires version=3 config with new CRI plugin paths.
+	pause := pauseImage(cfg.Shared.KubeTag)
+	var configContent string
+	if useV2Layout {
+		configContent = containerdV3Config(pause)
+	} else {
+		configContent = containerdV2Config(pause)
+	}
+	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(configContent), 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -130,9 +177,9 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Write Docker Hub registry host config (containerd 2.x registry config_path).
-	// Only needed for containerd 2.x (K8s >= 1.35); older versions use inline
+	// containerd 2.x uses config_path-based registry config instead of inline
 	// registry.mirrors in config.toml.
-	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 35) {
+	if useV2Layout {
 		dockerHubHost := `server = "https://registry-1.docker.io"
 
 [host."https://registry-1.docker.io"]
@@ -178,10 +225,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	var changes []host.Change
 
-	cgroupDriver := cfg.Shared.CgroupDriver
-	if cgroupDriver == "" {
-		cgroupDriver = "systemd"
-	}
+	cgroupDriver := cfg.ResolveCgroupDriver()
 
 	dropinDir := "/etc/systemd/system/docker.service.d"
 	change, err := executor.EnsureDir(dropinDir, 0o755)
@@ -241,18 +285,6 @@ func pauseImage(kubeTag string) string {
 		v = "3.10"
 	}
 	return "registry.k8s.io/pause:" + v
-}
-
-// containerdConfig returns the containerd config.toml for the given K8s version.
-// K8s >= 1.35 targets containerd 2.x (version = 3 config format).
-// Older versions use containerd 1.x (version = 2 config format).
-func containerdConfig(kubeTag string) string {
-	pause := pauseImage(kubeTag)
-
-	if kubeletconfig.KubeMinorAtLeast(kubeTag, 35) {
-		return containerdV3Config(pause)
-	}
-	return containerdV2Config(pause)
 }
 
 // containerdV3Config returns a containerd 2.x (config version 3) config.
@@ -327,10 +359,21 @@ oom_score = 0
 `, pause)
 }
 
-// fileExists is a small helper that avoids importing os in the caller.
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+// parseContainerdMajor extracts the major version from a containerd version
+// string like "2.2.2" or "1.7.27". Returns (major, rest, ok).
+func parseContainerdMajor(version string) (int, string, bool) {
+	dot := strings.IndexByte(version, '.')
+	if dot < 1 {
+		return 0, "", false
+	}
+	n := 0
+	for _, ch := range version[:dot] {
+		if ch < '0' || ch > '9' {
+			return 0, "", false
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, version[dot+1:], true
 }
 
 // Destroy stops container runtime services and removes runtime data.

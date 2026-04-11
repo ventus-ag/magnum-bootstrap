@@ -3,9 +3,11 @@ package config
 import (
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -303,6 +305,54 @@ func (c Config) ResolveNodeIP() string {
 		return ""
 	}
 	return strings.TrimSpace(string(body))
+}
+
+// ResolveCgroupDriver returns the cgroup driver to use.
+//
+// If CGROUP_DRIVER is set in heat-params, that value is used (explicit
+// override). Otherwise the driver is auto-detected from the host:
+//   - cgroup v2 → "systemd" (the only supported driver)
+//   - cgroup v1 + systemd init → "systemd"
+//   - cgroup v1 + non-systemd init → "cgroupfs"
+func (c Config) ResolveCgroupDriver() string {
+	if c.Shared.CgroupDriver != "" {
+		return c.Shared.CgroupDriver
+	}
+	return detectCgroupDriver()
+}
+
+func detectCgroupDriver() string {
+	// cgroup v2 (unified mode) requires systemd as the cgroup driver.
+	// Detection uses the same approach as runc/containerd: statfs on
+	// /sys/fs/cgroup and check for the cgroup2 filesystem magic number.
+	if IsCgroupV2() {
+		return "systemd"
+	}
+	// cgroup v1 with systemd init: systemd driver is recommended.
+	// Detection uses sd_booted() semantics: /run/systemd/system/ exists
+	// only when the system was booted with systemd as PID 1.
+	if isSystemdBooted() {
+		return "systemd"
+	}
+	return "cgroupfs"
+}
+
+// IsCgroupV2 returns true if the system is running cgroup v2 (unified mode).
+// Uses the same detection as runc's IsCgroup2UnifiedMode: statfs on
+// /sys/fs/cgroup with magic number 0x63677270 (CGROUP2_SUPER_MAGIC).
+func IsCgroupV2() bool {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/sys/fs/cgroup", &st); err != nil {
+		return false
+	}
+	return st.Type == 0x63677270 // CGROUP2_SUPER_MAGIC
+}
+
+// isSystemdBooted returns true if the system was booted with systemd.
+// Equivalent to sd_booted(3): checks for /run/systemd/system/.
+func isSystemdBooted() bool {
+	fi, err := os.Stat("/run/systemd/system")
+	return err == nil && fi.IsDir()
 }
 
 // IsPureCARotation returns true when a CA rotation is active and neither an

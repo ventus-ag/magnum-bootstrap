@@ -3,7 +3,6 @@ package prereqvalidation
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -63,7 +62,7 @@ func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (mo
 	}
 
 	// cgroup v1 detection: K8s 1.35+ refuses to start on cgroup v1 nodes.
-	if isCgroupV1() {
+	if !config.IsCgroupV2() {
 		if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 35) {
 			return moduleapi.Result{}, fmt.Errorf(
 				"cgroup v1 detected but Kubernetes >= 1.35 requires cgroup v2; "+
@@ -110,11 +109,4 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
-}
-
-// isCgroupV1 returns true if the node is running cgroup v1.
-// /sys/fs/cgroup/cgroup.controllers exists only on cgroup v2.
-func isCgroupV1() bool {
-	_, err := os.Stat("/sys/fs/cgroup/cgroup.controllers")
-	return os.IsNotExist(err)
 }
