@@ -134,7 +134,7 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 				"pod":  "",
 			},
 			"securityContext": map[string]interface{}{
-				"privileged": false,
+				"privileged": true,
 			},
 			"tolerations": []interface{}{
 				map[string]interface{}{

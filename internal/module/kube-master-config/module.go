@@ -358,25 +358,36 @@ KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379,http://127.0.0.1:4001"
 	// Exempt system namespaces so infrastructure DaemonSets (CSI drivers,
 	// OCCM, etc.) with privileged containers are not rejected.
 	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
+		// PodSecurity plugin config — separate file referenced by path.
+		// Using path instead of inline configuration for broader compatibility.
+		psaPluginConfig := `apiVersion: pod-security.admission.config.k8s.io/v1
+kind: PodSecurityConfiguration
+defaults:
+  enforce: "privileged"
+  audit: "baseline"
+  warn: "baseline"
+exemptions:
+  usernames: []
+  runtimeClasses: []
+  namespaces:
+  - kube-system
+  - kube-node-lease
+  - kube-public
+`
+		change, err = executor.EnsureFile("/etc/kubernetes/pod-security-config.yaml", []byte(psaPluginConfig), 0o644)
+		if err != nil {
+			return nil, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+		}
+
+		// Admission config — references PodSecurity config via path.
 		psaConfig := `apiVersion: apiserver.config.k8s.io/v1
 kind: AdmissionConfiguration
 plugins:
 - name: PodSecurity
-  configuration:
-    apiVersion: pod-security.admission.config.k8s.io/v1
-    kind: PodSecurityConfiguration
-    defaults:
-      enforce: "privileged"
-      enforce-version: "latest"
-      audit: "baseline"
-      audit-version: "latest"
-      warn: "baseline"
-      warn-version: "latest"
-    exemptions:
-      namespaces:
-      - kube-system
-      - kube-node-lease
-      - kube-public
+  path: /etc/kubernetes/pod-security-config.yaml
 `
 		change, err = executor.EnsureFile("/etc/kubernetes/admission-config.yaml", []byte(psaConfig), 0o644)
 		if err != nil {
