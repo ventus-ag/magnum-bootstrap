@@ -167,10 +167,11 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				},
 			},
 			"secret": map[string]interface{}{
-				"enabled":  true,
-				"create":   true,
-				"filename": "cloud.conf",
-				"name":     "cinder-csi-cloud-config",
+				"enabled":   true,
+				"create":    true,
+				"hostMount": false,
+				"filename":  "cloud.conf",
+				"name":      "cinder-csi-cloud-config",
 				"data": map[string]interface{}{
 					"cloud.conf": "[Global]\nauth-url=" + cfg.Shared.AuthURL + "\nuser-id=" + cfg.Shared.TrusteeUserID + "\npassword=" + cfg.Shared.TrusteePassword + "\ntrust-id=" + cfg.Shared.TrustID + "\nregion=" + cfg.Shared.RegionName + "\nca-file=/etc/kubernetes/certs/ca-bundle.crt",
 				},
