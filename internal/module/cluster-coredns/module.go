@@ -218,18 +218,22 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 // corednsChartVersions maps K8s minor version to a compatible CoreDNS Helm
 // chart version. Chart versions are chosen so the bundled CoreDNS appVersion
-// matches what kubeadm ships for that K8s release:
+// matches what kubeadm ships for that K8s release.
+// Source: helm search repo coredns/coredns --versions
 //
 //	chart 1.15.1 → CoreDNS 1.8.0   (K8s 1.20-1.21)
-//	chart 1.16.6 → CoreDNS 1.8.6   (K8s 1.22-1.24)
+//	chart 1.16.4 → CoreDNS 1.8.4   (K8s 1.22)
+//	chart 1.16.6 → CoreDNS 1.8.6   (K8s 1.23-1.24)
 //	chart 1.19.6 → CoreDNS 1.9.3   (K8s 1.25-1.26)
 //	chart 1.24.5 → CoreDNS 1.10.1  (K8s 1.27-1.28)
 //	chart 1.31.0 → CoreDNS 1.11.1  (K8s 1.29-1.30)
 //	chart 1.36.1 → CoreDNS 1.11.3  (K8s 1.31-1.32)
-//	chart 1.42.2 → CoreDNS 1.12.0  (K8s 1.33+)
+//	chart 1.42.2 → CoreDNS 1.12.0  (K8s 1.33)
+//	chart 1.44.3 → CoreDNS 1.12.3  (K8s 1.34)
+//	chart 1.45.2 → CoreDNS 1.13.1  (K8s 1.35)
 var corednsChartVersions = map[string]string{
-	"1.35": "1.42.2",
-	"1.34": "1.42.2",
+	"1.35": "1.45.2",
+	"1.34": "1.44.3",
 	"1.33": "1.42.2",
 	"1.32": "1.36.1",
 	"1.31": "1.36.1",
@@ -247,33 +251,29 @@ var corednsChartVersions = map[string]string{
 }
 
 // corednsImageTags maps K8s minor version to the CoreDNS image tag that
-// kubeadm bundles. Used as fallback when COREDNS_TAG is not set in heat-params.
-// Source: https://github.com/coredns/deployment/blob/master/kubernetes/CoreDNS-k8s_version.md
+// kubeadm bundles. Tags use "v" prefix matching registry.k8s.io/coredns/coredns.
+// Source: kubernetes/kubernetes cmd/kubeadm/app/constants/constants.go
 var corednsImageTags = map[string]string{
-	"1.35": "1.12.0",
-	"1.34": "1.12.0",
-	"1.33": "1.12.0",
-	"1.32": "1.11.3",
-	"1.31": "1.11.3",
-	"1.30": "1.11.1",
-	"1.29": "1.11.1",
-	"1.28": "1.10.1",
-	"1.27": "1.10.1",
-	"1.26": "1.9.3",
-	"1.25": "1.9.3",
-	"1.24": "1.8.6",
-	"1.23": "1.8.6",
-	"1.22": "1.8.4",
-	"1.21": "1.8.0",
-	"1.20": "1.7.0",
+	"1.35": "v1.13.1",
+	"1.34": "v1.12.1",
+	"1.33": "v1.12.0",
+	"1.32": "v1.11.3",
+	"1.31": "v1.11.3",
+	"1.30": "v1.11.1",
+	"1.29": "v1.11.1",
+	"1.28": "v1.10.1",
+	"1.27": "v1.10.1",
+	"1.26": "v1.9.3",
+	"1.25": "v1.9.3",
+	"1.24": "v1.8.6",
+	"1.23": "v1.8.6",
+	"1.22": "v1.8.4",
+	"1.21": "v1.8.0",
+	"1.20": "v1.7.0",
 }
 
 func corednsChartDefault(kubeTag string) string {
-	v := config.LookupByKubeVersion(corednsChartVersions, kubeTag)
-	if v == "" {
-		return "1.42.2"
-	}
-	return v
+	return config.LookupByKubeVersion(corednsChartVersions, kubeTag)
 }
 
 func corednsImageDefault(kubeTag string) string {
