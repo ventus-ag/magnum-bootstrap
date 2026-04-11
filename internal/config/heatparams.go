@@ -125,9 +125,8 @@ func Load(path string) (Config, error) {
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
 			AutoHealerTag:         raw["MAGNUM_AUTO_HEALER_TAG"],
 
-			AutoScalingEnabled:   parseBool(raw["AUTO_SCALING_ENABLED"]),
-			AutoscalerChartTag:   raw["AUTOSCALER_CHART_TAG"],
-			MinNodeCount:         parseInt(raw["MIN_NODE_COUNT"]),
+			AutoScalingEnabled: parseBool(raw["AUTO_SCALING_ENABLED"]),
+			MinNodeCount:       parseInt(raw["MIN_NODE_COUNT"]),
 			MaxNodeCount:         parseInt(raw["MAX_NODE_COUNT"]),
 
 			VolumeDriver:           raw["VOLUME_DRIVER"],

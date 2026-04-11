@@ -184,8 +184,7 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		"nfsCsiChartTag":      pulumi.String(cfg.Shared.NFSCSIChartTag),
 		"kubeDashboardChartTag": pulumi.String(cfg.Shared.KubeDashboardChartTag),
 		"metricsServerChartTag": pulumi.String(cfg.Shared.MetricsServerChartTag),
-		"autoscalerChartTag":  pulumi.String(cfg.Shared.AutoscalerChartTag),
-		"npdChartTag":         pulumi.String(cfg.Shared.NPDChartTag),
+		"npdChartTag": pulumi.String(cfg.Shared.NPDChartTag),
 	}
 
 	// Role-specific fields

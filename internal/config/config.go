@@ -162,10 +162,9 @@ type SharedConfig struct {
 	AutoHealerTag         string `json:"autoHealerTag"`
 
 	// Auto-scaling
-	AutoScalingEnabled   bool   `json:"autoScalingEnabled"`
-	AutoscalerChartTag   string `json:"autoscalerChartTag"`
-	MinNodeCount         int    `json:"minNodeCount"`
-	MaxNodeCount         int    `json:"maxNodeCount"`
+	AutoScalingEnabled bool `json:"autoScalingEnabled"`
+	MinNodeCount       int  `json:"minNodeCount"`
+	MaxNodeCount       int  `json:"maxNodeCount"`
 
 	// Volume / CSI
 	VolumeDriver           string `json:"volumeDriver"`
