@@ -10,6 +10,23 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+// occmChartVersions maps K8s minor version to the OCCM Helm chart version.
+// Source: helm search repo cpo/openstack-cloud-controller-manager --versions
+var occmChartVersions = map[string]string{
+	"1.35": "2.35.0",
+	"1.34": "2.34.2",
+	"1.33": "2.33.1",
+	"1.32": "2.32.0",
+	"1.31": "2.31.3",
+	"1.30": "2.30.5",
+	"1.29": "2.29.3",
+	"1.28": "2.28.5",
+	"1.27": "2.27.6",
+	"1.26": "2.26.5",
+	"1.25": "2.25.1",
+	"1.24": "2.24.0",
+}
+
 // occmImageTags maps Kubernetes minor version to the latest
 // openstack-cloud-controller-manager image tag.
 // Update: https://explore.ggcr.dev/?repo=registry.k8s.io%2Fprovider-os%2Fopenstack-cloud-controller-manager
@@ -63,7 +80,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/provider-os/openstack-cloud-controller-manager"
 	}
 
-	chartVersion := "2.35.0"
+	chartVersion := config.LookupByKubeVersion(occmChartVersions, cfg.Shared.KubeVersion)
 	imageTag := config.LookupByKubeVersion(occmImageTags, cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{

@@ -6,9 +6,27 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
-	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
+
+// metricsServerChartVersions maps K8s minor version to the metrics-server
+// Helm chart version.
+// Source: helm search repo metrics-server/metrics-server --versions
+var metricsServerChartVersions = map[string]string{
+	"1.35": "3.13.0",
+	"1.34": "3.13.0",
+	"1.33": "3.13.0",
+	"1.32": "3.12.2",
+	"1.31": "3.12.2",
+	"1.30": "3.12.2",
+	"1.29": "3.12.2",
+	"1.28": "3.12.2",
+	"1.27": "3.12.2",
+	"1.26": "3.12.2",
+	"1.25": "3.12.2",
+	"1.24": "3.11.0",
+}
 
 type Module struct{}
 
@@ -47,7 +65,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := cfg.Shared.MetricsServerChartTag
 	if chartVersion == "" {
-		chartVersion = "3.12.2"
+		chartVersion = config.LookupByKubeVersion(metricsServerChartVersions, cfg.Shared.KubeVersion)
 	}
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
@@ -59,6 +77,9 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Values: map[string]interface{}{
 			"image": map[string]interface{}{
 				"repository": prefix + "metrics-server",
+			},
+			"args": []interface{}{
+				"--kubelet-insecure-tls",
 			},
 			"nodeSelector": map[string]interface{}{
 				"node-role.kubernetes.io/" + roleName: "",
