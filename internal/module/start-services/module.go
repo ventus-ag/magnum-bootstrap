@@ -9,6 +9,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -73,12 +74,23 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			}
 		}
 
-		// Label master nodes.
-		if cfg.Role() == config.RoleMaster && cfg.Shared.LeadNodeRoleName != "" {
-			_ = executor.Run(kubectl, "--kubeconfig="+kubeconfig,
-				"label", "node", cfg.Shared.InstanceName,
-				"node-role.kubernetes.io/"+cfg.Shared.LeadNodeRoleName+"=",
-				"--overwrite")
+		// Label master nodes with version-appropriate role labels.
+		if cfg.Role() == config.RoleMaster {
+			kubeTag := cfg.Shared.KubeTag
+			kc := "--kubeconfig=" + kubeconfig
+
+			if kubeletconfig.KubeMinorAtLeast(kubeTag, 25) {
+				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+					"node-role.kubernetes.io/control-plane=", "--overwrite")
+			} else if kubeletconfig.KubeMinorAtLeast(kubeTag, 20) {
+				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+					"node-role.kubernetes.io/master=", "--overwrite")
+				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+					"node-role.kubernetes.io/control-plane=", "--overwrite")
+			} else {
+				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+					"node-role.kubernetes.io/master=", "--overwrite")
+			}
 		}
 	}
 

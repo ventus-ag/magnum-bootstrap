@@ -10,6 +10,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -137,18 +138,44 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Label control-plane node if needed.
-	if cfg.Role() == config.RoleMaster && cfg.Shared.LeadNodeRoleName == "control-plane" {
-		_ = executor.Run("kubectl",
-			"--kubeconfig=/etc/kubernetes/admin.conf",
-			"patch", "node", cfg.Shared.InstanceName,
-			"--patch", `{"metadata": {"labels": {"node-role.kubernetes.io/control-plane": ""}}}`,
-		)
+	// Label master nodes with the appropriate role label(s).
+	// K8s < 1.20:  only "master"
+	// K8s 1.20-1.24: both "master" and "control-plane" (transition period)
+	// K8s >= 1.25: only "control-plane" ("master" label removed upstream)
+	if cfg.Role() == config.RoleMaster {
+		kubeTag := cfg.Shared.KubeTag
+		kubectl := "kubectl"
+		kc := "--kubeconfig=/etc/kubernetes/admin.conf"
+
+		if kubeletconfig.KubeMinorAtLeast(kubeTag, 25) {
+			// 1.25+: control-plane only
+			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+				"node-role.kubernetes.io/control-plane=", "--overwrite")
+		} else if kubeletconfig.KubeMinorAtLeast(kubeTag, 20) {
+			// 1.20-1.24: both labels for backward compatibility
+			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+				"node-role.kubernetes.io/master=", "--overwrite")
+			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+				"node-role.kubernetes.io/control-plane=", "--overwrite")
+		} else {
+			// < 1.20: master only
+			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
+				"node-role.kubernetes.io/master=", "--overwrite")
+		}
+	}
+
+	// Record which labels/taints we applied for observability.
+	nodeRole := "master"
+	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
+		nodeRole = "control-plane"
 	}
 
 	return moduleapi.Result{
 		Changes: changes,
-		Outputs: map[string]string{"role": cfg.Role().String()},
+		Outputs: map[string]string{
+			"role":     cfg.Role().String(),
+			"nodeRole": nodeRole,
+		},
 	}, nil
 }
 
@@ -178,9 +205,14 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:Services", name, res, opts...); err != nil {
 		return nil, err
 	}
+	nodeRole := "master"
+	if kubeletconfig.KubeMinorAtLeast(heat.Cfg.Shared.KubeTag, 25) {
+		nodeRole = "control-plane"
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"role":             pulumi.String(heat.Cfg.Role().String()),
 		"containerRuntime": pulumi.String(heat.Cfg.Shared.ContainerRuntime),
+		"nodeRole":         pulumi.String(nodeRole),
 	}); err != nil {
 		return nil, err
 	}

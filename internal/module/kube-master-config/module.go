@@ -396,11 +396,18 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		}
 	}
 
+	// Taint master nodes so workloads don't schedule on them.
+	// K8s < 1.25 used "master", K8s >= 1.25 uses "control-plane".
 	registerWithTaints := ""
-	if cfg.Shared.LeadNodeRoleName == "control-plane" {
+	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
 		registerWithTaints = `registerWithTaints:
   - effect: "NoSchedule"
     key: "node-role.kubernetes.io/control-plane"
+`
+	} else {
+		registerWithTaints = `registerWithTaints:
+  - effect: "NoSchedule"
+    key: "node-role.kubernetes.io/master"
 `
 	}
 	featureGates := kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag)
