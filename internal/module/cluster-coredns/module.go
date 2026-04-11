@@ -53,10 +53,8 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	// kubernetes plugin parameters: cluster domain + reverse zones.
 	kubeParams := clusterDomain + " in-addr.arpa " + portalCIDR + " " + podsCIDR
 
-	chartVersion := cfg.Shared.CoreDNSChartTag
-	if chartVersion == "" {
-		chartVersion = corednsChartDefault(cfg.Shared.KubeTag)
-	}
+	chartVersion := corednsChartDefault(cfg.Shared.KubeTag)
+	imageTag := corednsImageDefault(cfg.Shared.KubeTag)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "coredns",
@@ -68,7 +66,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			"replicaCount": 2,
 			"image": map[string]interface{}{
 				"repository": prefix + "coredns",
-				"tag":        cfg.Shared.CorednsTag,
+				"tag":        imageTag,
 			},
 			"resources": map[string]interface{}{
 				"limits": map[string]interface{}{
@@ -209,7 +207,8 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
-		"corednsTag":   pulumi.String(cfg.Shared.CorednsTag),
+		"corednsTag":   pulumi.String(imageTag),
+		"chartVersion": pulumi.String(chartVersion),
 		"dnsServiceIp": pulumi.String(dnsServiceIP),
 	}); err != nil {
 		return nil, err
@@ -217,32 +216,68 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	return res, nil
 }
 
-// corednsChartVersions maps K8s minor version to a compatible CoreDNS Helm chart version.
+// corednsChartVersions maps K8s minor version to a compatible CoreDNS Helm
+// chart version. Chart versions are chosen so the bundled CoreDNS appVersion
+// matches what kubeadm ships for that K8s release:
+//
+//	chart 1.15.1 → CoreDNS 1.8.0   (K8s 1.20-1.21)
+//	chart 1.16.6 → CoreDNS 1.8.6   (K8s 1.22-1.24)
+//	chart 1.19.6 → CoreDNS 1.9.3   (K8s 1.25-1.26)
+//	chart 1.24.5 → CoreDNS 1.10.1  (K8s 1.27-1.28)
+//	chart 1.31.0 → CoreDNS 1.11.1  (K8s 1.29-1.30)
+//	chart 1.36.1 → CoreDNS 1.11.3  (K8s 1.31-1.32)
+//	chart 1.42.2 → CoreDNS 1.12.0  (K8s 1.33+)
 var corednsChartVersions = map[string]string{
-	"1.35": "1.36.2",
-	"1.34": "1.36.2",
-	"1.33": "1.32.0",
-	"1.32": "1.32.0",
-	"1.31": "1.31.0",
-	"1.30": "1.29.0",
-	"1.29": "1.29.0",
-	"1.28": "1.28.2",
-	"1.27": "1.24.0",
-	"1.26": "1.24.0",
-	"1.25": "1.22.0",
-	"1.24": "1.22.0",
-	"1.23": "1.22.0",
-	"1.22": "1.19.4",
-	"1.21": "1.19.4",
-	"1.20": "1.19.4",
+	"1.35": "1.42.2",
+	"1.34": "1.42.2",
+	"1.33": "1.42.2",
+	"1.32": "1.36.1",
+	"1.31": "1.36.1",
+	"1.30": "1.31.0",
+	"1.29": "1.31.0",
+	"1.28": "1.24.5",
+	"1.27": "1.24.5",
+	"1.26": "1.19.6",
+	"1.25": "1.19.6",
+	"1.24": "1.16.6",
+	"1.23": "1.16.6",
+	"1.22": "1.16.4",
+	"1.21": "1.15.1",
+	"1.20": "1.15.1",
+}
+
+// corednsImageTags maps K8s minor version to the CoreDNS image tag that
+// kubeadm bundles. Used as fallback when COREDNS_TAG is not set in heat-params.
+// Source: https://github.com/coredns/deployment/blob/master/kubernetes/CoreDNS-k8s_version.md
+var corednsImageTags = map[string]string{
+	"1.35": "1.12.0",
+	"1.34": "1.12.0",
+	"1.33": "1.12.0",
+	"1.32": "1.11.3",
+	"1.31": "1.11.3",
+	"1.30": "1.11.1",
+	"1.29": "1.11.1",
+	"1.28": "1.10.1",
+	"1.27": "1.10.1",
+	"1.26": "1.9.3",
+	"1.25": "1.9.3",
+	"1.24": "1.8.6",
+	"1.23": "1.8.6",
+	"1.22": "1.8.4",
+	"1.21": "1.8.0",
+	"1.20": "1.7.0",
 }
 
 func corednsChartDefault(kubeTag string) string {
 	v := config.LookupByKubeVersion(corednsChartVersions, kubeTag)
 	if v == "" {
-		return "1.36.2"
+		return "1.42.2"
 	}
 	return v
+}
+
+func corednsImageDefault(kubeTag string) string {
+	return config.LookupByKubeVersion(corednsImageTags, kubeTag)
 }
 
 // corednsCachePlugin returns the cache plugin entry for the CoreDNS Corefile.
