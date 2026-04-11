@@ -26,22 +26,27 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
 
+	configChanged := false
 	if cfg.Shared.ContainerRuntime == "containerd" {
-		cs, err := reconcileContainerd(ctx, cfg, executor)
+		cs, changed, err := reconcileContainerd(ctx, cfg, executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, cs...)
+		configChanged = changed
 	} else {
 		cs, err := reconcileDocker(cfg, executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, cs...)
+		configChanged = len(cs) > 0
 	}
 
-	// Signal restart for the container runtime only if config changed.
-	if len(changes) > 0 && req.Restarts != nil {
+	// Signal restart only if the runtime config actually changed (not just
+	// Docker being stopped). The configChanged flag is set by file writes
+	// in reconcileContainerd/reconcileDocker, not by service state changes.
+	if configChanged && req.Restarts != nil {
 		if cfg.Shared.ContainerRuntime == "containerd" {
 			req.Restarts.Add("containerd", "container-runtime config changed")
 		} else {
@@ -58,20 +63,19 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	}, nil
 }
 
-func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.Executor) ([]host.Change, error) {
+func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.Executor) ([]host.Change, bool, error) {
 	var changes []host.Change
 	configChanged := false
 	tarballExtracted := false
 
-	// Only stop/disable docker if it's actually running and we want containerd.
-	// Docker may already be stopped or not installed — log but don't fail.
+	// Stop, disable, and mask docker if it's running. Mask prevents
+	// socket-activation or dependency-based starts on subsequent boots,
+	// so this block only fires once.
 	if executor.SystemctlIsActive("docker") {
-		if err := executor.Run("systemctl", "stop", "docker"); err != nil {
-			executor.Logger.Warnf("failed to stop docker (may already be stopped): %v", err)
-		}
-		if err := executor.Run("systemctl", "disable", "docker"); err != nil {
-			executor.Logger.Warnf("failed to disable docker: %v", err)
-		}
+		_ = executor.Run("systemctl", "stop", "docker")
+		_ = executor.Run("systemctl", "disable", "docker")
+		_ = executor.Run("systemctl", "mask", "docker")
+		_ = executor.Run("systemctl", "mask", "docker.socket")
 		changes = append(changes, host.Change{Action: host.ActionOther, Summary: "disable docker in favour of containerd"})
 	}
 
@@ -114,7 +118,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		localPath := "/srv/magnum/containerd.tar.gz"
 		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
 		if err != nil {
-			return nil, fmt.Errorf("download containerd tarball: %w", err)
+			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
 		}
 		if dl.Change != nil {
 			changes = append(changes, *dl.Change)
@@ -126,7 +130,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 					"-C", "/usr/local",
 					"--no-same-owner", "--touch", "--no-same-permissions",
 				); err != nil {
-					return nil, fmt.Errorf("extract containerd tarball: %w", err)
+					return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 				}
 			} else {
 				// containerd 1.x cri-containerd-cni bundle: extract to /.
@@ -139,7 +143,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 					"--exclude=*.txt",
 					"--exclude=opt/containerd/cluster/gce",
 				); err != nil {
-					return nil, fmt.Errorf("extract containerd tarball: %w", err)
+					return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 				}
 			}
 			tarballExtracted = true
@@ -150,7 +154,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	for _, dir := range []string{"/etc/containerd", "/etc/containerd/certs.d", "/opt/cni/bin"} {
 		change, err := executor.EnsureDir(dir, 0o755)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if change != nil {
 			changes = append(changes, *change)
@@ -169,7 +173,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(configContent), 0o644)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if change != nil {
 		changes = append(changes, *change)
@@ -187,14 +191,14 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 `
 		change, err = executor.EnsureDir("/etc/containerd/certs.d/docker.io", 0o755)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if change != nil {
 			changes = append(changes, *change)
 		}
 		change, err = executor.EnsureFile("/etc/containerd/certs.d/docker.io/hosts.toml", []byte(dockerHubHost), 0o644)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if change != nil {
 			changes = append(changes, *change)
@@ -214,12 +218,12 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	// Detect drift: if containerd should be running but isn't, start it.
 	if !executor.SystemctlIsActive("containerd") {
 		if err := executor.Run("systemctl", "start", "containerd"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: "start containerd (was not running)"})
 	}
 
-	return changes, nil
+	return changes, configChanged, nil
 }
 
 func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
