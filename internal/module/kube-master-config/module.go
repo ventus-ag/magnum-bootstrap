@@ -103,10 +103,11 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 			}
 		}
 
-		if cfg.Shared.FlannelCNITag != "" {
+		{
+			cniTag := "v1.6.2"
 			cniURL := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/%s/cni-plugins-linux-amd64-%s.tgz",
-				cfg.Shared.FlannelCNITag, cfg.Shared.FlannelCNITag)
-			cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", cfg.Shared.FlannelCNITag)
+				cniTag, cniTag)
+			cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", cniTag)
 
 			dl, err := executor.DownloadFileWithRetry(context.Background(), cniURL, cniTgz, 0o644, 5)
 			if err != nil {

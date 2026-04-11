@@ -14,6 +14,23 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+// manilaCSIChartVersions maps K8s minor version to the Manila CSI Helm chart version.
+// Source: helm search repo cpo/openstack-manila-csi --versions
+var manilaCSIChartVersions = map[string]string{
+	"1.35": "2.35.0",
+	"1.34": "2.34.2",
+	"1.33": "2.33.1",
+	"1.32": "2.32.0",
+	"1.31": "2.31.5",
+	"1.30": "2.30.3",
+	"1.29": "2.29.0",
+	"1.28": "2.28.3",
+	"1.27": "2.27.3",
+	"1.26": "2.26.0",
+	"1.25": "2.25.1",
+	"1.24": "2.24.0",
+}
+
 type Module struct{}
 
 type Resource struct {
@@ -49,10 +66,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	childOpts := append(opts, pulumi.Parent(res))
 
-	nfsChartVersion := cfg.Shared.NFSCSIChartTag
-	if nfsChartVersion == "" {
-		nfsChartVersion = "4.5.0"
-	}
+	nfsChartVersion := "v4.9.0"
 
 	// NFS CSI driver (dependency for Manila).
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-nfs-driver", clusterhelm.HelmReleaseArgs{
@@ -71,10 +85,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
-	manilaChartVersion := cfg.Shared.ManilaCSIChartTag
-	if manilaChartVersion == "" {
-		manilaChartVersion = "2.27.1"
-	}
+	manilaChartVersion := config.LookupByKubeVersion(manilaCSIChartVersions, cfg.Shared.KubeVersion)
 
 	// Manila CSI plugin via Helm.
 	_, err = clusterhelm.DeployHelmRelease(ctx, name+"-manila-plugin", clusterhelm.HelmReleaseArgs{

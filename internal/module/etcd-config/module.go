@@ -16,6 +16,31 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+// etcdImageTags maps K8s minor version to the etcd image tag that kubeadm bundles.
+// Source: kubernetes/kubernetes cmd/kubeadm/app/constants/constants.go
+var etcdImageTags = map[string]string{
+	"1.35": "3.6.6-0",
+	"1.34": "3.6.5-0",
+	"1.33": "3.5.24-0",
+	"1.32": "3.5.24-0",
+	"1.31": "3.5.24-0",
+	"1.30": "3.5.15-0",
+	"1.29": "3.5.16-0",
+	"1.28": "3.5.15-0",
+	"1.27": "3.5.12-0",
+	"1.26": "3.5.10-0",
+	"1.25": "3.5.9-0",
+	"1.24": "3.5.6-0",
+	"1.23": "3.5.6-0",
+	"1.22": "3.5.6-0",
+	"1.21": "3.4.13-0",
+	"1.20": "3.4.13-0",
+}
+
+func etcdTag(cfg config.Config) string {
+	return config.LookupByKubeVersion(etcdImageTags, cfg.Shared.KubeTag)
+}
+
 type Module struct{}
 
 type Resource struct {
@@ -79,7 +104,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		cleanupExcessMembers(cfg, executor, protocol, certDir)
 		return moduleapi.Result{
 			Changes: changes,
-			Outputs: map[string]string{"etcdTag": cfg.Master.EtcdTag},
+			Outputs: map[string]string{"etcdTag": etcdTag(cfg)},
 		}, nil
 	}
 
@@ -143,7 +168,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	return moduleapi.Result{
 		Changes: changes,
-		Outputs: map[string]string{"etcdTag": cfg.Master.EtcdTag},
+		Outputs: map[string]string{"etcdTag": etcdTag(cfg)},
 	}, nil
 }
 
@@ -232,7 +257,7 @@ func writeEtcdService(cfg config.Config, executor *host.Executor) ([]host.Change
 
 	containerImage := cfg.Shared.ContainerInfraPrefix
 	if containerImage == "" {
-		containerImage = "quay.io/coreos/"
+		containerImage = "registry.k8s.io/"
 	}
 	containerImage += "etcd"
 
@@ -263,7 +288,7 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-`, containerImage, cfg.Master.EtcdTag)
+`, containerImage, etcdTag(cfg))
 
 	change, err := executor.EnsureFile("/etc/systemd/system/etcd.service", []byte(content), 0o644)
 	if err != nil {
@@ -277,7 +302,12 @@ WantedBy=multi-user.target
 }
 
 func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
-	etcdVersion := strings.TrimPrefix(cfg.Master.EtcdTag, "v")
+	// etcdTag returns kubeadm-style tags like "3.5.24-0"; strip the "-0"
+	// image build suffix to get the upstream release version for downloads.
+	etcdVersion := strings.TrimPrefix(etcdTag(cfg), "v")
+	if i := strings.LastIndex(etcdVersion, "-"); i > 0 {
+		etcdVersion = etcdVersion[:i]
+	}
 	if etcdVersion == "" {
 		return nil, nil
 	}
@@ -754,7 +784,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		"role": pulumi.String(cfg.Role().String()),
 	}
 	if cfg.Master != nil {
-		outputs["etcdTag"] = pulumi.String(cfg.Master.EtcdTag)
+		outputs["etcdTag"] = pulumi.String(etcdTag(cfg))
 		outputs["etcdDiscoveryUrl"] = pulumi.String(cfg.Master.EtcdDiscoveryURL)
 	}
 	if err := ctx.RegisterResourceOutputs(res, outputs); err != nil {

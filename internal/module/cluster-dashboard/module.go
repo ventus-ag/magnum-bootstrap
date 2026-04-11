@@ -2,7 +2,6 @@ package clusterdashboard
 
 import (
 	"context"
-	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -41,10 +40,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		roleName = "master"
 	}
 
-	chartVersion := strings.TrimPrefix(cfg.Shared.KubeDashboardChartTag, "v")
-	if chartVersion == "" {
-		chartVersion = "7.14.0"
-	}
+	chartVersion := "7.14.0"
 
 	nodeSelector := map[string]interface{}{
 		"node-role.kubernetes.io/" + roleName: "",

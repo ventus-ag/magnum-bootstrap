@@ -66,7 +66,6 @@ func Load(path string) (Config, error) {
 
 			PortalNetworkCIDR: raw["PORTAL_NETWORK_CIDR"],
 			PodsNetworkCIDR:   raw["PODS_NETWORK_CIDR"],
-			FlannelCNITag:     raw["FLANNEL_CNI_TAG"],
 
 			KubeAllowPriv:        raw["KUBE_ALLOW_PRIV"],
 			AdmissionControlList: raw["ADMISSION_CONTROL_LIST"],
@@ -98,25 +97,14 @@ func Load(path string) (Config, error) {
 			LeadNodeRoleName: raw["LEAD_NODE_ROLE_NAME"],
 			KubeImageDigest:  raw["KUBE_IMAGE_DIGEST"],
 
-			HelmClientURL:    raw["HELM_CLIENT_URL"],
-			HelmClientSHA256: raw["HELM_CLIENT_SHA256"],
-			HelmClientTag:    raw["HELM_CLIENT_TAG"],
-			RegionName:       raw["REGION_NAME"],
+			RegionName: raw["REGION_NAME"],
 
-			FlannelTag:         raw["FLANNEL_TAG"],
 			FlannelBackend:     raw["FLANNEL_BACKEND"],
 			FlannelNetworkCIDR: raw["FLANNEL_NETWORK_CIDR"],
 
-			CorednsTag:      raw["COREDNS_TAG"],
-			CoreDNSChartTag: raw["COREDNS_CHART_TAG"],
+			KubeDashboardEnabled: parseBool(raw["KUBE_DASHBOARD_ENABLED"]),
 
-			KubeDashboardEnabled:  parseBool(raw["KUBE_DASHBOARD_ENABLED"]),
-			KubeDashboardChartTag: raw["KUBE_DASHBOARD_VERSION"],
-
-			MetricsServerEnabled:  parseBool(raw["METRICS_SERVER_ENABLED"]),
-			MetricsServerChartTag: raw["METRICS_SERVER_CHART_TAG"],
-
-			NPDChartTag: raw["NPD_CHART_TAG"],
+			MetricsServerEnabled: parseBool(raw["METRICS_SERVER_ENABLED"]),
 
 			AutoHealingEnabled:    parseBool(raw["AUTO_HEALING_ENABLED"]),
 			AutoHealingController: raw["AUTO_HEALING_CONTROLLER"],
@@ -128,8 +116,6 @@ func Load(path string) (Config, error) {
 			VolumeDriver:     raw["VOLUME_DRIVER"],
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
 			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
-			ManilaCSIChartTag:      raw["MANILA_CSI_CHART_TAG"],
-			NFSCSIChartTag:         raw["NFS_CSI_CHART_TAG"],
 
 			OSAutoUpgradeEnabled:   parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
 
@@ -148,9 +134,8 @@ func Load(path string) (Config, error) {
 			NumberOfMasters:       parseInt(raw["NUMBER_OF_MASTERS"]),
 			KubeAPIPublicAddress:  raw["KUBE_API_PUBLIC_ADDRESS"],
 			KubeAPIPrivateAddress: raw["KUBE_API_PRIVATE_ADDRESS"],
-			EtcdDiscoveryURL:      raw["ETCD_DISCOVERY_URL"],
-			EtcdTag:               raw["ETCD_TAG"],
-			MasterHostname:        raw["MASTER_HOSTNAME"],
+			EtcdDiscoveryURL: raw["ETCD_DISCOVERY_URL"],
+			MasterHostname:   raw["MASTER_HOSTNAME"],
 			EtcdLBVIP:             raw["ETCD_LB_VIP"],
 			EtcdVolume:            raw["ETCD_VOLUME"],
 			EtcdVolumeSize:        parseInt(raw["ETCD_VOLUME_SIZE"]),

@@ -172,15 +172,6 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		"cinderCsiEnabled": pulumi.Bool(cfg.Shared.CinderCSIEnabled),
 		"manilaCSIEnabled": pulumi.Bool(cfg.Shared.ManilaCSIEnabled),
 
-		// Addon chart versions — tracked so Pulumi detects version changes.
-		"flannelTag":          pulumi.String(cfg.Shared.FlannelTag),
-		"corednsTag":          pulumi.String(cfg.Shared.CorednsTag),
-		"corednsChartTag":     pulumi.String(cfg.Shared.CoreDNSChartTag),
-		"manilaCsiChartTag":   pulumi.String(cfg.Shared.ManilaCSIChartTag),
-		"nfsCsiChartTag":      pulumi.String(cfg.Shared.NFSCSIChartTag),
-		"kubeDashboardChartTag": pulumi.String(cfg.Shared.KubeDashboardChartTag),
-		"metricsServerChartTag": pulumi.String(cfg.Shared.MetricsServerChartTag),
-		"npdChartTag": pulumi.String(cfg.Shared.NPDChartTag),
 	}
 
 	// Role-specific fields
@@ -189,7 +180,6 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		outputs["kubeApiPublicAddress"] = pulumi.String(cfg.Master.KubeAPIPublicAddress)
 		outputs["kubeApiPrivateAddress"] = pulumi.String(cfg.Master.KubeAPIPrivateAddress)
 		outputs["etcdDiscoveryUrl"] = pulumi.String(cfg.Master.EtcdDiscoveryURL)
-		outputs["etcdTag"] = pulumi.String(cfg.Master.EtcdTag)
 	}
 	if cfg.Worker != nil {
 		outputs["kubeMasterIp"] = pulumi.String(cfg.Worker.KubeMasterIP)

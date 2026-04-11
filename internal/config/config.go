@@ -89,7 +89,6 @@ type SharedConfig struct {
 	// Network
 	PortalNetworkCIDR string `json:"portalNetworkCidr"`
 	PodsNetworkCIDR   string `json:"podsNetworkCidr"`
-	FlannelCNITag     string `json:"flannelCniTag"`
 
 	// API server
 	KubeAllowPriv        string `json:"kubeAllowPriv"`
@@ -129,30 +128,17 @@ type SharedConfig struct {
 	KubeImageDigest  string `json:"kubeImageDigest"`
 
 	// Cluster addons (master-0 only, after API ready)
-	HelmClientURL    string `json:"helmClientUrl"`
-	HelmClientSHA256 string `json:"helmClientSha256"`
-	HelmClientTag    string `json:"helmClientTag"`
-	RegionName       string `json:"regionName"`
+	RegionName string `json:"regionName"`
 
 	// Flannel
-	FlannelTag        string `json:"flannelTag"`
-	FlannelBackend    string `json:"flannelBackend"`
+	FlannelBackend     string `json:"flannelBackend"`
 	FlannelNetworkCIDR string `json:"flannelNetworkCidr"`
 
-	// CoreDNS
-	CorednsTag       string `json:"corednsTag"`
-	CoreDNSChartTag  string `json:"corednsChartTag"`
-
 	// Kubernetes Dashboard
-	KubeDashboardEnabled  bool   `json:"kubeDashboardEnabled"`
-	KubeDashboardChartTag string `json:"kubeDashboardChartTag"`
+	KubeDashboardEnabled bool `json:"kubeDashboardEnabled"`
 
 	// Metrics server
-	MetricsServerEnabled  bool   `json:"metricsServerEnabled"`
-	MetricsServerChartTag string `json:"metricsServerChartTag"`
-
-	// NPD (Node Problem Detector) — deployed when AutoHealingEnabled is true.
-	NPDChartTag string `json:"npdChartTag"`
+	MetricsServerEnabled bool `json:"metricsServerEnabled"`
 
 	// Auto-healing (magnum-auto-healer)
 	AutoHealingEnabled    bool   `json:"autoHealingEnabled"`
@@ -164,11 +150,9 @@ type SharedConfig struct {
 	MaxNodeCount       int  `json:"maxNodeCount"`
 
 	// Volume / CSI
-	VolumeDriver      string `json:"volumeDriver"`
-	CinderCSIEnabled  bool   `json:"cinderCsiEnabled"`
-	ManilaCSIEnabled  bool   `json:"manilaCSIEnabled"`
-	ManilaCSIChartTag      string `json:"manilaCSIChartTag"`
-	NFSCSIChartTag         string `json:"nfsCsiChartTag"`
+	VolumeDriver     string `json:"volumeDriver"`
+	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
+	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
 
 	// OS auto-upgrade (Zincati on Fedora CoreOS)
 	OSAutoUpgradeEnabled bool `json:"osAutoUpgradeEnabled"`
@@ -184,9 +168,8 @@ type MasterConfig struct {
 	NumberOfMasters       int    `json:"numberOfMasters"`
 	KubeAPIPublicAddress  string `json:"kubeApiPublicAddress"`
 	KubeAPIPrivateAddress string `json:"kubeApiPrivateAddress"`
-	EtcdDiscoveryURL      string `json:"etcdDiscoveryUrl"`
-	EtcdTag               string `json:"etcdTag"`
-	MasterHostname        string `json:"masterHostname"`
+	EtcdDiscoveryURL string `json:"etcdDiscoveryUrl"`
+	MasterHostname   string `json:"masterHostname"`
 	EtcdLBVIP             string `json:"etcdLbVip"`
 	EtcdVolume            string `json:"etcdVolume"`
 	EtcdVolumeSize        int    `json:"etcdVolumeSize"`

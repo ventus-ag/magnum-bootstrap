@@ -100,10 +100,7 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 		prefix = "registry.k8s.io/"
 	}
 
-	chartVersion := cfg.Shared.NPDChartTag
-	if chartVersion == "" {
-		chartVersion = "2.3.14"
-	}
+	chartVersion := "2.3.14"
 
 	imageTag := config.LookupByKubeVersion(npdImageTags, cfg.Shared.KubeVersion)
 

@@ -51,7 +51,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		ReleaseName: "flannel",
 		Namespace:   "kube-flannel",
 		Chart:       "flannel",
-		Version:     cfg.Shared.FlannelTag,
+		Version:     "v0.28.2",
 		RepoURL:     "https://flannel-io.github.io/flannel/",
 		Values: map[string]interface{}{
 			"podCidr": podCIDR,
@@ -66,7 +66,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"networkDriver": pulumi.String("flannel"),
-		"flannelTag":    pulumi.String(cfg.Shared.FlannelTag),
+		"flannelTag":    pulumi.String("v0.28.2"),
 	}); err != nil {
 		return nil, err
 	}

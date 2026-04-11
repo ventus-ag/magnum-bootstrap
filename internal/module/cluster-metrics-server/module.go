@@ -63,10 +63,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		prefix = "registry.k8s.io/metrics-server/"
 	}
 
-	chartVersion := cfg.Shared.MetricsServerChartTag
-	if chartVersion == "" {
-		chartVersion = config.LookupByKubeVersion(metricsServerChartVersions, cfg.Shared.KubeVersion)
-	}
+	chartVersion := config.LookupByKubeVersion(metricsServerChartVersions, cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "metrics-server",
