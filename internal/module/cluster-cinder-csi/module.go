@@ -47,16 +47,6 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		executor := host.NewExecutor(req.Apply, req.Logger)
 		clusterhelm.AdoptHelmRelease(executor, "cinder-csi", "kube-system")
 		clusterhelm.CleanupFailedRelease(executor, "cinder-csi", "kube-system")
-
-		// Write cloud.conf to host so chart can mount it via hostPath
-		// (works with both chart 2.24.x and 2.35.x).
-		cloudConf := "[Global]\nauth-url=" + cfg.Shared.AuthURL +
-			"\nuser-id=" + cfg.Shared.TrusteeUserID +
-			"\npassword=" + cfg.Shared.TrusteePassword +
-			"\ntrust-id=" + cfg.Shared.TrustID +
-			"\nregion=" + cfg.Shared.RegionName +
-			"\nca-file=/etc/kubernetes/ca-bundle.crt\n"
-		_, _ = executor.EnsureFile("/etc/kubernetes/cloud.conf", []byte(cloudConf), 0o600)
 	}
 	return moduleapi.Result{}, nil
 }
@@ -181,7 +171,18 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				},
 			},
 			"secret": map[string]interface{}{
-				"enabled": false,
+				"enabled":   true,
+				"create":    true,
+				"hostMount": false,
+				"name":      "cinder-csi-cloud-config",
+				"data": map[string]interface{}{
+					"cloud.conf": "[Global]\nauth-url=" + cfg.Shared.AuthURL +
+						"\nuser-id=" + cfg.Shared.TrusteeUserID +
+						"\npassword=" + cfg.Shared.TrusteePassword +
+						"\ntrust-id=" + cfg.Shared.TrustID +
+						"\nregion=" + cfg.Shared.RegionName +
+						"\nca-file=/etc/kubernetes/certs/ca-bundle.crt",
+				},
 			},
 			"storageClass": map[string]interface{}{
 				"enabled": true,
