@@ -130,9 +130,6 @@ func registerNPD(ctx *pulumi.Context, name string, cfg config.Config, opts []pul
 				"host": "/var/log/",
 				"pod":  "",
 			},
-			"securityContext": map[string]interface{}{
-				"privileged": true,
-			},
 			"tolerations": []interface{}{
 				map[string]interface{}{
 					"effect":   "NoSchedule",

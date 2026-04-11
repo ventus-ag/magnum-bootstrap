@@ -19,7 +19,7 @@ import (
 // etcdImageTags maps K8s minor version to the etcd image tag that kubeadm bundles.
 // Source: kubernetes/kubernetes cmd/kubeadm/app/constants/constants.go
 var etcdImageTags = map[string]string{
-	"1.35": "3.6.6-0",
+	"1.35": "3.6.10-0",
 	"1.34": "3.6.5-0",
 	"1.33": "3.5.24-0",
 	"1.32": "3.5.24-0",
