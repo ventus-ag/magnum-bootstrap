@@ -354,49 +354,9 @@ KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379,http://127.0.0.1:4001"
 		changes = append(changes, *change)
 	}
 
-	// Pod Security Admission config — K8s 1.25+ enables PSA by default.
-	// Exempt system namespaces so infrastructure DaemonSets (CSI drivers,
-	// OCCM, etc.) with privileged containers are not rejected.
-	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
-		// PodSecurity plugin config — separate file referenced by path.
-		// Using path instead of inline configuration for broader compatibility.
-		psaPluginConfig := `apiVersion: pod-security.admission.config.k8s.io/v1
-kind: PodSecurityConfiguration
-defaults:
-  enforce: "privileged"
-  audit: "baseline"
-  warn: "baseline"
-exemptions:
-  usernames: []
-  runtimeClasses: []
-  namespaces:
-  - kube-system
-  - kube-node-lease
-  - kube-public
-`
-		change, err = executor.EnsureFile("/etc/kubernetes/pod-security-config.yaml", []byte(psaPluginConfig), 0o644)
-		if err != nil {
-			return nil, err
-		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
-
-		// Admission config — references PodSecurity config via path.
-		psaConfig := `apiVersion: apiserver.config.k8s.io/v1
-kind: AdmissionConfiguration
-plugins:
-- name: PodSecurity
-  path: /etc/kubernetes/pod-security-config.yaml
-`
-		change, err = executor.EnsureFile("/etc/kubernetes/admission-config.yaml", []byte(psaConfig), 0o644)
-		if err != nil {
-			return nil, err
-		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
-	}
+	// PodSecurity admission defaults to enforce: "privileged" (allow all).
+	// No explicit config needed — the built-in defaults are permissive.
+	// Namespace labels (applied in cluster-rbac) provide additional safety.
 
 	return changes, nil
 }
@@ -627,10 +587,6 @@ func buildAPIServerArgs(cfg config.Config) string {
 			"--authentication-token-webhook-config-file=/etc/kubernetes/keystone_webhook_config.yaml",
 			"--authorization-webhook-config-file=/etc/kubernetes/keystone_webhook_config.yaml",
 		)
-	}
-	// Pod Security Admission config for K8s 1.25+.
-	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
-		args = append(args, "--admission-control-config-file=/etc/kubernetes/admission-config.yaml")
 	}
 	if cfg.Shared.KubeAPIOptions != "" {
 		args = append(args, cfg.Shared.KubeAPIOptions)
