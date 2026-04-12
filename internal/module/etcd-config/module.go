@@ -55,6 +55,20 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{}, fmt.Errorf("etcd module requires master config")
 	}
 
+	// A pure CA rotation has already replaced certs and restarted etcd in the
+	// ca-rotation module. Do not run LB membership/discovery logic here: while
+	// masters are rotating, the LB can route to a peer still using the old CA,
+	// which looks like an unhealthy cluster and can trigger destructive rejoin
+	// decisions.
+	if skipMembershipReconcile(cfg) {
+		if req.Logger != nil {
+			req.Logger.Infof("etcd: skipping membership reconciliation during active CA rotation rotationId=%s", cfg.Trigger.CARotationID)
+		}
+		return moduleapi.Result{
+			Outputs: map[string]string{"etcdTag": etcdTag(cfg)},
+		}, nil
+	}
+
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
 
@@ -127,6 +141,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
 	}
 	discoveryOK := checkDiscoveryURL(executor, cfg.Master.EtcdDiscoveryURL)
+	if req.Logger != nil {
+		req.Logger.Infof("etcd: discoveryOK=%t lbOK=%t localOK=%t isMember=%t lbEndpoint=%s localEndpoint=%s",
+			discoveryOK, lbOK, localOK, isMember, lbEndpoint, localEndpoint)
+	}
 
 	switch {
 	case isMember && localOK:
@@ -156,7 +174,8 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		// New cluster via discovery URL.
 		cleanupEtcd(executor)
 		etcdConf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		cs, err := writeAndStartEtcd(executor, etcdConf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
+		waitForEndpointHealth := discoveryEndpointHealthRequired(cfg)
+		cs, err := writeAndStartEtcd(executor, etcdConf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, waitForEndpointHealth)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
@@ -381,6 +400,14 @@ func checkDiscoveryURL(executor *host.Executor, url string) bool {
 	return true
 }
 
+func skipMembershipReconcile(cfg config.Config) bool {
+	return cfg.Operation() == config.OperationCARotate
+}
+
+func discoveryEndpointHealthRequired(cfg config.Config) bool {
+	return cfg.Master != nil && cfg.Master.NumberOfMasters == 1
+}
+
 func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
 	// Remove ourselves and re-add.
 	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
@@ -419,7 +446,10 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 
 	initialCluster := extractInitialCluster(addOut)
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
-	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
+	if err := clearEtcdData(executor); err != nil {
+		return nil, err
+	}
+	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, true)
 }
 
 func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
@@ -433,7 +463,10 @@ func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, pro
 
 	initialCluster := extractInitialCluster(addOut)
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
-	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled)
+	if err := clearEtcdData(executor); err != nil {
+		return nil, err
+	}
+	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, true)
 }
 
 func cleanupEtcd(executor *host.Executor) {
@@ -443,6 +476,19 @@ func cleanupEtcd(executor *host.Executor) {
 	if executor.Apply {
 		time.Sleep(5 * time.Second)
 	}
+}
+
+func clearEtcdData(executor *host.Executor) error {
+	if executor.Logger != nil {
+		executor.Logger.Infof("etcd: clearing stale data dir /var/lib/etcd/default.etcd before member join")
+	}
+	if !executor.Apply {
+		return nil
+	}
+	if err := os.RemoveAll("/var/lib/etcd/default.etcd"); err != nil {
+		return fmt.Errorf("clear stale etcd data dir: %w", err)
+	}
+	return nil
 }
 
 func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, certDir string) {
@@ -526,7 +572,7 @@ func extractMasterIndex(memberLine string) int {
 	return n
 }
 
-func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDir string, tlsDisabled bool) ([]host.Change, error) {
+func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDir string, tlsDisabled bool, waitForEndpointHealth bool) ([]host.Change, error) {
 	change, err := executor.EnsureDir("/etc/etcd", 0o755)
 	if err != nil {
 		return nil, err
@@ -563,16 +609,21 @@ func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDi
 		started = true
 	}
 
-	// Wait for etcd to be functionally healthy after start.  In a
-	// multi-master setup the discovery process and quorum election can
-	// take significant time.  Without this wait, downstream phases
-	// (kube-apiserver, controller-manager) fail because etcd isn't ready.
-	//
-	// Use the proper protocol endpoint with TLS certs (matching the bash
-	// script).  The HTTP loopback (http://127.0.0.1:2379) cannot be used
-	// because etcd's client-transport-security with client-cert-auth
-	// enforces TLS on all client listeners.
 	if started && executor.Apply {
+		if !executor.WaitForSystemctlActive("etcd", 2*time.Minute, 2*time.Second) {
+			return nil, fmt.Errorf("etcd service did not become active after start")
+		}
+		if !waitForEndpointHealth {
+			if executor.Logger != nil {
+				executor.Logger.Infof("etcd: service is active; skipping immediate endpoint health wait while discovery cluster forms")
+			}
+			return changes, nil
+		}
+
+		// Wait for etcd to be functionally healthy after start when this node
+		// is joining an existing cluster or forming a single-master cluster.
+		// For multi-master discovery bootstrap, endpoint health may remain
+		// false until enough peer members have started to elect quorum.
 		healthy := false
 		localEP := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 		for i := 0; i < 60; i++ {
