@@ -155,9 +155,16 @@ internal/
     cert-api-manager/       CA key for controller-manager cert signing
     etcd-config/            Etcd: volume, service, etcdctl, cluster join/rejoin/scale-down
     kube-os-config/         OpenStack cloud-config rendering
-    admin-kubeconfig/       Admin kubeconfig generation
-    kube-master-config/     Master: CNI, sysctl, services, kubeconfigs, Keystone webhook
-    kube-worker-config/     Worker: CNI, sysctl, kubelet/kube-proxy, TLS stripping
+    admin-kubeconfig/       Admin kubeconfig generation (root + core/ubuntu user)
+    kubecommon/             Shared helpers: CNI, sysctl, kubeconfig, kubelet config
+    kube-master-config/     Master: services, kubeconfigs, Keystone webhook
+      module.go             Orchestrator, network, kubelet config, docker sysconfig
+      kubeconfigs.go        API server/controller/scheduler args, kubeconfig writes
+      services.go           Systemd unit templates (apiserver, controller, etc.)
+    kube-worker-config/     Worker: kubelet/kube-proxy, TLS stripping
+      module.go             Orchestrator, network, kubelet config, docker sysconfig
+      kubeconfigs.go        Worker kubeconfig writes (remote master, TLS-disabled path)
+      services.go           Systemd unit templates (kubelet, kube-proxy)
     docker-registry/        Docker registry v2 with Swift backend (worker only)
     storage/                Cinder/ephemeral volume: wait loop, format, mount
     services/               Enable + conditional restart (RestartTracker-driven)

@@ -11,6 +11,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -37,7 +38,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes = append(changes, cs...)
 
 	// Sysctl.
-	cs, err = setupSysctl(executor)
+	cs, err = kubecommon.SetupKubernetesSysctl(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
@@ -91,38 +92,11 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 	var changes []host.Change
 
 	if cfg.Shared.NetworkDriver == "flannel" {
-		for _, dir := range []string{"/opt/cni/bin", "/srv/magnum/kubernetes/cni"} {
-			change, err := executor.EnsureDir(dir, 0o755)
-			if err != nil {
-				return nil, err
-			}
-			if change != nil {
-				changes = append(changes, *change)
-			}
-		}
-
-		{
-			cniTag := "v1.6.2"
-			cniURL := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/%s/cni-plugins-linux-amd64-%s.tgz",
-				cniTag, cniTag)
-			cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", cniTag)
-
-			cs, err := reconcileCNIPlugins(executor, cniURL, cniTgz)
-			if err != nil {
-				return nil, err
-			}
-			changes = append(changes, cs...)
-		}
-
-		// Kernel modules for flannel.
-		_ = executor.Run("modprobe", "-a", "vxlan", "br_netfilter")
-		change, err := executor.EnsureFile("/etc/modules-load.d/flannel.conf", []byte("vxlan\nbr_netfilter\n"), 0o644)
+		cs, err := kubecommon.SetupFlannelCNI(executor)
 		if err != nil {
 			return nil, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, cs...)
 	}
 
 	if cfg.Shared.NetworkDriver == "calico" {
@@ -158,227 +132,8 @@ unmanaged-devices=interface-name:cali*;interface-name:tunl*
 	return changes, nil
 }
 
-func reconcileCNIPlugins(executor *host.Executor, cniURL, cniTgz string) ([]host.Change, error) {
-	if cniPluginsInstalled(cniTgz) {
-		return nil, nil
-	}
-	if !executor.Apply {
-		return []host.Change{{
-			Action:  host.ActionCreate,
-			Path:    cniTgz,
-			Summary: fmt.Sprintf("download CNI plugins from %s", cniURL),
-		}}, nil
-	}
-
-	var changes []host.Change
-	if _, err := os.Stat(cniTgz); os.IsNotExist(err) {
-		dl, err := executor.DownloadFileWithRetry(context.Background(), cniURL, cniTgz, 0o644, 5)
-		if err != nil {
-			return nil, fmt.Errorf("download CNI plugins: %w", err)
-		}
-		if dl.Change != nil {
-			changes = append(changes, *dl.Change)
-		}
-	} else if err != nil {
-		return nil, err
-	}
-
-	if err := executor.Run("tar", "-C", "/opt/cni/bin", "-xzf", cniTgz); err != nil {
-		return nil, fmt.Errorf("extract CNI plugins: %w", err)
-	}
-	if err := executor.Run("chmod", "+x", "/opt/cni/bin/."); err != nil {
-		return nil, fmt.Errorf("chmod CNI plugins: %w", err)
-	}
-	changes = append(changes, host.Change{Action: host.ActionUpdate, Path: "/opt/cni/bin", Summary: "extract CNI plugins"})
-	return changes, nil
-}
-
-func cniPluginsInstalled(cniTgz string) bool {
-	for _, path := range []string{
-		cniTgz,
-		"/opt/cni/bin/bridge",
-		"/opt/cni/bin/host-local",
-		"/opt/cni/bin/loopback",
-		"/opt/cni/bin/portmap",
-	} {
-		if _, err := os.Stat(path); err != nil {
-			return false
-		}
-	}
-	return true
-}
-
-func setupSysctl(executor *host.Executor) ([]host.Change, error) {
-	content := `net.ipv4.conf.default.rp_filter=2
-net.ipv4.conf.*.rp_filter=2
-net.ipv4.conf.all.promote_secondaries = 1
-net.ipv4.conf.*.accept_source_route = 1
-net.ipv4.ip_unprivileged_port_start = 0
-net.ipv4.ping_group_range = 0 2147483647
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward = 1
-fs.inotify.max_user_instances = 8192
-fs.inotify.max_user_watches = 1048576
-`
-	// br_netfilter must be loaded for bridge-nf-call-iptables sysctl to work.
-	_ = executor.Run("modprobe", "br_netfilter")
-	modChange, modErr := executor.EnsureFile("/etc/modules-load.d/k8s-bridge.conf", []byte("br_netfilter\n"), 0o644)
-	if modErr != nil {
-		return nil, modErr
-	}
-
-	change, err := executor.EnsureFile("/etc/sysctl.d/k8s_custom.conf", []byte(content), 0o644)
-	if err != nil {
-		return nil, err
-	}
-	var changes []host.Change
-	if modChange != nil {
-		changes = append(changes, *modChange)
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-	if len(changes) > 0 {
-		_ = executor.Run("sysctl", "--system")
-	}
-	return changes, nil
-}
-
-func writeServiceFiles(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
-	if !cfg.Shared.UsePodman {
-		return nil, nil
-	}
-
-	var changes []host.Change
-	services := map[string]string{
-		"kubelet":    kubeletService(),
-		"kube-proxy": kubeProxyService(cfg),
-	}
-
-	for name, content := range services {
-		path := fmt.Sprintf("/etc/systemd/system/%s.service", name)
-		change, err := executor.EnsureFile(path, []byte(content), 0o644)
-		if err != nil {
-			return nil, err
-		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
-	}
-
-	if len(changes) > 0 {
-		_ = executor.Run("systemctl", "daemon-reload")
-	}
-
-	return changes, nil
-}
-
-func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
-	var changes []host.Change
-	certDir := "/etc/kubernetes/certs"
-
-	masterIP := ""
-	if cfg.Worker != nil {
-		masterIP = cfg.Worker.KubeMasterIP
-	}
-	apiPort := cfg.Shared.KubeAPIPort
-	if apiPort == 0 {
-		apiPort = 6443
-	}
-	kubeMasterURI := fmt.Sprintf("https://%s:%d", masterIP, apiPort)
-
-	// Etcd server IP: fall back to master IP if not set.
-	etcdServerIP := ""
-	if cfg.Worker != nil {
-		etcdServerIP = cfg.Worker.EtcdServerIP
-		if etcdServerIP == "" {
-			etcdServerIP = cfg.Worker.KubeMasterIP
-		}
-	}
-
-	// Base config.
-	// --allow-privileged was removed in K8s 1.27; only include for older versions.
-	allowPrivLine := ""
-	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 27) {
-		allowPrivLine = fmt.Sprintf("\nKUBE_ALLOW_PRIV=\"--allow-privileged=%s\"", cfg.Shared.KubeAllowPriv)
-	}
-	baseConfig := fmt.Sprintf(`KUBE_LOG_LEVEL="--v=3"%s
-KUBE_ETCD_SERVERS="--etcd-servers=http://%s:2379"
-KUBE_MASTER="--master=%s"
-`, allowPrivLine, etcdServerIP, kubeMasterURI)
-	change, err := executor.EnsureFile("/etc/kubernetes/config", []byte(baseConfig), 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-
-	// Kubelet kubeconfig.
-	var kubeletKC string
-	if cfg.Shared.TLSDisabled {
-		kubeletKC = buildInsecureKubeconfig(
-			fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), kubeMasterURI)
-	} else {
-		kubeletKC = buildKubeconfig(
-			fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName),
-			certDir+"/kubelet.crt", certDir+"/kubelet.key",
-			certDir+"/ca.crt", kubeMasterURI)
-	}
-	change, err = executor.EnsureFile("/etc/kubernetes/kubelet.conf", []byte(kubeletKC), 0o640)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-
-	// Proxy kubeconfig.
-	var proxyKC string
-	if cfg.Shared.TLSDisabled {
-		proxyKC = buildInsecureKubeconfig("kube-proxy", kubeMasterURI)
-	} else {
-		proxyKC = buildKubeconfig("kube-proxy",
-			certDir+"/proxy.crt", certDir+"/proxy.key",
-			certDir+"/ca.crt", kubeMasterURI)
-	}
-	change, err = executor.EnsureFile("/etc/kubernetes/proxy-config.yaml", []byte(proxyKC), 0o640)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-
-	// Proxy env.
-	proxyArgs := fmt.Sprintf("--kubeconfig=/etc/kubernetes/proxy-config.yaml --cluster-cidr=%s --hostname-override=%s %s",
-		cfg.Shared.PodsNetworkCIDR, cfg.Shared.InstanceName, cfg.Shared.KubeProxyOptions)
-	change, err = executor.EnsureFile("/etc/kubernetes/proxy",
-		[]byte(fmt.Sprintf("KUBE_PROXY_ARGS=\"%s\"\n", strings.TrimSpace(proxyArgs))), 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-
-	// Environment.
-	change, err = executor.EnsureLine("/etc/environment",
-		fmt.Sprintf("KUBERNETES_MASTER=%s", kubeMasterURI), 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
-
-	return changes, nil
-}
-
 func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	var changes []host.Change
-	certDir := "/etc/kubernetes/certs"
 
 	change, err := executor.EnsureDir("/etc/kubernetes/manifests", 0o755)
 	if err != nil {
@@ -388,73 +143,22 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		changes = append(changes, *change)
 	}
 
-	nodeIP := cfg.ResolveNodeIP()
-	cgroupDriver := cfg.ResolveCgroupDriver()
-	dnsServiceIP := cfg.Shared.DNSServiceIP
 	dnsClusterDomain := cfg.Shared.DNSClusterDomain
 	if dnsClusterDomain == "" {
 		dnsClusterDomain = "cluster.local"
 	}
 
-	// Always fetch instance ID (even in preview) so generated content
-	// matches what is on disk — otherwise preview shows a false diff.
-	instanceID := ""
-	if out, err := executor.RunCapture("curl", "-s", "--max-time", "5", "http://169.254.169.254/openstack/latest/meta_data.json"); err == nil {
-		if idx := strings.Index(out, `"uuid"`); idx >= 0 {
-			rest := out[idx+7:]
-			if start := strings.Index(rest, `"`); start >= 0 {
-				rest = rest[start+1:]
-				if end := strings.Index(rest, `"`); end >= 0 {
-					instanceID = rest[:end]
-				}
-			}
-		}
+	opts := kubecommon.KubeletConfigOpts{
+		CertDir:          "/etc/kubernetes/certs",
+		CgroupDriver:     cfg.ResolveCgroupDriver(),
+		DNSServiceIP:     cfg.Shared.DNSServiceIP,
+		DNSClusterDomain: dnsClusterDomain,
+		NodeIP:           cfg.ResolveNodeIP(),
+		InstanceID:       kubecommon.FetchInstanceID(executor),
+		FeatureGates:     kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag),
 	}
-	featureGates := kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag)
 
-	kubeletConfig := fmt.Sprintf(`---
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-authentication:
-  anonymous:
-    enabled: false
-  webhook:
-    cacheTTL: 0s
-    enabled: true
-  x509:
-    clientCAFile: "%s/ca.crt"
-authorization:
-  mode: Webhook
-  webhook:
-    cacheAuthorizedTTL: 0s
-    cacheUnauthorizedTTL: 0s
-cgroupDriver: %s
-clusterDNS:
-- %s
-clusterDomain: %s
-address: %s
-failSwapOn: true
-port: 10250
-readOnlyPort: 0
-containerLogMaxFiles: 5
-containerLogMaxSize: 10Mi
-maxPods: 110
-podPidsLimit: -1
-providerID: openstack:///%s
-resolvConf: /run/systemd/resolve/resolv.conf
-volumePluginDir: /var/lib/kubelet/volumeplugins
-rotateCertificates: true
-tlsCertFile: %s/kubelet.crt
-tlsPrivateKeyFile: %s/kubelet.key
-staticPodPath: /etc/kubernetes/manifests
-runtimeRequestTimeout: 15m
-eventRecordQPS: 5
-containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
-%s
-`, certDir, cgroupDriver, dnsServiceIP, dnsClusterDomain, nodeIP,
-		instanceID, certDir, certDir, featureGates)
-
-	change, err = executor.EnsureFile("/etc/kubernetes/kubelet-config.yaml", []byte(kubeletConfig), 0o644)
+	change, err = executor.EnsureFile("/etc/kubernetes/kubelet-config.yaml", []byte(kubecommon.RenderKubeletConfig(opts)), 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +167,8 @@ containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
 	}
 
 	// Kubelet args.
-	kubeletArgs := buildKubeletArgs(cfg)
+	nodeIP := opts.NodeIP
+	kubeletArgs := kubecommon.BuildKubeletArgs(cfg)
 	kubeletEnv := fmt.Sprintf(`KUBELET_ADDRESS="--node-ip=%s"
 KUBELET_HOSTNAME="--hostname-override=%s"
 KUBELET_ARGS="%s"
@@ -477,82 +182,6 @@ KUBELET_ARGS="%s"
 	}
 
 	return changes, nil
-}
-
-func buildKubeletArgs(cfg config.Config) string {
-	args := []string{
-		"--kubeconfig /etc/kubernetes/kubelet.conf",
-		"--config=/etc/kubernetes/kubelet-config.yaml",
-		fmt.Sprintf("--node-labels=magnum.openstack.org/role=%s", cfg.Shared.NodegroupRole),
-		fmt.Sprintf("--node-labels=magnum.openstack.org/nodegroup=%s", cfg.Shared.NodegroupName),
-	}
-	if cfg.Shared.ContainerRuntime == "containerd" {
-		args = append(args, "--runtime-cgroups=/system.slice/containerd.service")
-	}
-	// containerRuntimeEndpoint was added to KubeletConfiguration in K8s 1.27.
-	// For older versions the config field is silently ignored, so pass it as
-	// a CLI flag to tell kubelet where the CRI socket is.
-	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 27) {
-		endpoint := "unix:///run/containerd/containerd.sock"
-		if cfg.Shared.ContainerRuntime == "docker" {
-			endpoint = "unix:///var/run/cri-dockerd.sock"
-		}
-		args = append(args, "--container-runtime-endpoint="+endpoint)
-		// K8s < 1.24 defaults to --container-runtime=docker (built-in dockershim).
-		// When using containerd, we must explicitly select the remote CRI path.
-		if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 24) && cfg.Shared.ContainerRuntime == "containerd" {
-			args = append(args, "--container-runtime=remote")
-		}
-	}
-	if cfg.Shared.KubeletOptions != "" {
-		args = append(args, cfg.Shared.KubeletOptions)
-	}
-	return strings.Join(args, " ")
-}
-
-func buildKubeconfig(user, certFile, keyFile, caFile, server string) string {
-	return fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    certificate-authority: %s
-    server: %s
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: %s
-  name: default
-current-context: default
-kind: Config
-preferences: {}
-users:
-- name: %s
-  user:
-    as-user-extra: {}
-    client-certificate: %s
-    client-key: %s
-`, caFile, server, user, user, certFile, keyFile)
-}
-
-func buildInsecureKubeconfig(user, server string) string {
-	return fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    server: %s
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: %s
-  name: default
-current-context: default
-kind: Config
-preferences: {}
-users:
-- name: %s
-  user:
-    as-user-extra: {}
-`, server, user, user)
 }
 
 func configureDockerSysconfig(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -584,69 +213,6 @@ func configureDockerSysconfig(cfg config.Config, executor *host.Executor) ([]hos
 	}
 
 	return changes, nil
-}
-
-func kubeletService() string {
-	return `[Unit]
-Description=Kubelet
-Wants=rpc-statd.service
-
-[Service]
-EnvironmentFile=/etc/sysconfig/heat-params
-EnvironmentFile=/etc/kubernetes/config
-EnvironmentFile=-/etc/kubernetes/kubelet.env
-ExecStartPre=/bin/mkdir -p /etc/kubernetes/cni/net.d
-ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
-ExecStartPre=/bin/mkdir -p /var/lib/calico
-ExecStartPre=/bin/mkdir -p /var/lib/containerd
-ExecStartPre=/bin/mkdir -p /var/lib/docker
-ExecStartPre=/bin/mkdir -p /var/lib/kubelet/volumeplugins
-ExecStartPre=/bin/mkdir -p /opt/cni/bin
-ExecStart=/usr/local/bin/kubelet \
-    $KUBE_LOG_LEVEL $KUBELET_API_SERVER $KUBELET_ADDRESS $KUBELET_PORT $KUBELET_HOSTNAME $KUBELET_ARGS
-Delegate=yes
-Restart=always
-RestartSec=10
-TimeoutStartSec=10min
-[Install]
-WantedBy=multi-user.target
-`
-}
-
-func kubeProxyService(cfg config.Config) string {
-	prefix := cfg.Shared.ContainerInfraPrefix
-	if prefix == "" {
-		prefix = "registry.k8s.io/"
-	}
-	return fmt.Sprintf(`[Unit]
-Description=kube-proxy via registry.k8s.io/kube-proxy
-[Service]
-EnvironmentFile=/etc/sysconfig/heat-params
-EnvironmentFile=/etc/kubernetes/config
-EnvironmentFile=/etc/kubernetes/proxy
-ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-proxy
-ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-proxy \
-    --privileged \
-    --net host \
-    --volume /etc/kubernetes:/etc/kubernetes:ro,z \
-    --volume /usr/lib/os-release:/etc/os-release:ro \
-    --volume /etc/ssl/certs:/etc/ssl/certs:ro \
-    --volume /run:/run \
-    --volume /sys/fs/cgroup:/sys/fs/cgroup \
-    --volume /lib/modules:/lib/modules:ro \
-    --volume /etc/pki/tls/certs:/usr/share/ca-certificates:ro \
-    %skube-proxy-%s:%s \
-    kube-proxy \
-    $KUBE_LOG_LEVEL $KUBE_MASTER $KUBE_PROXY_ARGS'
-ExecStop=-/usr/bin/podman stop kube-proxy
-Delegate=yes
-Restart=always
-RestartSec=10
-TimeoutStartSec=10min
-[Install]
-WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
 
 // Destroy removes worker kubernetes configuration files and CNI binaries.

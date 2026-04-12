@@ -65,6 +65,31 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
+	// Copy kubeconfig to non-root user home directories so operators can
+	// use kubectl without sudo.  Fedora CoreOS → core, Ubuntu → ubuntu.
+	for _, user := range []string{"core", "ubuntu"} {
+		homeDir := "/home/" + user
+		if _, err := os.Stat(homeDir); err != nil {
+			continue
+		}
+		kubeDir := homeDir + "/.kube"
+		change, err := executor.EnsureDir(kubeDir, 0o755)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+		}
+		change, err = executor.EnsureFile(kubeDir+"/config", []byte(content), 0o600)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+		}
+		_ = executor.Run("chown", "-R", user+":"+user, kubeDir)
+	}
+
 	change, err := executor.UpsertExport("/etc/bashrc", "KUBECONFIG", "/etc/kubernetes/admin.conf", 0o644)
 	if err != nil {
 		return moduleapi.Result{}, err
@@ -90,6 +115,9 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 	}
 	_ = os.Remove("/etc/kubernetes/admin.conf")
 	_ = os.Remove("/root/.kube/config")
+	for _, user := range []string{"core", "ubuntu"} {
+		_ = os.RemoveAll("/home/" + user + "/.kube")
+	}
 
 	return nil
 }

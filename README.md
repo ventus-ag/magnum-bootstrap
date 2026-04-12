@@ -164,6 +164,7 @@ internal/
   logging/              Structured logger with auto-trim at 100MB
   magnum/               Keystone auth, Magnum CA fetch, parallel CSR signing
   module/               31 reconcile modules (see CLAUDE.md for details)
+    kubecommon/          Shared: CNI plugins, sysctl, kubeconfig builders, kubelet config
   moduleapi/            Module interface, RestartTracker, HeatParamsComponent
   paths/                Runtime path resolution from environment
   plan/                 Unified phase catalog for master/worker plans
