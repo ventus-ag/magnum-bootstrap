@@ -594,6 +594,11 @@ func buildKubeletArgs(cfg config.Config) string {
 			endpoint = "unix:///var/run/cri-dockerd.sock"
 		}
 		args = append(args, "--container-runtime-endpoint="+endpoint)
+		// K8s < 1.24 defaults to --container-runtime=docker (built-in dockershim).
+		// When using containerd, we must explicitly select the remote CRI path.
+		if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 24) && cfg.Shared.ContainerRuntime == "containerd" {
+			args = append(args, "--container-runtime=remote")
+		}
 	}
 	if cfg.Shared.KubeletOptions != "" {
 		args = append(args, cfg.Shared.KubeletOptions)
