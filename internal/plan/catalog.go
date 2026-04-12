@@ -38,6 +38,7 @@ func masterPhases() []Phase {
 		newPhase("cluster-dashboard", "reconcile Kubernetes Dashboard via Helm", false),
 		newPhase("cluster-auto-healer", "reconcile node problem detector and auto-healer", false),
 		newPhase("cluster-autoscaler", "reconcile cluster autoscaler via Helm", false),
+		newPhase("cluster-gpu-operator", "reconcile NVIDIA GPU Operator via Helm", false),
 		newPhase("cluster-health", "verify cluster pods are healthy, restart crashlooping pods", false),
 		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 	}

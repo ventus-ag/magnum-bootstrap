@@ -152,6 +152,9 @@ type SharedConfig struct {
 	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
 	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
 
+	// NVIDIA GPU Operator (master-0 only, requires GPU nodes)
+	GPUOperatorEnabled bool `json:"gpuOperatorEnabled"`
+
 	// OS auto-upgrade (Zincati on Fedora CoreOS)
 	OSAutoUpgradeEnabled bool `json:"osAutoUpgradeEnabled"`
 

@@ -184,6 +184,7 @@ internal/
     cluster-dashboard/      Kubernetes Dashboard via Helm
     cluster-auto-healer/    Node Problem Detector via Helm
     cluster-autoscaler/     Cluster Autoscaler via Helm (Magnum provider)
+    cluster-gpu-operator/   NVIDIA GPU Operator via Helm (requires GPU nodes)
     cluster-health/         Cluster addon health checks
     zincati/                Fedora CoreOS auto-update settings
   moduleapi/moduleapi.go    Module interface, HeatParams, Request, RestartTracker
@@ -235,8 +236,9 @@ based on current vs desired state.
 | 24 | cluster-dashboard | no | Master-0 only, skip on other masters |
 | 25 | cluster-auto-healer | no | Master-0 only, skip on other masters |
 | 26 | cluster-autoscaler | no | Master-0 only, skip on other masters |
-| 27 | cluster-health | no | Master-0 only, skip on other masters |
-| 28 | zincati | no | Fedora CoreOS OS auto-upgrade settings |
+| 27 | cluster-gpu-operator | no | Master-0 only, requires GPU nodes |
+| 28 | cluster-health | no | Master-0 only, skip on other masters |
+| 29 | zincati | no | Fedora CoreOS OS auto-upgrade settings |
 
 ### Worker (16 phases)
 

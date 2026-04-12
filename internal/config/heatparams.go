@@ -115,6 +115,7 @@ func Load(path string) (Config, error) {
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
 			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
 
+			GPUOperatorEnabled:     parseBool(raw["GPU_OPERATOR_ENABLED"]),
 			OSAutoUpgradeEnabled:   parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
 
 			PostInstallManifestURL: raw["POST_INSTALL_MANIFEST_URL"],
