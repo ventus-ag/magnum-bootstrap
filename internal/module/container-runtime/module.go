@@ -14,11 +14,14 @@ import (
 )
 
 // containerdVersions maps Kubernetes minor version to the containerd version.
-// K8s >= 1.28 uses containerd 2.x (shim protocol v3).
-// K8s < 1.28 uses containerd 1.7.x (shim protocol v2).
+// Based on containerd.io/releases support matrix:
+//   - K8s >= 1.35: containerd 2.2.x (officially supports 1.35+)
+//   - K8s 1.32-1.34: containerd 2.1.x (officially supports 1.32-1.35)
+//   - K8s < 1.32: containerd 1.7.x LTS (officially supports through 1.35, LTS until Sep 2026)
 var containerdVersions = map[string]string{
-	"1.28": "2.2.2",
-	"1.27": "1.7.30",
+	"1.35": "2.2.2",
+	"1.32": "2.1.6",
+	"1.31": "1.7.30",
 }
 
 type Module struct{}
@@ -88,8 +91,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Select containerd version by Kubernetes version.
-	// K8s >= 1.28 uses containerd 2.x (shim protocol v3).
-	// K8s < 1.28 uses containerd 1.7.x (shim protocol v2).
+	// K8s >= 1.32 uses containerd 2.x; K8s < 1.32 uses containerd 1.7.x LTS.
 	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
 	useV2Layout := false
 	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
