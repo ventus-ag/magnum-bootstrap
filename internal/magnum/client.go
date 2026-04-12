@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // Client provides access to the Magnum certificate API via OpenStack Keystone
@@ -156,6 +157,61 @@ type CertSpec struct {
 	SANDNSs     []string // DNS SANs
 	KeyUsage    x509.KeyUsage
 	ExtKeyUsage []x509.ExtKeyUsage
+}
+
+type SignedCert struct {
+	Spec    CertSpec
+	KeyPEM  string
+	CertPEM string
+}
+
+// GenerateAndSignCerts generates keys/CSRs and signs all requested certs in
+// parallel. Results preserve the input order so callers can write files and
+// report changes deterministically.
+func GenerateAndSignCerts(client *Client, token string, specs []CertSpec) ([]SignedCert, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	if client == nil {
+		return nil, fmt.Errorf("generate/sign certificates: nil Magnum client")
+	}
+
+	results := make([]SignedCert, len(specs))
+	errCh := make(chan error, len(specs))
+	var wg sync.WaitGroup
+
+	for i, spec := range specs {
+		wg.Add(1)
+		go func(i int, spec CertSpec) {
+			defer wg.Done()
+
+			keyPEM, csrPEM, err := GenerateKeyAndCSR(spec)
+			if err != nil {
+				errCh <- fmt.Errorf("generate %s key/CSR: %w", spec.Name, err)
+				return
+			}
+
+			certPEM, err := client.SignCSR(token, csrPEM)
+			if err != nil {
+				errCh <- fmt.Errorf("sign %s CSR: %w", spec.Name, err)
+				return
+			}
+
+			results[i] = SignedCert{
+				Spec:    spec,
+				KeyPEM:  keyPEM,
+				CertPEM: certPEM,
+			}
+		}(i, spec)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return nil, err
+	}
+
+	return results, nil
 }
 
 // GenerateKeyAndCSR creates a 4096-bit RSA key and a PEM-encoded CSR.

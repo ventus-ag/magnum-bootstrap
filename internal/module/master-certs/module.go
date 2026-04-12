@@ -149,27 +149,27 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Generate and sign each certificate.
+	// Generate and sign certificates in parallel, then write files in
+	// deterministic spec order.
+	signSpecs := make([]magnumapi.CertSpec, 0, len(specs))
 	for _, spec := range specs {
 		needsReconcile, _ := certNeedsReconcile(certDir, spec)
 		if !needsReconcile {
 			continue
 		}
+		signSpecs = append(signSpecs, spec)
+	}
 
-		keyPEM, csrPEM, err := magnumapi.GenerateKeyAndCSR(spec)
-		if err != nil {
-			return moduleapi.Result{}, fmt.Errorf("generate %s key/CSR: %w", spec.Name, err)
-		}
-
-		certPEM, err := client.SignCSR(token, csrPEM)
-		if err != nil {
-			return moduleapi.Result{}, fmt.Errorf("sign %s CSR: %w", spec.Name, err)
-		}
-
+	signedCerts, err := magnumapi.GenerateAndSignCerts(client, token, signSpecs)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
+	for _, signed := range signedCerts {
+		spec := signed.Spec
 		keyPath := fmt.Sprintf("%s/%s.key", certDir, spec.Name)
 		certPath := fmt.Sprintf("%s/%s.crt", certDir, spec.Name)
 
-		change, err := executor.EnsureFile(keyPath, []byte(keyPEM), 0o440)
+		change, err := executor.EnsureFile(keyPath, []byte(signed.KeyPEM), 0o440)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
@@ -177,7 +177,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			changes = append(changes, *change)
 		}
 
-		change, err = executor.EnsureFile(certPath, []byte(certPEM), 0o444)
+		change, err = executor.EnsureFile(certPath, []byte(signed.CertPEM), 0o444)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -83,28 +84,23 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	needsKubectlCopy := binaryNeedsReconcile("/srv/magnum/bin/kubectl", desired.KubectlURL, installed.KubectlURL, installed.KubectlCopySHA256) || needsKubectl
 
 	if req.Apply {
+		kubeletDownload, kubectlDownload, err := downloadClientBinaries(ctx, executor, desired, needsKubelet, needsKubectl)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
 		if needsKubelet {
-			download, err := executor.DownloadFileWithRetry(ctx, desired.KubeletURL, "/usr/local/bin/kubelet", 0o755, 5)
-			if err != nil {
-				return moduleapi.Result{}, err
+			if kubeletDownload.Change != nil {
+				changes = append(changes, *kubeletDownload.Change)
 			}
-			if download.Change != nil {
-				changes = append(changes, *download.Change)
-			}
-			desired.KubeletSHA256 = download.Checksum
+			desired.KubeletSHA256 = kubeletDownload.Checksum
 		} else {
 			desired.KubeletSHA256, _ = host.FileSHA256("/usr/local/bin/kubelet")
 		}
-
 		if needsKubectl {
-			download, err := executor.DownloadFileWithRetry(ctx, desired.KubectlURL, "/usr/local/bin/kubectl", 0o755, 5)
-			if err != nil {
-				return moduleapi.Result{}, err
+			if kubectlDownload.Change != nil {
+				changes = append(changes, *kubectlDownload.Change)
 			}
-			if download.Change != nil {
-				changes = append(changes, *download.Change)
-			}
-			desired.KubectlSHA256 = download.Checksum
+			desired.KubectlSHA256 = kubectlDownload.Checksum
 		} else {
 			desired.KubectlSHA256, _ = host.FileSHA256("/usr/local/bin/kubectl")
 		}
@@ -152,6 +148,38 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			"targetDir":  "/usr/local/bin",
 		},
 	}, nil
+}
+
+func downloadClientBinaries(ctx context.Context, executor *host.Executor, desired installState, needsKubelet, needsKubectl bool) (host.DownloadResult, host.DownloadResult, error) {
+	var wg sync.WaitGroup
+	var kubeletDownload host.DownloadResult
+	var kubectlDownload host.DownloadResult
+	var kubeletErr error
+	var kubectlErr error
+
+	if needsKubelet {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kubeletDownload, kubeletErr = executor.DownloadFileWithRetry(ctx, desired.KubeletURL, "/usr/local/bin/kubelet", 0o755, 5)
+		}()
+	}
+	if needsKubectl {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kubectlDownload, kubectlErr = executor.DownloadFileWithRetry(ctx, desired.KubectlURL, "/usr/local/bin/kubectl", 0o755, 5)
+		}()
+	}
+	wg.Wait()
+
+	if kubeletErr != nil {
+		return host.DownloadResult{}, host.DownloadResult{}, kubeletErr
+	}
+	if kubectlErr != nil {
+		return host.DownloadResult{}, host.DownloadResult{}, kubectlErr
+	}
+	return kubeletDownload, kubectlDownload, nil
 }
 
 // Destroy removes kubelet and kubectl binaries.

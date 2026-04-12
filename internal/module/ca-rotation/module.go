@@ -107,13 +107,13 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	if cfg.Role() == config.RoleMaster {
-		cs, err := rotateMasterCerts(cfg, executor, client, token, stageCertDir)
+		cs, err := rotateMasterCerts(cfg, client, token, stageCertDir)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, cs...)
 	} else {
-		cs, err := rotateWorkerCerts(cfg, executor, client, token, stageCertDir)
+		cs, err := rotateWorkerCerts(cfg, client, token, stageCertDir)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
@@ -238,7 +238,7 @@ func latestAppliedCARotationID(markerPath, previousRotationID string) (string, e
 	return previousRotationID, nil
 }
 
-func rotateMasterCerts(cfg config.Config, executor *host.Executor, client *magnumapi.Client, token, stageCertDir string) ([]host.Change, error) {
+func rotateMasterCerts(cfg config.Config, client *magnumapi.Client, token, stageCertDir string) ([]host.Change, error) {
 	var changes []host.Change
 
 	nodeIP := cfg.ResolveNodeIP()
@@ -303,13 +303,11 @@ func rotateMasterCerts(cfg config.Config, executor *host.Executor, client *magnu
 		},
 	}
 
-	for _, spec := range specs {
-		cs, err := generateAndWriteCert(executor, client, token, stageCertDir, spec)
-		if err != nil {
-			return nil, err
-		}
-		changes = append(changes, cs...)
+	cs, err := generateAndWriteCerts(client, token, stageCertDir, specs)
+	if err != nil {
+		return nil, err
 	}
+	changes = append(changes, cs...)
 
 	// Write service account keys.
 	if err := os.WriteFile(filepath.Join(stageCertDir, "service_account.key"),
@@ -324,7 +322,7 @@ func rotateMasterCerts(cfg config.Config, executor *host.Executor, client *magnu
 	return changes, nil
 }
 
-func rotateWorkerCerts(cfg config.Config, executor *host.Executor, client *magnumapi.Client, token, stageCertDir string) ([]host.Change, error) {
+func rotateWorkerCerts(cfg config.Config, client *magnumapi.Client, token, stageCertDir string) ([]host.Change, error) {
 	var changes []host.Change
 
 	nodeIP := cfg.ResolveNodeIP()
@@ -347,40 +345,34 @@ func rotateWorkerCerts(cfg config.Config, executor *host.Executor, client *magnu
 		},
 	}
 
-	for _, spec := range specs {
-		cs, err := generateAndWriteCert(executor, client, token, stageCertDir, spec)
-		if err != nil {
-			return nil, err
-		}
-		changes = append(changes, cs...)
+	cs, err := generateAndWriteCerts(client, token, stageCertDir, specs)
+	if err != nil {
+		return nil, err
 	}
+	changes = append(changes, cs...)
 
 	return changes, nil
 }
 
-func generateAndWriteCert(executor *host.Executor, client *magnumapi.Client, token, certDir string, spec magnumapi.CertSpec) ([]host.Change, error) {
-	var changes []host.Change
-
-	keyPEM, csrPEM, err := magnumapi.GenerateKeyAndCSR(spec)
+func generateAndWriteCerts(client *magnumapi.Client, token, certDir string, specs []magnumapi.CertSpec) ([]host.Change, error) {
+	signedCerts, err := magnumapi.GenerateAndSignCerts(client, token, specs)
 	if err != nil {
-		return nil, fmt.Errorf("generate %s key/CSR: %w", spec.Name, err)
-	}
-
-	certPEM, err := client.SignCSR(token, csrPEM)
-	if err != nil {
-		return nil, fmt.Errorf("sign %s CSR: %w", spec.Name, err)
-	}
-
-	keyPath := filepath.Join(certDir, spec.Name+".key")
-	certPath := filepath.Join(certDir, spec.Name+".crt")
-
-	if err := os.WriteFile(keyPath, []byte(keyPEM), 0o440); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(certPath, []byte(certPEM), 0o444); err != nil {
-		return nil, err
+
+	changes := make([]host.Change, 0, len(signedCerts))
+	for _, signed := range signedCerts {
+		keyPath := filepath.Join(certDir, signed.Spec.Name+".key")
+		certPath := filepath.Join(certDir, signed.Spec.Name+".crt")
+
+		if err := os.WriteFile(keyPath, []byte(signed.KeyPEM), 0o440); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(certPath, []byte(signed.CertPEM), 0o444); err != nil {
+			return nil, err
+		}
+		changes = append(changes, host.Change{Action: host.ActionReplace, Path: certPath, Summary: fmt.Sprintf("rotate %s certificate", signed.Spec.Name)})
 	}
-	changes = append(changes, host.Change{Action: host.ActionReplace, Path: certPath, Summary: fmt.Sprintf("rotate %s certificate", spec.Name)})
 
 	return changes, nil
 }

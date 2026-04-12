@@ -7,6 +7,7 @@ Kubernetes node reconciliation engine for OpenStack Magnum. Replaces legacy bash
 - **31 native modules** covering full node lifecycle: create, upgrade, resize, CA rotation
 - **Unified phase plan** — same phases for all operations; each module decides internally whether to act
 - **Dependency-aware phase parallelism** — independent module phases run concurrently up to `--parallelism`
+- **Parallel certificate signing** — cert modules generate keys/CSRs and call Magnum signing concurrently, then write files deterministically
 - **Cluster-level addons** via Pulumi Kubernetes/Helm providers (Flannel, CoreDNS, OCCM, Cinder CSI, Manila CSI, metrics-server, autoscaler, auto-healer)
 - **Desired-state reconciliation** — idempotent, drift-detecting, change-driven restarts
 - **Crash recovery** — stale Pulumi lock detection, PID verification, auto-cancel
@@ -84,6 +85,9 @@ make build
 
 ### Master Phases
 
+This is the catalog order. Actual execution follows module dependencies, so
+independent phases can overlap.
+
 prereq-validation → ca-rotation → container-runtime → client-tools →
 master-certificates → cert-api-manager → etcd → kube-os-config →
 admin-kubeconfig → stop-services → kube-master-config → storage → proxy-env →
@@ -93,6 +97,9 @@ cluster-metrics-server → cluster-dashboard → cluster-auto-healer →
 cluster-autoscaler → cluster-health → zincati
 
 ### Worker Phases
+
+This is the catalog order. Actual execution follows module dependencies, so
+independent phases can overlap.
 
 prereq-validation → ca-rotation → container-runtime → client-tools →
 kube-os-config → worker-certificates → registry → admin-kubeconfig →
@@ -155,7 +162,7 @@ internal/
   host/                 Idempotent file/command primitives (EnsureFile, Run, etc.)
   journal/              Run state tracking, crash recovery
   logging/              Structured logger with auto-trim at 100MB
-  magnum/               Keystone auth, Magnum CA fetch, CSR signing (Go crypto)
+  magnum/               Keystone auth, Magnum CA fetch, parallel CSR signing
   module/               31 reconcile modules (see CLAUDE.md for details)
   moduleapi/            Module interface, RestartTracker, HeatParamsComponent
   paths/                Runtime path resolution from environment

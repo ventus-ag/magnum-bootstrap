@@ -143,15 +143,15 @@ internal/
   host/ops.go               Idempotent host file/command primitives
   journal/run_state.go      Run lifecycle tracking (running/completed/failed/interrupted)
   logging/logger.go         Structured file + stderr logging
-  magnum/client.go          Keystone auth, Magnum CA fetch, CSR signing (Go crypto)
+  magnum/client.go          Keystone auth, Magnum CA fetch, parallel CSR signing
   module/
     module.go               Type alias for moduleapi.Module
     registry.go             Module registry (31 modules)
     prereq-validation/      Input validation checks
     container-runtime/      Docker/containerd install, config, drift detection
     client-tools/           kubectl/kubelet binary download & install
-    master-certs/           Master cert generation via Magnum API (6 certs)
-    worker-certs/           Worker cert generation via Magnum API (2 certs)
+    master-certs/           Master cert generation via Magnum API (6 certs, parallel signing)
+    worker-certs/           Worker cert generation via Magnum API (2 certs, parallel signing)
     cert-api-manager/       CA key for controller-manager cert signing
     etcd-config/            Etcd: volume, service, etcdctl, cluster join/rejoin/scale-down
     kube-os-config/         OpenStack cloud-config rendering
@@ -257,7 +257,8 @@ based on current vs desired state.
 ### Idempotency
 - All file writes use `EnsureFile` (content-compare, atomic write)
 - Services only restart when config actually changed (RestartTracker)
-- Certs skipped if existing material matches desired certificate spec
+- Certs skipped if existing material matches desired certificate spec; changed
+  certs are signed in parallel and written in deterministic order
 - Storage skipped if already mounted (`mountpoint -q`)
 - Device wait loops (60 attempts, 30s) for Cinder volume attachment
 
@@ -307,7 +308,7 @@ The timer is started AFTER the synchronous Heat-triggered run to avoid racing.
 
 - [ ] Add `make test` and `make lint` targets to Makefile
 - [ ] Add unit tests for config parsing edge cases
-- [ ] Add unit tests for certificate generation (magnum client)
+- [x] Add unit tests for certificate generation/signing concurrency (magnum client)
 - [ ] Add golden tests for rendered files (cloud-config, kubeconfig, kubelet-config, etcd.conf)
 - [ ] Add state backup before disruptive apply steps
 - [ ] Add Pulumi state backup before apply steps

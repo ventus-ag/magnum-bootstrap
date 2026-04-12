@@ -46,7 +46,6 @@ func TestMasterDependencyContracts(t *testing.T) {
 	assertDependsOn(t, reconcilePlan, registry, "kube-master-config",
 		"master-certificates",
 		"cert-api-manager",
-		"etcd",
 		"kube-os-config",
 		"client-tools",
 		"container-runtime",
@@ -60,6 +59,7 @@ func TestMasterDependencyContracts(t *testing.T) {
 		"storage",
 		"container-runtime",
 		"master-certificates",
+		"etcd",
 	)
 	assertDependsOn(t, reconcilePlan, registry, "health", "services", "start-services", "proxy-env")
 	assertDependsOn(t, reconcilePlan, registry, "cluster-rbac", "health")

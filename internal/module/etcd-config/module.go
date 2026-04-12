@@ -323,15 +323,31 @@ WantedBy=multi-user.target
 func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	// etcdTag returns kubeadm-style tags like "3.5.24-0"; strip the "-0"
 	// image build suffix to get the upstream release version for downloads.
-	etcdVersion := strings.TrimPrefix(etcdTag(cfg), "v")
-	if i := strings.LastIndex(etcdVersion, "-"); i > 0 {
-		etcdVersion = etcdVersion[:i]
-	}
+	etcdVersion := desiredEtcdctlVersion(cfg)
 	if etcdVersion == "" {
+		return nil, nil
+	}
+	if etcdctlVersionMatches(executor, etcdVersion) {
 		return nil, nil
 	}
 
 	etcdDir := "/srv/magnum/etcd"
+	tgzURL := fmt.Sprintf("https://github.com/etcd-io/etcd/releases/download/v%s/etcd-v%s-linux-amd64.tar.gz",
+		etcdVersion, etcdVersion)
+	tgzPath := fmt.Sprintf("%s/etcd-v%s-linux-amd64.tar.gz", etcdDir, etcdVersion)
+
+	if !executor.Apply {
+		action := host.ActionReplace
+		if _, err := os.Stat("/usr/local/bin/etcdctl"); os.IsNotExist(err) {
+			action = host.ActionCreate
+		}
+		return []host.Change{{
+			Action:  action,
+			Path:    "/usr/local/bin/etcdctl",
+			Summary: fmt.Sprintf("install etcdctl %s from %s", etcdVersion, tgzURL),
+		}}, nil
+	}
+
 	change, err := executor.EnsureDir(etcdDir, 0o755)
 	if err != nil {
 		return nil, err
@@ -340,10 +356,6 @@ func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, 
 	if change != nil {
 		changes = append(changes, *change)
 	}
-
-	tgzURL := fmt.Sprintf("https://github.com/etcd-io/etcd/releases/download/v%s/etcd-v%s-linux-amd64.tar.gz",
-		etcdVersion, etcdVersion)
-	tgzPath := fmt.Sprintf("%s/etcd-v%s-linux-amd64.tar.gz", etcdDir, etcdVersion)
 
 	dl, err := executor.DownloadFileWithRetry(context.Background(), tgzURL, tgzPath, 0o644, 5)
 	if err != nil {
@@ -363,6 +375,22 @@ func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, 
 	}
 
 	return changes, nil
+}
+
+func desiredEtcdctlVersion(cfg config.Config) string {
+	etcdVersion := strings.TrimPrefix(etcdTag(cfg), "v")
+	if i := strings.LastIndex(etcdVersion, "-"); i > 0 {
+		etcdVersion = etcdVersion[:i]
+	}
+	return etcdVersion
+}
+
+func etcdctlVersionMatches(executor *host.Executor, desiredVersion string) bool {
+	out, err := executor.RunCapture("/usr/local/bin/etcdctl", "version")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, "etcdctl version: "+desiredVersion)
 }
 
 func etcdHealthy(executor *host.Executor, endpoint, certDir string, tlsDisabled bool) bool {
@@ -627,11 +655,11 @@ func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDi
 		healthy := false
 		localEP := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 		for i := 0; i < 60; i++ {
-			if etcdHealthy(executor, localEP, certDir, tlsDisabled) {
+			if etcdHealthyOnce(executor, localEP, certDir, tlsDisabled, "2s") {
 				healthy = true
 				break
 			}
-			time.Sleep(5 * time.Second)
+			time.Sleep(3 * time.Second)
 		}
 		if !healthy {
 			return nil, fmt.Errorf("etcd did not become healthy within 5 minutes after start")
@@ -728,7 +756,14 @@ func buildConfig(cfg config.Config, nodeIP, protocol, mode, initialCluster strin
 }
 
 func etcdctlArgs(endpoint, certDir string, tlsDisabled bool) []string {
-	args := []string{"--endpoints=" + endpoint, "--command-timeout=5s"}
+	return etcdctlArgsWithTimeout(endpoint, certDir, tlsDisabled, "5s")
+}
+
+func etcdctlArgsWithTimeout(endpoint, certDir string, tlsDisabled bool, timeout string) []string {
+	if timeout == "" {
+		timeout = "5s"
+	}
+	args := []string{"--endpoints=" + endpoint, "--command-timeout=" + timeout}
 	if !tlsDisabled {
 		args = append(args,
 			"--cacert="+certDir+"/ca.crt",
@@ -737,6 +772,13 @@ func etcdctlArgs(endpoint, certDir string, tlsDisabled bool) []string {
 		)
 	}
 	return args
+}
+
+func etcdHealthyOnce(executor *host.Executor, endpoint, certDir string, tlsDisabled bool, timeout string) bool {
+	args := etcdctlArgsWithTimeout(endpoint, certDir, tlsDisabled, timeout)
+	args = append(args, "endpoint", "health")
+	_, err := executor.RunCapture("/usr/local/bin/etcdctl", args...)
+	return err == nil
 }
 
 // runEtcdctl runs etcdctl with retry logic (3 attempts, 3s delay),

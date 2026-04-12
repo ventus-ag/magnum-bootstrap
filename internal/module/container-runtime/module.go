@@ -115,15 +115,27 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	if tarballURL != "" {
-		localPath := "/srv/magnum/containerd.tar.gz"
-		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
-		if err != nil {
-			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
-		}
-		if dl.Change != nil {
-			changes = append(changes, *dl.Change)
-		}
-		if dl.Changed && executor.Apply {
+		if containerdVersionMatches(executor, cfg.Shared.ContainerdVersion) {
+			// Already on the requested containerd version; avoid re-fetching the
+			// tarball on every reconcile.
+		} else if !executor.Apply {
+			changes = append(changes, host.Change{
+				Action:  host.ActionReplace,
+				Path:    "/srv/magnum/containerd.tar.gz",
+				Summary: fmt.Sprintf("download containerd tarball from %s", tarballURL),
+			})
+		} else {
+			localPath := "/srv/magnum/containerd.tar.gz"
+			dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
+			if err != nil {
+				return nil, false, fmt.Errorf("download containerd tarball: %w", err)
+			}
+			if dl.Change != nil {
+				changes = append(changes, *dl.Change)
+			}
+			// We only reach this branch when the installed containerd version is
+			// not the requested version. Extract the cached or freshly downloaded
+			// tarball so interrupted installs can recover without another fetch.
 			if useV2Layout {
 				// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
 				if err := executor.Run("tar", "xzf", localPath,
@@ -224,6 +236,17 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	return changes, configChanged, nil
+}
+
+func containerdVersionMatches(executor *host.Executor, desiredVersion string) bool {
+	if desiredVersion == "" {
+		return false
+	}
+	out, err := executor.RunCapture("containerd", "--version")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, desiredVersion)
 }
 
 func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, error) {

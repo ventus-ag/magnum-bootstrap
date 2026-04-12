@@ -23,7 +23,7 @@ type Resource struct {
 
 func (Module) PhaseID() string { return "kube-master-config" }
 func (Module) Dependencies() []string {
-	return []string{"master-certificates", "cert-api-manager", "etcd", "kube-os-config", "client-tools", "container-runtime", "stop-services"}
+	return []string{"master-certificates", "cert-api-manager", "kube-os-config", "client-tools", "container-runtime", "stop-services"}
 }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -109,17 +109,11 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 				cniTag, cniTag)
 			cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", cniTag)
 
-			dl, err := executor.DownloadFileWithRetry(context.Background(), cniURL, cniTgz, 0o644, 5)
+			cs, err := reconcileCNIPlugins(executor, cniURL, cniTgz)
 			if err != nil {
-				return nil, fmt.Errorf("download CNI plugins: %w", err)
+				return nil, err
 			}
-			if dl.Change != nil {
-				changes = append(changes, *dl.Change)
-			}
-			if dl.Changed {
-				_ = executor.Run("tar", "-C", "/opt/cni/bin", "-xzf", cniTgz)
-				_ = executor.Run("chmod", "+x", "/opt/cni/bin/.")
-			}
+			changes = append(changes, cs...)
 		}
 
 		// Kernel modules for flannel.
@@ -159,6 +153,56 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 	}
 
 	return changes, nil
+}
+
+func reconcileCNIPlugins(executor *host.Executor, cniURL, cniTgz string) ([]host.Change, error) {
+	if cniPluginsInstalled(cniTgz) {
+		return nil, nil
+	}
+	if !executor.Apply {
+		return []host.Change{{
+			Action:  host.ActionCreate,
+			Path:    cniTgz,
+			Summary: fmt.Sprintf("download CNI plugins from %s", cniURL),
+		}}, nil
+	}
+
+	var changes []host.Change
+	if _, err := os.Stat(cniTgz); os.IsNotExist(err) {
+		dl, err := executor.DownloadFileWithRetry(context.Background(), cniURL, cniTgz, 0o644, 5)
+		if err != nil {
+			return nil, fmt.Errorf("download CNI plugins: %w", err)
+		}
+		if dl.Change != nil {
+			changes = append(changes, *dl.Change)
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	if err := executor.Run("tar", "-C", "/opt/cni/bin", "-xzf", cniTgz); err != nil {
+		return nil, fmt.Errorf("extract CNI plugins: %w", err)
+	}
+	if err := executor.Run("chmod", "+x", "/opt/cni/bin/."); err != nil {
+		return nil, fmt.Errorf("chmod CNI plugins: %w", err)
+	}
+	changes = append(changes, host.Change{Action: host.ActionUpdate, Path: "/opt/cni/bin", Summary: "extract CNI plugins"})
+	return changes, nil
+}
+
+func cniPluginsInstalled(cniTgz string) bool {
+	for _, path := range []string{
+		cniTgz,
+		"/opt/cni/bin/bridge",
+		"/opt/cni/bin/host-local",
+		"/opt/cni/bin/loopback",
+		"/opt/cni/bin/portmap",
+	} {
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func setupSysctl(executor *host.Executor) ([]host.Change, error) {
