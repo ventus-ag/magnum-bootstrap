@@ -135,7 +135,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 					"volumeMounts": []interface{}{
 						map[string]interface{}{
 							"name":      "cacert",
-							"mountPath": "/etc/cacert/ca-bundle.crt",
+							"mountPath": "/etc/kubernetes/certs/ca-bundle.crt",
+							"readOnly":  true,
+						},
+						map[string]interface{}{
+							"name":      "cloud-config",
+							"mountPath": "/etc/kubernetes/config/",
 							"readOnly":  true,
 						},
 					},
@@ -174,6 +179,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				"enabled":   true,
 				"create":    true,
 				"hostMount": false,
+				"filename":  "config/cloud.conf",
 				"name":      "cinder-csi-cloud-config",
 				"data": map[string]interface{}{
 					"cloud.conf": "[Global]\nauth-url=" + cfg.Shared.AuthURL +
@@ -181,7 +187,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 						"\npassword=" + cfg.Shared.TrusteePassword +
 						"\ntrust-id=" + cfg.Shared.TrustID +
 						"\nregion=" + cfg.Shared.RegionName +
-						"\nca-file=/etc/cacert/ca-bundle.crt",
+						"\nca-file=/etc/kubernetes/certs/ca-bundle.crt",
 				},
 			},
 			"storageClass": map[string]interface{}{
