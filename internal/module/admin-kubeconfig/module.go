@@ -53,7 +53,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		content string
 		mode    os.FileMode
 	}{
-		{path: "/etc/kubernetes/admin.conf", content: content, mode: 0o600},
+		{path: "/etc/kubernetes/admin.conf", content: content, mode: 0o644},
 		{path: "/root/.kube/config", content: content, mode: 0o600},
 	} {
 		change, err := executor.EnsureFile(file.path, []byte(file.content), file.mode)
