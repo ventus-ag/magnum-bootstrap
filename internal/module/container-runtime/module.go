@@ -337,6 +337,11 @@ func containerdV3Config(pause string) string {
     enable_unprivileged_ports = true
     enable_unprivileged_icmp = true
 
+  [plugins."io.containerd.cri.v1.runtime".runtimes.runc]
+    runtime_type = "io.containerd.runc.v2"
+    [plugins."io.containerd.cri.v1.runtime".runtimes.runc.options]
+      SystemdCgroup = true
+
   [plugins."io.containerd.cri.v1.cni"]
     bin_dir = "/opt/cni/bin"
     conf_dir = "/etc/cni/net.d"
@@ -381,6 +386,10 @@ oom_score = 0
     [plugins."io.containerd.grpc.v1.cri".containerd]
       default_runtime_name = "runc"
       snapshotter = "overlayfs"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+        runtime_type = "io.containerd.runc.v2"
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+          SystemdCgroup = true
     [plugins."io.containerd.grpc.v1.cri".registry]
       [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
         [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
