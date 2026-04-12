@@ -247,9 +247,32 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 				if req.Logger != nil {
 					req.Logger.Warnf("helm patch failure for %v, retrying with force update", names)
 				}
+
+				// Clean up Helm releases left in "failed" state by the
+				// first attempt so the retry can start fresh.
+				executor := host.NewExecutor(true, req.Logger)
+				for _, rel := range helmFailures {
+					clusterhelm.CleanupFailedRelease(executor, rel.Name, rel.Namespace)
+				}
+
+				// Rebuild up options without EventStreams — the Pulumi SDK
+				// closes the event channel after stack.Up() returns, so
+				// reusing it would panic on the retry.
+				retryOpts := []optup.Option{
+					optup.Parallel(parallelism),
+					optup.ProgressStreams(progressWriters...),
+					optup.ErrorProgressStreams(errorProgressWriters...),
+				}
+				if diff {
+					retryOpts = append(retryOpts, optup.Diff())
+				}
+				if pulumiDebugOpts != nil {
+					retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
+				}
+
 				start = time.Now()
 				stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, "up (force retry)", cfg.StackName(), start)
-				upRes, err = stack.Up(ctx, upOpts...)
+				upRes, err = stack.Up(ctx, retryOpts...)
 				stopHeartbeat()
 			}
 			if err != nil {
