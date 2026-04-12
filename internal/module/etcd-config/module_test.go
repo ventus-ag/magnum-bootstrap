@@ -26,7 +26,7 @@ func TestRunSkipsActiveCARotation(t *testing.T) {
 	if len(res.Changes) != 0 {
 		t.Fatalf("expected no changes during active CA rotation, got %d", len(res.Changes))
 	}
-	if got := res.Outputs["etcdTag"]; got != "3.5.6-0" {
+	if got := res.Outputs["etcdTag"]; got != "3.6.10-0" {
 		t.Fatalf("expected etcd tag output, got %q", got)
 	}
 }
