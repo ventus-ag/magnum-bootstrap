@@ -489,6 +489,16 @@ func buildKubeletArgs(cfg config.Config) string {
 	if cfg.Shared.ContainerRuntime == "containerd" {
 		args = append(args, "--runtime-cgroups=/system.slice/containerd.service")
 	}
+	// containerRuntimeEndpoint was added to KubeletConfiguration in K8s 1.27.
+	// For older versions the config field is silently ignored, so pass it as
+	// a CLI flag to tell kubelet where the CRI socket is.
+	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 27) {
+		endpoint := "unix:///run/containerd/containerd.sock"
+		if cfg.Shared.ContainerRuntime == "docker" {
+			endpoint = "unix:///var/run/cri-dockerd.sock"
+		}
+		args = append(args, "--container-runtime-endpoint="+endpoint)
+	}
 	if cfg.Shared.KubeletOptions != "" {
 		args = append(args, cfg.Shared.KubeletOptions)
 	}
