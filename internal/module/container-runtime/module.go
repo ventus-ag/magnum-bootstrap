@@ -13,6 +13,14 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+// containerdVersions maps Kubernetes minor version to the containerd version.
+// K8s >= 1.28 uses containerd 2.x (shim protocol v3).
+// K8s < 1.28 uses containerd 1.7.x (shim protocol v2).
+var containerdVersions = map[string]string{
+	"1.28": "2.2.2",
+	"1.27": "1.7.30",
+}
+
 type Module struct{}
 
 type Resource struct {
@@ -79,6 +87,15 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		changes = append(changes, host.Change{Action: host.ActionOther, Summary: "disable docker in favour of containerd"})
 	}
 
+	// Select containerd version by Kubernetes version.
+	// K8s >= 1.28 uses containerd 2.x (shim protocol v3).
+	// K8s < 1.28 uses containerd 1.7.x (shim protocol v2).
+	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
+	useV2Layout := false
+	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
+		useV2Layout = true
+	}
+
 	// Determine tarball URL and install layout.
 	//
 	// containerd 1.x published "cri-containerd-cni-VERSION-linux-amd64.tar.gz"
@@ -90,76 +107,63 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	// binaries under "bin/" and must be extracted to "/usr/local". CNI plugins
 	// and runc are installed separately (CNI is handled by the network driver
 	// module).
-	tarballURL := cfg.Shared.ContainerdTarballURL
-	useV2Layout := false
-
-	// Detect containerd major version from CONTAINERD_VERSION if available.
-	if cfg.Shared.ContainerdVersion != "" {
-		if major, _, ok := parseContainerdMajor(cfg.Shared.ContainerdVersion); ok && major >= 2 {
-			useV2Layout = true
-		}
+	var tarballURL string
+	if useV2Layout {
+		tarballURL = fmt.Sprintf(
+			"https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz",
+			containerdVersion, containerdVersion,
+		)
+	} else {
+		tarballURL = fmt.Sprintf(
+			"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
+			containerdVersion, containerdVersion,
+		)
 	}
 
-	if tarballURL == "" && cfg.Shared.ContainerdVersion != "" {
+	if containerdVersionMatches(executor, containerdVersion) {
+		// Already on the requested containerd version; avoid re-fetching the
+		// tarball on every reconcile.
+	} else if !executor.Apply {
+		changes = append(changes, host.Change{
+			Action:  host.ActionReplace,
+			Path:    "/srv/magnum/containerd.tar.gz",
+			Summary: fmt.Sprintf("download containerd tarball from %s", tarballURL),
+		})
+	} else {
+		localPath := "/srv/magnum/containerd.tar.gz"
+		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
+		if err != nil {
+			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
+		}
+		if dl.Change != nil {
+			changes = append(changes, *dl.Change)
+		}
+		// We only reach this branch when the installed containerd version is
+		// not the requested version. Extract the cached or freshly downloaded
+		// tarball so interrupted installs can recover without another fetch.
 		if useV2Layout {
-			tarballURL = fmt.Sprintf(
-				"https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz",
-				cfg.Shared.ContainerdVersion, cfg.Shared.ContainerdVersion,
-			)
+			// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
+			if err := executor.Run("tar", "xzf", localPath,
+				"-C", "/usr/local",
+				"--no-same-owner", "--touch", "--no-same-permissions",
+			); err != nil {
+				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
+			}
 		} else {
-			tarballURL = fmt.Sprintf(
-				"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
-				cfg.Shared.ContainerdVersion, cfg.Shared.ContainerdVersion,
-			)
+			// containerd 1.x cri-containerd-cni bundle: extract to /.
+			if err := executor.Run("tar", "xzf", localPath,
+				"-C", "/",
+				"--no-same-owner", "--touch", "--no-same-permissions",
+				"--exclude=etc/cni/net.d",
+				"--exclude=etc/containerd/config.toml",
+				"--exclude=opt/cni/bin",
+				"--exclude=*.txt",
+				"--exclude=opt/containerd/cluster/gce",
+			); err != nil {
+				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
+			}
 		}
-	}
-
-	if tarballURL != "" {
-		if containerdVersionMatches(executor, cfg.Shared.ContainerdVersion) {
-			// Already on the requested containerd version; avoid re-fetching the
-			// tarball on every reconcile.
-		} else if !executor.Apply {
-			changes = append(changes, host.Change{
-				Action:  host.ActionReplace,
-				Path:    "/srv/magnum/containerd.tar.gz",
-				Summary: fmt.Sprintf("download containerd tarball from %s", tarballURL),
-			})
-		} else {
-			localPath := "/srv/magnum/containerd.tar.gz"
-			dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
-			if err != nil {
-				return nil, false, fmt.Errorf("download containerd tarball: %w", err)
-			}
-			if dl.Change != nil {
-				changes = append(changes, *dl.Change)
-			}
-			// We only reach this branch when the installed containerd version is
-			// not the requested version. Extract the cached or freshly downloaded
-			// tarball so interrupted installs can recover without another fetch.
-			if useV2Layout {
-				// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
-				if err := executor.Run("tar", "xzf", localPath,
-					"-C", "/usr/local",
-					"--no-same-owner", "--touch", "--no-same-permissions",
-				); err != nil {
-					return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
-				}
-			} else {
-				// containerd 1.x cri-containerd-cni bundle: extract to /.
-				if err := executor.Run("tar", "xzf", localPath,
-					"-C", "/",
-					"--no-same-owner", "--touch", "--no-same-permissions",
-					"--exclude=etc/cni/net.d",
-					"--exclude=etc/containerd/config.toml",
-					"--exclude=opt/cni/bin",
-					"--exclude=*.txt",
-					"--exclude=opt/containerd/cluster/gce",
-				); err != nil {
-					return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
-				}
-			}
-			tarballExtracted = true
-		}
+		tarballExtracted = true
 	}
 
 	// Ensure directories.
@@ -432,7 +436,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"containerRuntime":  pulumi.String(cfg.Shared.ContainerRuntime),
-		"containerdVersion": pulumi.String(cfg.Shared.ContainerdVersion),
+		"containerdVersion": pulumi.String(config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)),
 		"cgroupDriver":      pulumi.String(cfg.Shared.CgroupDriver),
 	}); err != nil {
 		return nil, err

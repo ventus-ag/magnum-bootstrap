@@ -55,9 +55,7 @@ func Load(path string) (Config, error) {
 			HTTPSProxy:                raw["HTTPS_PROXY"],
 			NoProxy:                   raw["NO_PROXY"],
 
-			ContainerdVersion:    raw["CONTAINERD_VERSION"],
-			ContainerdTarballURL: raw["CONTAINERD_TARBALL_URL"],
-			CgroupDriver:         raw["CGROUP_DRIVER"],
+			CgroupDriver: raw["CGROUP_DRIVER"],
 			UsePodman:            parseBool(raw["USE_PODMAN"]),
 			ContainerInfraPrefix: raw["CONTAINER_INFRA_PREFIX"],
 

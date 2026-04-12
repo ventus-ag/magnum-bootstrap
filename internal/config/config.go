@@ -76,9 +76,7 @@ type SharedConfig struct {
 	NoProxy                   string `json:"noProxy"`
 
 	// Container runtime
-	ContainerdVersion    string `json:"containerdVersion"`
-	ContainerdTarballURL string `json:"containerdTarballUrl"`
-	CgroupDriver         string `json:"cgroupDriver"`
+	CgroupDriver string `json:"cgroupDriver"`
 	UsePodman            bool   `json:"usePodman"`
 	ContainerInfraPrefix string `json:"containerInfraPrefix"`
 
