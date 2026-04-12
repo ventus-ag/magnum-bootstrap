@@ -2,6 +2,8 @@ package clustercindercsi
 
 import (
 	"context"
+	"strconv"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -51,6 +53,20 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	return moduleapi.Result{}, nil
 }
 
+// cinderChartNewStyle returns true for chart versions >= 2.33.0 which use
+// /etc/config/ as the cloud-config base path instead of /etc/kubernetes/.
+func cinderChartNewStyle(chartVersion string) bool {
+	parts := strings.SplitN(chartVersion, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return minor >= 33
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
@@ -79,6 +95,19 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 
 	chartVersion := config.LookupByKubeVersion(cinderCSIChartVersions, cfg.Shared.KubeVersion)
+
+	// Chart versions >= 2.33 changed the cloud-config base path from
+	// /etc/kubernetes/ to /etc/config/. The CLOUD_CONFIG env var is
+	// hardcoded in the chart template as <basePath>/<filename>.
+	// Use filename "cloud.conf" (no path component) and set the
+	// cloud-config volumeMount to match the chart's expected base path.
+	newStyle := cinderChartNewStyle(chartVersion)
+	cloudConfigMount := "/etc/kubernetes"
+	if newStyle {
+		cloudConfigMount = "/etc/config"
+	}
+	// CA cert is mounted at a path that doesn't overlap with either base.
+	cacertMount := "/etc/cacert/ca-bundle.crt"
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "cinder-csi",
@@ -135,12 +164,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 					"volumeMounts": []interface{}{
 						map[string]interface{}{
 							"name":      "cacert",
-							"mountPath": "/etc/kubernetes/certs/ca-bundle.crt",
+							"mountPath": cacertMount,
 							"readOnly":  true,
 						},
 						map[string]interface{}{
 							"name":      "cloud-config",
-							"mountPath": "/etc/kubernetes/config/",
+							"mountPath": cloudConfigMount,
 							"readOnly":  true,
 						},
 					},
@@ -179,7 +208,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				"enabled":   true,
 				"create":    true,
 				"hostMount": false,
-				"filename":  "config/cloud.conf",
+				"filename":  "cloud.conf",
 				"name":      "cinder-csi-cloud-config",
 				"data": map[string]interface{}{
 					"cloud.conf": "[Global]\nauth-url=" + cfg.Shared.AuthURL +
@@ -187,7 +216,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 						"\npassword=" + cfg.Shared.TrusteePassword +
 						"\ntrust-id=" + cfg.Shared.TrustID +
 						"\nregion=" + cfg.Shared.RegionName +
-						"\nca-file=/etc/kubernetes/certs/ca-bundle.crt",
+						"\nca-file=" + cacertMount,
 				},
 			},
 			"storageClass": map[string]interface{}{

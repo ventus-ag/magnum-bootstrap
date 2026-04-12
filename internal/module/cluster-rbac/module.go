@@ -50,14 +50,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	// enforcement. K8s 1.25+ enables PSA by default — without this,
 	// infrastructure DaemonSets (CSI, OCCM) that need privileged containers
 	// are rejected. Applied imperatively here to guarantee it runs before
-	// any Helm releases in Register().
+	// any Helm releases in Register(). Also set via Pulumi in Register()
+	// as a reliable backup.
 	executor := host.NewExecutor(req.Apply, req.Logger)
-	_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+	if err := executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
 		"label", "namespace", "kube-system",
 		"pod-security.kubernetes.io/enforce=privileged",
 		"pod-security.kubernetes.io/audit=privileged",
 		"pod-security.kubernetes.io/warn=privileged",
-		"--overwrite")
+		"--overwrite"); err != nil {
+		if req.Logger != nil {
+			req.Logger.Warnf("cluster-rbac: failed to label kube-system with PSA labels: %v", err)
+		}
+	}
 
 	return moduleapi.Result{
 		Outputs: map[string]string{"firstMaster": "true"},
@@ -76,8 +81,30 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	childOpts := append(opts, pulumi.Parent(res))
 
+	// Patch kube-system namespace with PSA "privileged" labels.
+	// This is the authoritative source — the kubectl in Run() is a
+	// best-effort early attempt but can fail on fresh clusters.
+	// All downstream Helm releases depend on cluster-rbac, so these
+	// labels are guaranteed to be set before any addon DaemonSets.
+	_, err := corev1.NewNamespacePatch(ctx, name+"-kube-system-psa", &corev1.NamespacePatchArgs{
+		Metadata: &metav1.ObjectMetaPatchArgs{
+			Name: pulumi.String("kube-system"),
+			Labels: pulumi.StringMap{
+				"pod-security.kubernetes.io/enforce": pulumi.String("privileged"),
+				"pod-security.kubernetes.io/audit":   pulumi.String("privileged"),
+				"pod-security.kubernetes.io/warn":    pulumi.String("privileged"),
+			},
+			Annotations: pulumi.StringMap{
+				"pulumi.com/patchForce": pulumi.String("true"),
+			},
+		},
+	}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
 	// ClusterRole: system:kube-apiserver-to-kubelet
-	_, err := rbacv1.NewClusterRole(ctx, name+"-apiserver-kubelet", &rbacv1.ClusterRoleArgs{
+	_, err = rbacv1.NewClusterRole(ctx, name+"-apiserver-kubelet", &rbacv1.ClusterRoleArgs{
 		Metadata: mergeMetadata("system:kube-apiserver-to-kubelet", ""),
 		Rules: rbacv1.PolicyRuleArray{
 			&rbacv1.PolicyRuleArgs{
