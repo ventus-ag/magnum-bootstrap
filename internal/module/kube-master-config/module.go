@@ -559,10 +559,15 @@ func buildAPIServerArgs(cfg config.Config) string {
 		"--runtime-config=api/all=true",
 		"--kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP",
 	}
-	// --allow-privileged was removed in K8s 1.27; only pass it for older versions.
-	if !kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 27) {
-		args = append(args, fmt.Sprintf("--allow-privileged=%s", cfg.Shared.KubeAllowPriv))
+	// --allow-privileged was documented as "removed" in K8s 1.27, but the
+	// default changed in K8s 1.34+ to disallow privileged containers.
+	// Always pass it explicitly to ensure infrastructure DaemonSets
+	// (cinder-csi, etc.) that need privileged: true are accepted.
+	allowPriv := cfg.Shared.KubeAllowPriv
+	if allowPriv == "" {
+		allowPriv = "true"
 	}
+	args = append(args, "--allow-privileged="+allowPriv)
 	args = append(args,
 		fmt.Sprintf("--authorization-mode=%s", authzMode),
 		fmt.Sprintf("--tls-cert-file=%s/server.crt", certDir),
