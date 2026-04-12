@@ -22,8 +22,10 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string        { return "storage" }
-func (Module) Dependencies() []string { return []string{"container-runtime"} }
+func (Module) PhaseID() string { return "storage" }
+func (Module) Dependencies() []string {
+	return []string{"container-runtime", "stop-services"}
+}
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Shared.DockerVolumeSize <= 0 {

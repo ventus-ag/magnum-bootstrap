@@ -23,7 +23,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string        { return "worker-certificates" }
-func (Module) Dependencies() []string { return []string{"prereq-validation"} }
+func (Module) Dependencies() []string { return []string{"ca-rotation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Shared.TLSDisabled {

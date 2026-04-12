@@ -37,7 +37,7 @@ type installState struct {
 func (Module) PhaseID() string {
 	return "client-tools"
 }
-func (Module) Dependencies() []string { return []string{"prereq-validation"} }
+func (Module) Dependencies() []string { return []string{"ca-rotation"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)

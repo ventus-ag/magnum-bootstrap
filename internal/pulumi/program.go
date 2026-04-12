@@ -130,13 +130,14 @@ func BuildMetadata(cfg config.Config, reconcilePlan plan.Plan, command string, d
 //  3. Registers a HeatParamsComponent as its child — the relevant config
 //     fields are stored as Pulumi outputs so the state JSON records what drove
 //     each run and Pulumi can diff those values between runs.
-//  4. For each phase: calls mod.Run() (imperative), accumulates results in acc,
-//     then calls mod.Register() with heat as parent so every module component
-//     is a Pulumi child of HeatParams in the resource tree.
+//  4. Runs phase Run() methods through a dependency-aware worker scheduler,
+//     accumulates results in acc, then calls mod.Register() on the main
+//     goroutine as phases complete so every module component is a Pulumi child
+//     of HeatParams in the resource tree.
 //
 // The apply flag on req is overridden by ctx.DryRun(): preview runs set
 // Apply=false, up runs set Apply=true.
-func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan plan.Plan, metadata ProgramMetadata, req moduleapi.Request, acc *RunAccumulator) gopulumi.RunFunc {
+func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan plan.Plan, metadata ProgramMetadata, req moduleapi.Request, acc *RunAccumulator, phaseParallelism int) gopulumi.RunFunc {
 	return func(ctx *gopulumi.Context) error {
 		// Load heat-params dynamically inside the Pulumi execution so the
 		// program is self-contained and always reads the latest file contents.
@@ -175,66 +176,68 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 		registry := module.BuildRegistry(cfg)
 		executed := make(gopulumi.StringArray, 0, len(reconcilePlan.Phases))
 		missing := make(gopulumi.StringArray, 0)
+		for _, phase := range reconcilePlan.Phases {
+			if _, ok := registry[phase.ID]; !ok {
+				missing = append(missing, gopulumi.String(phase.ID))
+			}
+		}
 
 		// DAG-based dependency resolution: each module declares its
-		// dependencies via Dependencies(). Modules whose dependencies are
-		// all satisfied can run in parallel via Pulumi's engine.
+		// dependencies via Dependencies(). Run() executes host-side work in
+		// parallel for ready phases; Register() stays single-threaded because
+		// Pulumi Context resource registration is not treated as goroutine-safe.
 		phaseResources := make(map[string]gopulumi.Resource)
-
-		for _, phase := range reconcilePlan.Phases {
-			mod, ok := registry[phase.ID]
-			if !ok {
-				missing = append(missing, gopulumi.String(phase.ID))
-				continue
-			}
-
-			if actualReq.Logger != nil {
-				actualReq.Logger.Infof("running phase=%s apply=%t", phase.ID, actualReq.Apply)
-			}
-
-			// Build Pulumi DependsOn from the module's declared dependencies.
-			// This is computed before Run() so that Register() can be called
-			// even when Run() fails — keeping the DAG intact for later phases.
-			regOpts := []gopulumi.ResourceOption{gopulumi.Parent(heat)}
-			var deps []gopulumi.Resource
-			for _, depID := range mod.Dependencies() {
-				if depRes, ok := phaseResources[depID]; ok && depRes != nil {
-					deps = append(deps, depRes)
-				}
-			}
-			if len(deps) > 0 {
-				regOpts = append(regOpts, gopulumi.DependsOn(deps))
-			}
-
-			// Imperative execution: Run() does the actual host operations.
-			phaseResult, runErr := mod.Run(goCtx, cfg, actualReq)
-			if runErr != nil {
-				acc.RecordFailure(phase.ID, runErr)
-
-				// Still register the component so phaseResources[phase.ID]
-				// is populated and downstream phases retain their dependency
-				// edges in the Pulumi DAG.
-				if phaseRes, regErr := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...); regErr != nil {
-					if actualReq.Logger != nil {
-						actualReq.Logger.Warnf("phase=%s Register() also failed after Run() error: %v", phase.ID, regErr)
+		executedPhases := make(map[string]bool, len(reconcilePlan.Phases))
+		_, runErr := runPhaseDAG(goCtx, reconcilePlan.Phases, registry, cfg, actualReq, phaseParallelism,
+			func(phase plan.Phase, mod module.Module, phaseRun phaseRunResult) error {
+				// Build Pulumi DependsOn from the module's declared dependencies.
+				regOpts := []gopulumi.ResourceOption{gopulumi.Parent(heat)}
+				var deps []gopulumi.Resource
+				for _, depID := range mod.Dependencies() {
+					if depRes, ok := phaseResources[depID]; ok && depRes != nil {
+						deps = append(deps, depRes)
 					}
-				} else {
-					phaseResources[phase.ID] = phaseRes
+				}
+				if len(deps) > 0 {
+					regOpts = append(regOpts, gopulumi.DependsOn(deps))
 				}
 
-				if !actualReq.AllowPartial {
-					return runErr
-				}
-				continue
-			}
-			acc.RecordPhase(phase.ID, phaseResult)
+				if phaseRun.err != nil {
+					acc.RecordFailure(phase.ID, phaseRun.err)
 
-			phaseRes, err := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...)
-			if err != nil {
-				return err
+					// Still register the component so phaseResources[phase.ID]
+					// is populated and downstream phases retain their dependency
+					// edges in the Pulumi DAG.
+					if phaseRes, regErr := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...); regErr != nil {
+						if actualReq.Logger != nil {
+							actualReq.Logger.Warnf("phase=%s Register() also failed after Run() error: %v", phase.ID, regErr)
+						}
+					} else {
+						phaseResources[phase.ID] = phaseRes
+					}
+
+					if !actualReq.AllowPartial {
+						return phaseRun.err
+					}
+					return nil
+				}
+
+				acc.RecordPhase(phase.ID, phaseRun.result)
+				phaseRes, err := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...)
+				if err != nil {
+					return err
+				}
+				phaseResources[phase.ID] = phaseRes
+				executedPhases[phase.ID] = true
+				return nil
+			})
+		if runErr != nil {
+			return runErr
+		}
+		for _, phase := range reconcilePlan.Phases {
+			if executedPhases[phase.ID] {
+				executed = append(executed, gopulumi.String(phase.ID))
 			}
-			phaseResources[phase.ID] = phaseRes
-			executed = append(executed, gopulumi.String(phase.ID))
 		}
 
 		return ctx.RegisterResourceOutputs(root, gopulumi.Map{

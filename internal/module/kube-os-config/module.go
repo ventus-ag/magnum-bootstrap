@@ -27,7 +27,7 @@ type Resource struct {
 func (Module) PhaseID() string {
 	return "kube-os-config"
 }
-func (Module) Dependencies() []string { return nil }
+func (Module) Dependencies() []string { return []string{"ca-rotation"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)

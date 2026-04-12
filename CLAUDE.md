@@ -25,8 +25,9 @@ make fmt      # Format code with gofmt
 ```bash
 bootstrap preview      # Dry-run: show planned changes
 bootstrap up           # Apply changes
-bootstrap run-once     # Alias for up (Heat-triggered invocations)
-bootstrap run-periodic # Alias for up (timer-triggered)
+bootstrap run-once     # Heat-triggered up invocation, refresh default false
+bootstrap run-periodic # Timer-triggered up invocation, refresh default true
+bootstrap destroy      # Destroy Pulumi-managed resources + module cleanup
 bootstrap cancel       # Cancel the current Pulumi update for the local node stack
 bootstrap validate-input   # Parse heat-params, print role/operation
 bootstrap print-last-result # Print last result JSON
@@ -37,9 +38,9 @@ bootstrap print-last-result # Print last result JSON
 ```
 --diff                 Show diff-oriented output
 --allow-partial        Skip unimplemented modules and continue
---refresh              Pulumi refresh before run (default: true, detects drift)
+--refresh              Pulumi refresh before run (default: true except run-once)
 --target-phase STRING  Execute only specified phase
---parallelism INT      Pulumi resource operation parallelism (default: 50)
+--parallelism INT      Maximum phase/resource operations to run in parallel (default: 10)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
@@ -49,7 +50,7 @@ bootstrap print-last-result # Print last result JSON
 
 ### Reconciliation Flow
 
-1. Parse `heat-params` → typed `config.Config` (~80 typed fields)
+1. Parse `heat-params` → typed `config.Config` (100+ typed fields)
 2. Load previous state → set `AppliedCARotationID` so completed rotations
    don't re-trigger on periodic runs
 3. Detect role (master/worker) and operation (create/upgrade/resize/ca-rotate)
@@ -87,16 +88,17 @@ Every module follows the desired-state pattern:
 - **Self-bootstrapping CLI**: `auto.InstallPulumiCommand()` on first run
 - **Local file backend**: `file:///var/lib/magnum/pulumi` (no cloud, no secrets)
 - **Stack naming**: `node-{sanitized-instance-name}`
-- **DAG dependencies**: Each module declares `Dependencies()` → Pulumi `DependsOn`
-  edges. Failed modules still call `Register()` to keep the DAG intact for
-  downstream phases.
+- **DAG dependencies**: Each module declares `Dependencies()`. The program
+  builder runs ready module `Run()` phases concurrently up to `--parallelism`
+  and wires the same dependencies into Pulumi `DependsOn` edges. Failed modules
+  still call `Register()` to keep the DAG intact for downstream phases.
 - **Stale lock recovery**: `runWithAutoCancel()` detects
   `IsConcurrentUpdateError`, extracts PID, verifies liveness, auto-cancels stale
   locks
 - **Kubernetes provider**: Used by cluster-addon modules for RBAC, Secrets, Helm
 - **patchForce**: Cluster-addon K8s resources use `pulumi.com/patchForce` annotation
   to adopt pre-existing resources created by legacy kubectl scripts
-- **Event buffer**: 1000-capacity channel prevents Pulumi blocking on slow consumers
+- **Event buffer**: 5000-capacity channel prevents Pulumi blocking on slow consumers
 - **Heartbeat**: 30s ticker logs "still running..." for long operations
 
 ### Module System
@@ -106,6 +108,7 @@ Each module implements `moduleapi.Module`:
 ```go
 type Module interface {
     PhaseID() string
+    Dependencies() []string
     Run(ctx context.Context, cfg config.Config, req Request) (Result, error)
     Register(ctx *pulumi.Context, name string, heat *HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error)
 }
@@ -143,7 +146,7 @@ internal/
   magnum/client.go          Keystone auth, Magnum CA fetch, CSR signing (Go crypto)
   module/
     module.go               Type alias for moduleapi.Module
-    registry.go             Module registry (28 modules)
+    registry.go             Module registry (31 modules)
     prereq-validation/      Input validation checks
     container-runtime/      Docker/containerd install, config, drift detection
     client-tools/           kubectl/kubelet binary download & install
@@ -171,15 +174,19 @@ internal/
     cluster-cinder-csi/     Cinder CSI driver via Helm
     cluster-manila-csi/     Manila CSI + NFS driver via Helm
     cluster-metrics-server/ Metrics Server via Helm
+    cluster-dashboard/      Kubernetes Dashboard via Helm
     cluster-auto-healer/    Node Problem Detector via Helm
     cluster-autoscaler/     Cluster Autoscaler via Helm (Magnum provider)
+    cluster-health/         Cluster addon health checks
+    zincati/                Fedora CoreOS auto-update settings
   moduleapi/moduleapi.go    Module interface, HeatParams, Request, RestartTracker
   paths/paths.go            Runtime paths from environment variables
   plan/
     plan.go                 Plan type, phase filtering
-    catalog.go              Phase sequences for each role + operation
+    catalog.go              Unified phase sequences for each role
   provider/heatparams/      Heat-params Pulumi provider (unused currently)
-  pulumi/program.go         Pulumi program builder, RunAccumulator, dependency chain
+  pulumi/program.go         Pulumi program builder, RunAccumulator
+  pulumi/phase_runner.go    Dependency-aware parallel phase scheduler
   reconcile/reconciler.go   Main reconcile orchestration, parallelism
   result/result.go          Result JSON, Heat signal text rendering
   state/state.go            Reconciler state persistence
@@ -191,7 +198,7 @@ All operations (create, upgrade, resize, ca-rotate, periodic) use the **same
 unified phase list** per role.  Each module internally decides whether to act
 based on current vs desired state.
 
-### Master (25 phases)
+### Master (28 phases)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|
@@ -207,13 +214,24 @@ based on current vs desired state.
 | 10 | stop-services | yes | Only drain/uncordon during upgrade/resize |
 | 11 | kube-master-config | yes | Signals restart for kube services |
 | 12 | storage | yes | Skips if already mounted; mounts specific device |
-| 13 | services | yes | RestartTracker-driven |
-| 14 | start-services | yes | Only drain/uncordon during upgrade/resize |
-| 15 | proxy-env | no | |
+| 13 | proxy-env | no | Runtime proxy drop-ins before service convergence |
+| 14 | services | yes | RestartTracker-driven |
+| 15 | start-services | yes | Only drain/uncordon during upgrade/resize |
 | 16 | health | no | |
-| 17-25 | cluster-* addons | no | Master-0 only, skip on other masters |
+| 17 | cluster-rbac | no | Master-0 only, skip on other masters |
+| 18 | cluster-flannel | no | Master-0 only, skip on other masters |
+| 19 | cluster-coredns | no | Master-0 only, skip on other masters |
+| 20 | cluster-occm | no | Master-0 only, skip on other masters |
+| 21 | cluster-cinder-csi | no | Master-0 only, skip on other masters |
+| 22 | cluster-manila-csi | no | Master-0 only, skip on other masters |
+| 23 | cluster-metrics-server | no | Master-0 only, skip on other masters |
+| 24 | cluster-dashboard | no | Master-0 only, skip on other masters |
+| 25 | cluster-auto-healer | no | Master-0 only, skip on other masters |
+| 26 | cluster-autoscaler | no | Master-0 only, skip on other masters |
+| 27 | cluster-health | no | Master-0 only, skip on other masters |
+| 28 | zincati | no | Fedora CoreOS OS auto-upgrade settings |
 
-### Worker (15 phases)
+### Worker (16 phases)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|
@@ -227,23 +245,24 @@ based on current vs desired state.
 | 8 | admin-kubeconfig | no | |
 | 9 | stop-services | yes | Only drain/uncordon during upgrade/resize |
 | 10 | kube-worker-config | yes | |
-| 11 | proxy-env | no | |
-| 12 | storage | yes | |
+| 11 | storage | yes | |
+| 12 | proxy-env | no | Runtime proxy drop-ins before service convergence |
 | 13 | services | yes | |
 | 14 | start-services | yes | |
 | 15 | health | no | |
+| 16 | zincati | no | Fedora CoreOS OS auto-upgrade settings |
 
 ## Key Design Decisions
 
 ### Idempotency
 - All file writes use `EnsureFile` (content-compare, atomic write)
 - Services only restart when config actually changed (RestartTracker)
-- Certs skipped if already exist (`certExists` check)
+- Certs skipped if existing material matches desired certificate spec
 - Storage skipped if already mounted (`mountpoint -q`)
 - Device wait loops (60 attempts, 30s) for Cinder volume attachment
 
 ### Drift Detection
-- `--refresh` defaults to true — Pulumi syncs state each run
+- `--refresh` defaults to true for preview/up/run-periodic and false for run-once
 - Services module detects crashed services via `SystemctlIsActive`
 - File modules detect content drift via SHA256 comparison
 

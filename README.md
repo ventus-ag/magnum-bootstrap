@@ -4,8 +4,9 @@ Kubernetes node reconciliation engine for OpenStack Magnum. Replaces legacy bash
 
 ## Features
 
-- **28 native modules** covering full node lifecycle: create, upgrade, resize, CA rotation
+- **31 native modules** covering full node lifecycle: create, upgrade, resize, CA rotation
 - **Unified phase plan** — same phases for all operations; each module decides internally whether to act
+- **Dependency-aware phase parallelism** — independent module phases run concurrently up to `--parallelism`
 - **Cluster-level addons** via Pulumi Kubernetes/Helm providers (Flannel, CoreDNS, OCCM, Cinder CSI, Manila CSI, metrics-server, autoscaler, auto-healer)
 - **Desired-state reconciliation** — idempotent, drift-detecting, change-driven restarts
 - **Crash recovery** — stale Pulumi lock detection, PID verification, auto-cancel
@@ -44,8 +45,9 @@ make build
 |---------|-------------|
 | `preview` | Dry-run: show planned changes without applying |
 | `up` | Apply changes to reconcile node state |
-| `run-once` | Alias for `up` (Heat-triggered invocations) |
-| `run-periodic` | Alias for `up` (timer-triggered drift correction) |
+| `run-once` | Heat-triggered `up` invocation; refresh defaults to false |
+| `run-periodic` | Timer-triggered `up` invocation; refresh defaults to true |
+| `destroy` | Destroy Pulumi-managed resources and run module cleanup |
 | `cancel` | Cancel the current Pulumi update for the local node stack |
 | `validate-input` | Parse heat-params and print role/operation |
 | `print-last-result` | Print last reconcile result JSON |
@@ -55,9 +57,9 @@ make build
 ```
 --diff                 Show diff-oriented output
 --allow-partial        Skip unimplemented modules, run only implemented ones
---refresh              Pulumi refresh to detect drift (default: true)
+--refresh              Pulumi refresh to detect drift (default: true except run-once)
 --target-phase STRING  Execute only the specified phase
---parallelism INT      Pulumi resource operation parallelism (default: 50)
+--parallelism INT      Maximum phase/resource operations to run in parallel (default: 10)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL
 --heat-params-file     Override heat-params file path
@@ -71,21 +73,31 @@ make build
 --heat-params-file     Override heat-params file path
 ```
 
+`destroy` also supports:
+
+```
+--backend-url STRING   Override Pulumi backend URL
+--heat-params-file     Override heat-params file path
+```
+
 ## Phase Catalog
 
-### Master Create
+### Master Phases
 
-prereq-validation → container-runtime → client-tools → master-certificates →
-cert-api-manager → etcd → kube-os-config → admin-kubeconfig → kube-master-config →
-storage → services → proxy-env → health → cluster-rbac → cluster-flannel →
+prereq-validation → ca-rotation → container-runtime → client-tools →
+master-certificates → cert-api-manager → etcd → kube-os-config →
+admin-kubeconfig → stop-services → kube-master-config → storage → proxy-env →
+services → start-services → health → cluster-rbac → cluster-flannel →
 cluster-coredns → cluster-occm → cluster-cinder-csi → cluster-manila-csi →
-cluster-metrics-server → cluster-auto-healer → cluster-autoscaler
+cluster-metrics-server → cluster-dashboard → cluster-auto-healer →
+cluster-autoscaler → cluster-health → zincati
 
-### Worker Create
+### Worker Phases
 
-prereq-validation → container-runtime → client-tools → kube-os-config →
-worker-certificates → registry → admin-kubeconfig → kube-worker-config →
-proxy-env → storage → services → health
+prereq-validation → ca-rotation → container-runtime → client-tools →
+kube-os-config → worker-certificates → registry → admin-kubeconfig →
+stop-services → kube-worker-config → storage → proxy-env → services →
+start-services → health → zincati
 
 All operations (create, upgrade, resize, CA rotation, periodic) use the same
 unified phase list per role.  Each module internally decides whether to act.
@@ -109,15 +121,16 @@ The launcher exports these environment variables (all have defaults):
 ```
 heat-params (desired state)
     ↓
-config.Load() → typed Config (~80 fields)
+config.Load() → typed Config (100+ fields)
     ↓
 plan.Build() → ordered phase list
     ↓
 reconcile.Run() → Pulumi Automation API
     ↓
-┌─ For each phase:
-│   mod.Run()      → imperative host ops (files, downloads, systemctl)
-│   mod.Register() → Pulumi component (state tracking, Helm, K8s resources)
+┌─ Dependency DAG:
+│   ready mod.Run() phases execute in parallel up to --parallelism
+│   completed phases call mod.Register() on the main goroutine
+│   dependencies release downstream phases
 └─
     ↓
 result.Write() → Heat-compatible JSON
@@ -143,11 +156,11 @@ internal/
   journal/              Run state tracking, crash recovery
   logging/              Structured logger with auto-trim at 100MB
   magnum/               Keystone auth, Magnum CA fetch, CSR signing (Go crypto)
-  module/               28 reconcile modules (see CLAUDE.md for details)
+  module/               31 reconcile modules (see CLAUDE.md for details)
   moduleapi/            Module interface, RestartTracker, HeatParamsComponent
   paths/                Runtime path resolution from environment
-  plan/                 Phase catalog for master/worker × create/reconcile
-  pulumi/               Pulumi program builder, RunAccumulator, dependency chain
+  plan/                 Unified phase catalog for master/worker plans
+  pulumi/               Pulumi program builder, RunAccumulator, parallel phase scheduler
   reconcile/            Main orchestration, parallelism, error handling
   result/               Result JSON, Heat signal text
   state/                Reconciler state persistence

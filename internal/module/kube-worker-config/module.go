@@ -22,7 +22,7 @@ type Resource struct {
 
 func (Module) PhaseID() string { return "kube-worker-config" }
 func (Module) Dependencies() []string {
-	return []string{"worker-certificates", "client-tools", "container-runtime"}
+	return []string{"worker-certificates", "kube-os-config", "client-tools", "container-runtime", "stop-services"}
 }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {

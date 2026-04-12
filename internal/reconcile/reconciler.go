@@ -53,9 +53,13 @@ const refreshRetries = 2
 const refreshRetryDelay = 15 * time.Second
 
 func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
+	if parallelism < 1 {
+		parallelism = 10
+	}
+
 	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, mode, diff, runtimePaths.HeatParamsFile)
 	acc := pulumipkg.NewRunAccumulator()
-	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc)
+	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc, parallelism)
 
 	workspaceDir := filepath.Join(runtimePaths.PulumiStateDir, "workspace")
 	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
@@ -154,10 +158,6 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			req.Logger.Infof("pulumi refresh completed stack=%s duration=%s changes=%s",
 				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(refreshRes.Summary.ResourceChanges))
 		}
-	}
-
-	if parallelism < 1 {
-		parallelism = 10
 	}
 
 	previewPlanText := ""
@@ -326,7 +326,7 @@ func Destroy(ctx context.Context, cfg config.Config, runtimePaths paths.Paths, r
 	// destroy doesn't run it. Use the normal program so the stack can be found.
 	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, "destroy", false, runtimePaths.HeatParamsFile)
 	acc := pulumipkg.NewRunAccumulator()
-	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc)
+	program := pulumipkg.BuildProgram(ctx, runtimePaths.HeatParamsFile, reconcilePlan, metadata, req, acc, 1)
 
 	stackOpts := []auto.LocalWorkspaceOption{
 		auto.Pulumi(pulumiCmd),

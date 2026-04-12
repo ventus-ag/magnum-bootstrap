@@ -18,8 +18,20 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string        { return "cluster-health" }
-func (Module) Dependencies() []string { return []string{"cluster-autoscaler"} }
+func (Module) PhaseID() string { return "cluster-health" }
+func (Module) Dependencies() []string {
+	return []string{
+		"cluster-flannel",
+		"cluster-coredns",
+		"cluster-occm",
+		"cluster-cinder-csi",
+		"cluster-manila-csi",
+		"cluster-metrics-server",
+		"cluster-dashboard",
+		"cluster-auto-healer",
+		"cluster-autoscaler",
+	}
+}
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if !cfg.IsFirstMaster() {
