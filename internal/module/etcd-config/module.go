@@ -394,10 +394,10 @@ func etcdctlVersionMatches(executor *host.Executor, desiredVersion string) bool 
 }
 
 func etcdHealthy(executor *host.Executor, endpoint, certDir string, tlsDisabled bool) bool {
-	args := etcdctlArgs(endpoint, certDir, tlsDisabled)
-	args = append(args, "endpoint", "health")
-	_, err := runEtcdctl(executor, args...)
-	return err == nil
+	// Single attempt — this is detection ("does a cluster exist?"), not
+	// convergence. A healthy cluster responds on the first try; retrying a
+	// dead endpoint just wastes ~16s on new-cluster creation.
+	return etcdHealthyOnce(executor, endpoint, certDir, tlsDisabled, "5s")
 }
 
 func checkMembership(executor *host.Executor, endpoint, certDir string, tlsDisabled bool, instanceName, nodeIP string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -78,20 +79,45 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	for _, svc := range serviceList {
-		// Always enable so services come back after reboot.
-		if err := executor.Run("systemctl", "enable", svc); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("enable %s: %w", svc, err)
+	// Enable all services in parallel.
+	{
+		errs := make(chan error, len(serviceList))
+		var wg sync.WaitGroup
+		for _, svc := range serviceList {
+			wg.Add(1)
+			go func(svc string) {
+				defer wg.Done()
+				if err := executor.Run("systemctl", "enable", svc); err != nil {
+					errs <- fmt.Errorf("enable %s: %w", svc, err)
+				}
+			}(svc)
 		}
+		wg.Wait()
+		close(errs)
+		if err, ok := <-errs; ok {
+			return moduleapi.Result{}, err
+		}
+	}
 
+	// Start/restart services in dependency tiers (parallel within each tier).
+	// Master: [etcd, runtime] → [kube-apiserver] → [controller-manager, scheduler, kubelet, kube-proxy]
+	// Worker: [runtime] → [kubelet, kube-proxy]
+	var tiers [][]string
+	if cfg.Role() == config.RoleMaster {
+		tiers = [][]string{serviceList[:2], serviceList[2:3], serviceList[3:]}
+	} else {
+		tiers = [][]string{serviceList[:1], serviceList[1:]}
+	}
+
+	var mu sync.Mutex
+	startOrRestart := func(svc string) error {
 		needsRestart := req.Restarts != nil && req.Restarts.NeedsRestart(svc)
 		isActive := executor.SystemctlIsActive(svc)
 
 		switch {
 		case needsRestart:
-			// Config changed for this service — restart it.
 			if err := executor.Run("systemctl", "restart", svc); err != nil {
-				return moduleapi.Result{}, fmt.Errorf("restart %s: %w", svc, err)
+				return fmt.Errorf("restart %s: %w", svc, err)
 			}
 			reason := ""
 			if req.Restarts != nil {
@@ -99,29 +125,55 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 					reason = " (" + all[svc] + ")"
 				}
 			}
+			mu.Lock()
 			changes = append(changes, host.Change{
 				Action:  host.ActionRestart,
 				Summary: fmt.Sprintf("restart %s%s", svc, reason),
 			})
+			mu.Unlock()
 			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
-				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after restart", svc)
+				return fmt.Errorf("service %s did not become active after restart", svc)
 			}
 
 		case !isActive:
-			// Service not running — start it.
 			if err := executor.Run("systemctl", "start", svc); err != nil {
-				return moduleapi.Result{}, fmt.Errorf("start %s: %w", svc, err)
+				return fmt.Errorf("start %s: %w", svc, err)
 			}
+			mu.Lock()
 			changes = append(changes, host.Change{
 				Action:  host.ActionCreate,
 				Summary: fmt.Sprintf("start %s", svc),
 			})
+			mu.Unlock()
 			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
-				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
+				return fmt.Errorf("service %s did not become active after start", svc)
 			}
+		}
+		return nil
+	}
 
-		default:
-			// Already running and no changes — skip.
+	for _, tier := range tiers {
+		if len(tier) == 1 {
+			if err := startOrRestart(tier[0]); err != nil {
+				return moduleapi.Result{}, err
+			}
+			continue
+		}
+		errs := make(chan error, len(tier))
+		var wg sync.WaitGroup
+		for _, svc := range tier {
+			wg.Add(1)
+			go func(svc string) {
+				defer wg.Done()
+				if err := startOrRestart(svc); err != nil {
+					errs <- err
+				}
+			}(svc)
+		}
+		wg.Wait()
+		close(errs)
+		if err, ok := <-errs; ok {
+			return moduleapi.Result{}, err
 		}
 	}
 
@@ -190,13 +242,19 @@ func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Reques
 		services = []string{"kubelet", "kube-proxy"}
 	}
 
+	var wg sync.WaitGroup
 	for _, svc := range services {
-		if req.Logger != nil {
-			req.Logger.Infof("services destroy: stopping %s", svc)
-		}
-		_ = executor.Run("systemctl", "stop", svc)
-		_ = executor.Run("systemctl", "disable", svc)
+		wg.Add(1)
+		go func(svc string) {
+			defer wg.Done()
+			if req.Logger != nil {
+				req.Logger.Infof("services destroy: stopping %s", svc)
+			}
+			_ = executor.Run("systemctl", "stop", svc)
+			_ = executor.Run("systemctl", "disable", svc)
+		}(svc)
 	}
+	wg.Wait()
 	return nil
 }
 
