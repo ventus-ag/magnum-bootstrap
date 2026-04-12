@@ -77,7 +77,6 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.Executor) ([]host.Change, bool, error) {
 	var changes []host.Change
 	configChanged := false
-	tarballExtracted := false
 
 	// Stop, disable, and mask docker if it's running. Mask prevents
 	// socket-activation or dependency-based starts on subsequent boots,
@@ -91,7 +90,6 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Select containerd version by Kubernetes version.
-	// K8s >= 1.32 uses containerd 2.x; K8s < 1.32 uses containerd 1.7.x LTS.
 	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
 	useV2Layout := false
 	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
@@ -122,9 +120,22 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		)
 	}
 
-	if containerdVersionMatches(executor, containerdVersion) {
-		// Already on the requested containerd version; avoid re-fetching the
-		// tarball on every reconcile.
+	// Check if the desired version is already installed. If a different
+	// version is running (e.g. OS-bundled 1.6.x), stop it first so we
+	// install and start the correct binary cleanly.
+	versionOK := containerdVersionMatches(executor, containerdVersion)
+	needsInstall := !versionOK
+
+	if needsInstall && executor.SystemctlIsActive("containerd") {
+		_ = executor.Run("systemctl", "stop", "containerd")
+		changes = append(changes, host.Change{
+			Action:  host.ActionOther,
+			Summary: fmt.Sprintf("stop old containerd (want %s)", containerdVersion),
+		})
+	}
+
+	if versionOK {
+		// Already on the requested containerd version; skip download.
 	} else if !executor.Apply {
 		changes = append(changes, host.Change{
 			Action:  host.ActionReplace,
@@ -140,9 +151,6 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		if dl.Change != nil {
 			changes = append(changes, *dl.Change)
 		}
-		// We only reach this branch when the installed containerd version is
-		// not the requested version. Extract the cached or freshly downloaded
-		// tarball so interrupted installs can recover without another fetch.
 		if useV2Layout {
 			// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
 			if err := executor.Run("tar", "xzf", localPath,
@@ -165,7 +173,32 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 			}
 		}
-		tarballExtracted = true
+		configChanged = true
+	}
+
+	// containerd 2.x installs to /usr/local/bin but the OS systemd unit
+	// (Fedora CoreOS, /usr/lib/systemd/system/containerd.service) still
+	// references /usr/bin/containerd. Override ExecStart via drop-in so
+	// systemd starts the correct binary. The /usr tree is immutable on
+	// ostree systems, so we cannot replace the binary in-place.
+	if useV2Layout {
+		dropinDir := "/etc/systemd/system/containerd.service.d"
+		change, err := executor.EnsureDir(dropinDir, 0o755)
+		if err != nil {
+			return nil, false, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+		}
+		dropin := "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\n"
+		change, err = executor.EnsureFile(dropinDir+"/10-exec-start.conf", []byte(dropin), 0o644)
+		if err != nil {
+			return nil, false, err
+		}
+		if change != nil {
+			changes = append(changes, *change)
+			configChanged = true
+		}
 	}
 
 	// Ensure directories.
@@ -199,8 +232,6 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Write Docker Hub registry host config (containerd 2.x registry config_path).
-	// containerd 2.x uses config_path-based registry config instead of inline
-	// registry.mirrors in config.toml.
 	if useV2Layout {
 		dockerHubHost := `server = "https://registry-1.docker.io"
 
@@ -224,21 +255,21 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		}
 	}
 
-	// Daemon-reload when tarball was extracted (may contain updated service
-	// files) or when config.toml changed.
-	if tarballExtracted || configChanged {
+	// Daemon-reload when binaries or config changed.
+	if configChanged {
 		_ = executor.Run("systemctl", "daemon-reload")
 	}
 
-	// Enable is idempotent — always safe to run.
+	// Enable + start. After a fresh install the service was stopped above,
+	// so this starts the correct binary. On idempotent runs where nothing
+	// changed, this is a no-op (already running).
 	_ = executor.Run("systemctl", "enable", "containerd")
 
-	// Detect drift: if containerd should be running but isn't, start it.
 	if !executor.SystemctlIsActive("containerd") {
 		if err := executor.Run("systemctl", "start", "containerd"); err != nil {
 			return nil, false, err
 		}
-		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: "start containerd (was not running)"})
+		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: fmt.Sprintf("start containerd %s", containerdVersion)})
 	}
 
 	return changes, configChanged, nil
@@ -248,11 +279,19 @@ func containerdVersionMatches(executor *host.Executor, desiredVersion string) bo
 	if desiredVersion == "" {
 		return false
 	}
-	out, err := executor.RunCapture("containerd", "--version")
-	if err != nil {
-		return false
+	// Check /usr/local/bin first (containerd 2.x install path), then fall
+	// back to bare "containerd" for 1.x which installs to /usr/bin via the
+	// cri-containerd-cni bundle.
+	for _, bin := range []string{"/usr/local/bin/containerd", "containerd"} {
+		out, err := executor.RunCapture(bin, "--version")
+		if err != nil {
+			continue
+		}
+		if strings.Contains(out, desiredVersion) {
+			return true
+		}
 	}
-	return strings.Contains(out, desiredVersion)
+	return false
 }
 
 func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
