@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	helmv3 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
@@ -45,6 +46,29 @@ func adoptedMarkerPath(namespace, releaseName string) string {
 // importMarkerPath returns the path for the "needs import" marker file.
 func importMarkerPath(namespace, releaseName string) string {
 	return fmt.Sprintf("/var/lib/magnum/helm-import-%s-%s", namespace, releaseName)
+}
+
+// forceMarkerPath returns the path for the "needs force update" marker file.
+func forceMarkerPath(namespace, releaseName string) string {
+	return fmt.Sprintf("/var/lib/magnum/helm-force-%s-%s", namespace, releaseName)
+}
+
+// NeedsForceUpdate returns true if a previous failed upgrade wrote a force
+// marker for this release.
+func NeedsForceUpdate(releaseName, namespace string) bool {
+	_, err := os.Stat(forceMarkerPath(namespace, releaseName))
+	return err == nil
+}
+
+// MarkForceUpdate writes a force-update marker so the next stack.Up() retries
+// the Helm release with ForceUpdate enabled.
+func MarkForceUpdate(releaseName, namespace string) {
+	_ = os.WriteFile(forceMarkerPath(namespace, releaseName), []byte("force"), 0o644)
+}
+
+// ClearForceUpdate removes the force-update marker after a successful deploy.
+func ClearForceUpdate(releaseName, namespace string) {
+	_ = os.Remove(forceMarkerPath(namespace, releaseName))
 }
 
 // AdoptHelmRelease prepares a legacy Helm release for Pulumi adoption.
@@ -150,6 +174,11 @@ type HelmReleaseArgs struct {
 	Version     string
 	RepoURL     string
 	Values      map[string]interface{}
+	// ForceUpdate tells Helm to replace resources instead of patching during
+	// upgrades. Required for charts whose templates change enough across
+	// versions that strategic merge patches produce invalid K8s objects
+	// (e.g. CoreDNS Service missing spec.ports after a major chart bump).
+	ForceUpdate bool
 }
 
 // DeployHelmRelease creates a Pulumi Helm Release resource. If the release
@@ -162,7 +191,7 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 		opts = append(opts, pulumi.Import(pulumi.ID(importID)))
 	}
 
-	rel, err := helmv3.NewRelease(ctx, name, &helmv3.ReleaseArgs{
+	releaseArgs := &helmv3.ReleaseArgs{
 		Name:            pulumi.String(args.ReleaseName),
 		Namespace:       pulumi.String(args.Namespace),
 		Chart:           pulumi.String(args.Chart),
@@ -179,13 +208,23 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 			Repo: pulumi.String(args.RepoURL),
 		},
 		Values: pulumi.Map(toStringMap(args.Values)),
-	}, opts...)
+	}
+	// ForceUpdate is enabled either explicitly by the module or automatically
+	// when a previous stack.Up() failed with a Helm patch error and wrote a
+	// force marker. This lets the first attempt use normal patching and only
+	// escalates to replace-on-upgrade for the retry.
+	if args.ForceUpdate || NeedsForceUpdate(args.ReleaseName, args.Namespace) {
+		releaseArgs.ForceUpdate = pulumi.BoolPtr(true)
+	}
+
+	rel, err := helmv3.NewRelease(ctx, name, releaseArgs, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	// Mark as adopted after successful registration.
+	// Mark as adopted and clear any force marker after successful registration.
 	MarkAdopted(args.ReleaseName, args.Namespace)
+	ClearForceUpdate(args.ReleaseName, args.Namespace)
 	return rel, err
 }
 
@@ -218,4 +257,35 @@ func toInput(v interface{}) pulumi.Input {
 	default:
 		return pulumi.String(fmt.Sprintf("%v", v))
 	}
+}
+
+// HelmReleasePair is a namespace/name pair identifying a Helm release.
+type HelmReleasePair struct {
+	Namespace string
+	Name      string
+}
+
+// helmReleaseRe matches Helm release identifiers in Pulumi error output.
+// Patterns: `Helm release "NAMESPACE/NAME"` or `Helm Release NAMESPACE/NAME:`
+var helmReleaseRe = regexp.MustCompile(`Helm [Rr]elease "?([a-z0-9-]+)/([a-z0-9-]+)"?`)
+
+// ParseHelmPatchFailures extracts Helm releases that failed due to patch
+// errors (e.g. "cannot patch", "is invalid") from a Pulumi error message.
+// Returns nil if the error is not a Helm patch failure.
+func ParseHelmPatchFailures(errMsg string) []HelmReleasePair {
+	if !strings.Contains(errMsg, "cannot patch") && !strings.Contains(errMsg, "is invalid") {
+		return nil
+	}
+	matches := helmReleaseRe.FindAllStringSubmatch(errMsg, -1)
+	seen := make(map[string]bool)
+	var releases []HelmReleasePair
+	for _, m := range matches {
+		key := m[1] + "/" + m[2]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
+	}
+	return releases
 }

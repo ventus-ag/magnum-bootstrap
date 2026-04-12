@@ -23,6 +23,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/internal/paths"
 	"github.com/ventus-ag/magnum-bootstrap/internal/plan"
@@ -233,10 +234,30 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		upRes, err = stack.Up(ctx, upOpts...)
 		stopHeartbeat()
 		if err != nil {
-			if req.Logger != nil {
-				req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+			// Check if the failure is a Helm release patch error. These
+			// happen during chart version upgrades when the strategic merge
+			// patch produces an invalid K8s object. Retry once with
+			// ForceUpdate which replaces resources instead of patching.
+			if helmFailures := clusterhelm.ParseHelmPatchFailures(err.Error()); len(helmFailures) > 0 {
+				names := make([]string, len(helmFailures))
+				for i, rel := range helmFailures {
+					names[i] = rel.Namespace + "/" + rel.Name
+					clusterhelm.MarkForceUpdate(rel.Name, rel.Namespace)
+				}
+				if req.Logger != nil {
+					req.Logger.Warnf("helm patch failure for %v, retrying with force update", names)
+				}
+				start = time.Now()
+				stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, "up (force retry)", cfg.StackName(), start)
+				upRes, err = stack.Up(ctx, upOpts...)
+				stopHeartbeat()
 			}
-			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
+			if err != nil {
+				if req.Logger != nil {
+					req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+				}
+				return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
+			}
 		}
 		if req.Logger != nil {
 			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
