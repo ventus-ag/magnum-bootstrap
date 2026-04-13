@@ -117,7 +117,9 @@ func ownershipStateFromSpec(spec hostresource.OwnershipSpec) (OwnershipState, er
 	state := OwnershipState{Path: spec.Path, Owner: spec.Owner, Group: spec.Group, Recursive: spec.Recursive, SkipIfMissing: spec.SkipIfMissing}
 	observed, err := spec.Observe(newExecutor(false))
 	if err != nil {
-		return OwnershipState{}, err
+		state.Drifted = true
+		state.DriftReasons = []string{err.Error()}
+		return state, nil
 	}
 	drift := spec.Diff(observed)
 	state.ObservedExists = observed.Exists
