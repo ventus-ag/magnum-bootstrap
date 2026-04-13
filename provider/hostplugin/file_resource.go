@@ -121,14 +121,6 @@ func (*File) Diff(_ context.Context, req infer.DiffRequest[FileArgs, FileState])
 func (*File) Annotate(a infer.Annotator) {
 	a.SetToken("index", "File")
 	a.Describe(&File{}, "A host file managed by the Magnum host provider.")
-	args := &FileArgs{}
-	a.Describe(&args.Path, "Absolute file path on the host.")
-	a.Describe(&args.Content, "Desired file content.")
-	a.Describe(&args.Mode, "Desired file mode as an octal string like 0644.")
-	a.Describe(&args.Absent, "Whether the file should be absent.")
-	state := &FileState{}
-	a.Describe(&state.ContentSHA256, "SHA256 of the desired content stored in state instead of raw content.")
-	a.Describe(&state.DriftReasons, "Observed reasons the host file differs from desired state.")
 }
 
 func fileSpecAndState(args FileArgs, _ bool) (hostresource.FileSpec, FileState, error) {

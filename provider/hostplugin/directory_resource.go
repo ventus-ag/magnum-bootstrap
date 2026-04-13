@@ -102,11 +102,6 @@ func (*Directory) Diff(_ context.Context, req infer.DiffRequest[DirectoryArgs, D
 func (*Directory) Annotate(a infer.Annotator) {
 	a.SetToken("index", "Directory")
 	a.Describe(&Directory{}, "A host directory managed by the Magnum host provider.")
-	args := &DirectoryArgs{}
-	a.Describe(&args.Path, "Absolute directory path on the host.")
-	a.Describe(&args.Mode, "Desired directory mode as an octal string like 0755.")
-	state := &DirectoryState{}
-	a.Describe(&state.DriftReasons, "Observed reasons the host directory differs from desired state.")
 }
 
 func directorySpec(args DirectoryArgs) (hostresource.DirectorySpec, error) {
