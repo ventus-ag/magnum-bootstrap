@@ -116,8 +116,20 @@ func (*SystemdService) Diff(_ context.Context, req infer.DiffRequest[SystemdServ
 	if req.State.Restart != spec.Restart || req.State.RestartReason != spec.RestartReason || req.State.DaemonReload != spec.DaemonReload || req.State.RestartOnChange != spec.RestartOnChange || req.State.RestartToken != spec.RestartToken {
 		detailed["restart"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
-	if req.State.Drifted {
-		detailed["observedActive"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+	observed, err := spec.Observe(newExecutor(false))
+	if err != nil {
+		return infer.DiffResponse{}, err
+	}
+	if drift := spec.Diff(observed); drift.Changed {
+		if spec.Enabled != nil && observed.Enabled != *spec.Enabled {
+			detailed["enabled"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
+		if spec.Active != nil && observed.Active != *spec.Active {
+			detailed["active"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
+		if spec.Masked != nil && observed.Masked != *spec.Masked {
+			detailed["masked"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
 	}
 	return infer.DiffResponse{HasChanges: len(detailed) > 0, DetailedDiff: detailed}, nil
 }

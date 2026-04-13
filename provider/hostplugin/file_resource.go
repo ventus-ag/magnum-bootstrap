@@ -100,7 +100,7 @@ func (*File) Diff(_ context.Context, req infer.DiffRequest[FileArgs, FileState])
 	if req.ID != spec.Path {
 		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.UpdateReplace, InputDiff: true}
 	}
-	if req.State.Mode != modeString(spec.Mode) || req.State.ObservedMode != modeString(spec.Mode) {
+	if req.State.Mode != modeString(spec.Mode) {
 		detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
 	if req.State.Absent != spec.Absent {
@@ -108,12 +108,31 @@ func (*File) Diff(_ context.Context, req infer.DiffRequest[FileArgs, FileState])
 	}
 	if !spec.Absent {
 		desiredHash := hostresource.BytesSHA256(spec.Content)
-		if req.State.ObservedContentSHA256 != desiredHash {
+		if req.State.ContentSHA256 != desiredHash {
 			detailed["content"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 		}
 	}
-	if spec.Absent && req.State.ObservedExists {
-		detailed["absent"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
+	observed, err := spec.Observe(newExecutor(false))
+	if err != nil {
+		return infer.DiffResponse{}, err
+	}
+	if drift := spec.Diff(observed); drift.Changed {
+		if spec.Absent {
+			if observed.Exists {
+				detailed["absent"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+			}
+		} else {
+			if !observed.Exists || !observed.IsRegularFile {
+				detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+			} else {
+				if observed.Mode != modeString(spec.Mode) {
+					detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+				}
+				if observed.ContentSHA256 != hostresource.BytesSHA256(spec.Content) {
+					detailed["content"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+				}
+			}
+		}
 	}
 	return infer.DiffResponse{HasChanges: len(detailed) > 0, DetailedDiff: detailed}, nil
 }

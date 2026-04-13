@@ -99,11 +99,24 @@ func (*Copy) Diff(_ context.Context, req infer.DiffRequest[CopyArgs, CopyState])
 	if req.State.Source != spec.Source || req.State.SourceSHA256 != desiredHash {
 		detailed["source"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
-	if req.State.Mode != modeString(spec.Mode) || req.State.ObservedMode != modeString(spec.Mode) {
+	if req.State.Mode != modeString(spec.Mode) {
 		detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
-	if !req.State.ObservedExists || !req.State.ObservedMatchesCopy {
-		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+	observed, err := observeCopy(spec, sourceData)
+	if err != nil {
+		return infer.DiffResponse{}, err
+	}
+	if drift := diffCopy(spec, observed); drift.Changed {
+		if !observed.Exists {
+			detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		} else {
+			if observed.Mode != modeString(spec.Mode) {
+				detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+			}
+			if !observed.MatchesSource {
+				detailed["source"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+			}
+		}
 	}
 	return infer.DiffResponse{HasChanges: len(detailed) > 0, DetailedDiff: detailed}, nil
 }

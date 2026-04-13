@@ -90,11 +90,19 @@ func (*Directory) Diff(_ context.Context, req infer.DiffRequest[DirectoryArgs, D
 	if req.ID != spec.Path {
 		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.UpdateReplace, InputDiff: true}
 	}
-	if req.State.ObservedMode != modeString(spec.Mode) || req.State.Mode != modeString(spec.Mode) {
+	if req.State.Mode != modeString(spec.Mode) {
 		detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
-	if !req.State.ObservedExists || !req.State.ObservedIsDir {
-		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
+	observed, err := spec.Observe(newExecutor(false))
+	if err != nil {
+		return infer.DiffResponse{}, err
+	}
+	if drift := spec.Diff(observed); drift.Changed {
+		if !observed.Exists || !observed.IsDir {
+			detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		} else if observed.Mode != modeString(spec.Mode) {
+			detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
 	}
 	return infer.DiffResponse{HasChanges: len(detailed) > 0, DetailedDiff: detailed}, nil
 }

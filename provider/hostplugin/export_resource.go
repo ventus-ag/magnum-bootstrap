@@ -111,15 +111,27 @@ func (*Export) Diff(_ context.Context, req infer.DiffRequest[ExportArgs, ExportS
 	if req.State.VarName != spec.VarName {
 		detailed["varName"] = providerpkg.PropertyDiff{Kind: providerpkg.UpdateReplace, InputDiff: true}
 	}
-	if req.State.Mode != modeString(spec.Mode) || req.State.ObservedMode != modeString(spec.Mode) {
+	if req.State.Mode != modeString(spec.Mode) {
 		detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
 	desiredHash := hostresource.BytesSHA256([]byte(spec.Value))
-	if req.State.ValueSHA256 != desiredHash || !req.State.ObservedHasDesired {
+	if req.State.ValueSHA256 != desiredHash {
 		detailed["value"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
-	if !req.State.ObservedExists && spec.Value != "" {
-		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
+	observed, err := observeExport(spec)
+	if err != nil {
+		return infer.DiffResponse{}, err
+	}
+	if drift := diffExport(spec, observed); drift.Changed {
+		if !observed.Exists && spec.Value != "" {
+			detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
+		if observed.Mode != modeString(spec.Mode) {
+			detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
+		if (spec.Value != "" && !observed.HasDesiredValue) || (spec.Value == "" && observed.HasDesiredValue) {
+			detailed["value"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
+		}
 	}
 	return infer.DiffResponse{HasChanges: len(detailed) > 0, DetailedDiff: detailed}, nil
 }
