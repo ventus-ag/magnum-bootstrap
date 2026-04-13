@@ -264,49 +264,6 @@ func PrepareManagedImports(executor *host.Executor) []HelmReleasePair {
 	return prepared
 }
 
-// CleanupVeryOldLegacyAddons removes manifest-era addon resources from very old
-// clusters before Helm-based addon reconciliation starts. All operations are
-// best-effort and intentionally ignore missing resources.
-func CleanupVeryOldLegacyAddons(executor *host.Executor) {
-	if executor == nil {
-		return
-	}
-
-	manifestPaths := []string{
-		"/srv/magnum/kubernetes/manifests/npd.yaml",
-		"/srv/magnum/kubernetes/manifests/draino.yaml",
-		"/srv/magnum/kubernetes/manifests/k8s-keystone-auth.yaml",
-		"/srv/magnum/kubernetes/keystone-auth-policy.yaml",
-		"/srv/magnum/kubernetes/kubernetes-dashboard.yaml",
-		"/srv/magnum/kubernetes/openstack-cloud-controller-manager.yaml",
-	}
-	for _, manifestPath := range manifestPaths {
-		if _, err := os.Stat(manifestPath); err != nil {
-			continue
-		}
-		if executor.Logger != nil {
-			executor.Logger.Infof("cleanup deprecated: deleting legacy manifest %s", manifestPath)
-		}
-		_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "-f", manifestPath, "--ignore-not-found=true")
-	}
-
-	_ = executor.Run("helm", "uninstall", "magnum", "-n", "kube-system", "--ignore-not-found")
-
-	legacyDeletes := [][]string{
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-flannel", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-flannel", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-flannel", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-system", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-system", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-system", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrolebinding", "flannel", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrole", "flannel", "--ignore-not-found=true"},
-	}
-	for _, cmd := range legacyDeletes {
-		_ = executor.Run(cmd[0], cmd[1:]...)
-	}
-}
-
 // ManagedReleases returns releases that bootstrap attempted to manage.
 func ManagedReleases() []HelmReleasePair {
 	markerPaths, err := filepath.Glob(filepath.Join(helmMarkerRootDir, "helm-managed-*"))

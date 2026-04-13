@@ -7,7 +7,6 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
-	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -26,11 +25,30 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	if req.Apply {
 		executor := host.NewExecutor(req.Apply, req.Logger)
-		clusterhelm.CleanupVeryOldLegacyAddons(executor)
+		cleanupDeprecatedFlannel(executor)
 	}
 	return moduleapi.Result{
 		Outputs: map[string]string{"firstMaster": "true"},
 	}, nil
+}
+
+// cleanupDeprecatedFlannel removes only the legacy flannel resources that the
+// old Magnum cleanup script deleted before upgrade.
+func cleanupDeprecatedFlannel(executor *host.Executor) {
+	if executor == nil {
+		return
+	}
+
+	legacyDeletes := [][]string{
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-system", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-system", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-system", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrolebinding", "flannel", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrole", "flannel", "--ignore-not-found=true"},
+	}
+	for _, cmd := range legacyDeletes {
+		_ = executor.Run(cmd[0], cmd[1:]...)
+	}
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
