@@ -17,8 +17,8 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cluster-coredns" }
-func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
+func (Module) PhaseID() string        { return "cluster-coredns" }
+func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	return clusterhelm.RunNoop(ctx, cfg, req, cfg.IsFirstMaster(), "coredns", "kube-system")

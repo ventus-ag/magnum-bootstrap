@@ -16,8 +16,10 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string        { return "cluster-dashboard" }
-func (Module) Dependencies() []string { return []string{"cluster-metrics-server"} }
+func (Module) PhaseID() string { return "cluster-dashboard" }
+func (Module) Dependencies() []string {
+	return []string{"cluster-cleanup-deprecated", "cluster-metrics-server"}
+}
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	return clusterhelm.RunNoop(ctx, cfg, req, cfg.Shared.KubeDashboardEnabled, "kubernetes-dashboard", "kubernetes-dashboard")

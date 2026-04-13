@@ -63,6 +63,7 @@ func TestMasterDependencyContracts(t *testing.T) {
 	)
 	assertDependsOn(t, reconcilePlan, registry, "health", "services", "start-services", "proxy-env")
 	assertDependsOn(t, reconcilePlan, registry, "cluster-rbac", "health")
+	assertDependsOn(t, reconcilePlan, registry, "cluster-cleanup-deprecated", "cluster-rbac")
 
 	for _, addon := range []string{
 		"cluster-flannel",
@@ -74,9 +75,24 @@ func TestMasterDependencyContracts(t *testing.T) {
 		"cluster-dashboard",
 		"cluster-auto-healer",
 		"cluster-autoscaler",
+		"cluster-gpu-operator",
 	} {
-		assertDependsOn(t, reconcilePlan, registry, addon, "cluster-rbac")
-		assertDependsOn(t, reconcilePlan, registry, "cluster-health", addon)
+		assertDependsOn(t, reconcilePlan, registry, addon, "cluster-cleanup-deprecated")
+	}
+	assertDependsOn(t, reconcilePlan, registry, "cluster-dashboard", "cluster-metrics-server")
+
+	for _, monitoredAddon := range []string{
+		"cluster-flannel",
+		"cluster-coredns",
+		"cluster-occm",
+		"cluster-cinder-csi",
+		"cluster-manila-csi",
+		"cluster-metrics-server",
+		"cluster-dashboard",
+		"cluster-auto-healer",
+		"cluster-autoscaler",
+	} {
+		assertDependsOn(t, reconcilePlan, registry, "cluster-health", monitoredAddon)
 	}
 }
 

@@ -29,6 +29,7 @@ func masterPhases() []Phase {
 		newPhase("health", "verify master health after reconciliation", false),
 		// Cluster-level addons — only execute on master-0, skip on other masters.
 		newPhase("cluster-rbac", "reconcile RBAC roles, secrets, and pod security for cluster", false),
+		newPhase("cluster-cleanup-deprecated", "clean up deprecated pre-Helm cluster addon resources", false),
 		newPhase("cluster-flannel", "reconcile flannel CNI via Helm", false),
 		newPhase("cluster-coredns", "reconcile CoreDNS via Helm", false),
 		newPhase("cluster-occm", "reconcile OpenStack Cloud Controller Manager via Helm", false),

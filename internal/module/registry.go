@@ -8,12 +8,13 @@ import (
 	clienttools "github.com/ventus-ag/magnum-bootstrap/internal/module/client-tools"
 	clusterautohealer "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-auto-healer"
 	clusterautoscaler "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-autoscaler"
+	clustercindercsi "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-cinder-csi"
+	clustercleanupdeprecated "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-cleanup-deprecated"
+	clustercoredns "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-coredns"
 	clusterdashboard "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-dashboard"
+	clusterflannel "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-flannel"
 	clustergpuoperator "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-gpu-operator"
 	clusterhealth "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-health"
-	clustercindercsi "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-cinder-csi"
-	clustercoredns "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-coredns"
-	clusterflannel "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-flannel"
 	clustermanilacsi "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-manila-csi"
 	clustermetricsserver "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-metrics-server"
 	clusteroccm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-occm"
@@ -60,18 +61,19 @@ func BuildRegistry(_ config.Config) map[string]Module {
 		"ca-rotation":         carotation.Module{},
 		"zincati":             zincati.Module{},
 		// Cluster-level addons (master-0 only).
-		"cluster-rbac":           clusterrbac.Module{},
-		"cluster-flannel":        clusterflannel.Module{},
-		"cluster-coredns":        clustercoredns.Module{},
-		"cluster-occm":           clusteroccm.Module{},
-		"cluster-cinder-csi":     clustercindercsi.Module{},
-		"cluster-manila-csi":     clustermanilacsi.Module{},
-		"cluster-metrics-server": clustermetricsserver.Module{},
-		"cluster-dashboard":     clusterdashboard.Module{},
-		"cluster-auto-healer":    clusterautohealer.Module{},
-		"cluster-autoscaler":     clusterautoscaler.Module{},
-		"cluster-gpu-operator":   clustergpuoperator.Module{},
-		"cluster-health":         clusterhealth.Module{},
+		"cluster-rbac":               clusterrbac.Module{},
+		"cluster-cleanup-deprecated": clustercleanupdeprecated.Module{},
+		"cluster-flannel":            clusterflannel.Module{},
+		"cluster-coredns":            clustercoredns.Module{},
+		"cluster-occm":               clusteroccm.Module{},
+		"cluster-cinder-csi":         clustercindercsi.Module{},
+		"cluster-manila-csi":         clustermanilacsi.Module{},
+		"cluster-metrics-server":     clustermetricsserver.Module{},
+		"cluster-dashboard":          clusterdashboard.Module{},
+		"cluster-auto-healer":        clusterautohealer.Module{},
+		"cluster-autoscaler":         clusterautoscaler.Module{},
+		"cluster-gpu-operator":       clustergpuoperator.Module{},
+		"cluster-health":             clusterhealth.Module{},
 	}
 }
 

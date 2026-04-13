@@ -38,7 +38,7 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string        { return "cluster-cinder-csi" }
-func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
+func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
