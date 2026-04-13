@@ -11,6 +11,8 @@ var Repository = "ventus-ag/magnum-bootstrap"
 
 const HostProviderAsset = "pulumi-resource-magnumhost"
 
+const DefaultProviderSemver = "0.1.0"
+
 func IsTaggedRelease() bool {
 	if len(Version) <= 1 || Version[0] != 'v' {
 		return false
@@ -30,4 +32,11 @@ func ReleaseAssetURL(asset string) string {
 
 func DefaultHostProviderURL() string {
 	return ReleaseAssetURL(HostProviderAsset)
+}
+
+func ProviderSemver() string {
+	if IsTaggedRelease() {
+		return strings.TrimPrefix(Version, "v")
+	}
+	return DefaultProviderSemver
 }

@@ -15,7 +15,7 @@ const (
 	ProviderBinary = buildinfo.HostProviderAsset
 )
 
-var ProviderVersion = buildinfo.Version
+var ProviderVersion = buildinfo.ProviderSemver()
 
 func newExecutor(apply bool) *host.Executor {
 	return host.NewExecutor(apply, nil)
