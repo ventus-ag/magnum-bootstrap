@@ -212,11 +212,12 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	// Config format is driven by containerd version (not K8s version):
 	// containerd 2.x requires version=3 config with new CRI plugin paths.
 	pause := pauseImage(cfg.Shared.KubeTag)
+	systemdCgroup := containerdUsesSystemdCgroup(cfg.ResolveCgroupDriver())
 	var configContent string
 	if useV2Layout {
-		configContent = containerdV3Config(pause)
+		configContent = containerdV3Config(pause, systemdCgroup)
 	} else {
-		configContent = containerdV2Config(pause)
+		configContent = containerdV2Config(pause, systemdCgroup)
 	}
 	configResult, err := (hostresource.FileSpec{Path: "/etc/containerd/config.toml", Content: []byte(configContent), Mode: 0o644}).Apply(executor)
 	if err != nil {
@@ -358,7 +359,7 @@ func pauseImage(kubeTag string) string {
 }
 
 // containerdV3Config returns a containerd 2.x (config version 3) config.
-func containerdV3Config(pause string) string {
+func containerdV3Config(pause string, systemdCgroup bool) string {
 	return fmt.Sprintf(`version = 3
 
 [plugins]
@@ -376,10 +377,10 @@ func containerdV3Config(pause string) string {
     enable_unprivileged_ports = true
     enable_unprivileged_icmp = true
 
-  [plugins."io.containerd.cri.v1.runtime".runtimes.runc]
-    runtime_type = "io.containerd.runc.v2"
-    [plugins."io.containerd.cri.v1.runtime".runtimes.runc.options]
-      SystemdCgroup = true
+   [plugins."io.containerd.cri.v1.runtime".runtimes.runc]
+     runtime_type = "io.containerd.runc.v2"
+     [plugins."io.containerd.cri.v1.runtime".runtimes.runc.options]
+       SystemdCgroup = %t
 
   [plugins."io.containerd.cri.v1.cni"]
     bin_dir = "/opt/cni/bin"
@@ -391,11 +392,11 @@ func containerdV3Config(pause string) string {
 
 [debug]
   level = "info"
-`, pause, pause)
+`, pause, pause, systemdCgroup)
 }
 
 // containerdV2Config returns a containerd 1.x (config version 2) config.
-func containerdV2Config(pause string) string {
+func containerdV2Config(pause string, systemdCgroup bool) string {
 	return fmt.Sprintf(`version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -428,14 +429,18 @@ oom_score = 0
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-          SystemdCgroup = true
+          SystemdCgroup = %t
     [plugins."io.containerd.grpc.v1.cri".registry]
       [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
         [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
           endpoint = ["https://registry-1.docker.io"]
   [plugins."io.containerd.internal.v1.opt"]
     path = "/var/lib/containerd/opt"
-`, pause)
+`, pause, systemdCgroup)
+}
+
+func containerdUsesSystemdCgroup(cgroupDriver string) bool {
+	return strings.EqualFold(cgroupDriver, "systemd")
 }
 
 // parseContainerdMajor extracts the major version from a containerd version
@@ -519,11 +524,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			dirResources[dir] = resDir
 		}
 		pause := pauseImage(cfg.Shared.KubeTag)
-		configContent := containerdV2Config(pause)
+		systemdCgroup := containerdUsesSystemdCgroup(cfg.ResolveCgroupDriver())
+		configContent := containerdV2Config(pause, systemdCgroup)
 		var configDeps []pulumi.Resource
 		configDeps = append(configDeps, dirResources["/etc/containerd"])
 		if useV2Layout {
-			configContent = containerdV3Config(pause)
+			configContent = containerdV3Config(pause, systemdCgroup)
 			dropinDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-containerd-dropin-dir", hostresource.DirectorySpec{Path: "/etc/systemd/system/containerd.service.d", Mode: 0o755}, childOpts...)
 			if err != nil {
 				return nil, err
@@ -580,7 +586,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"containerRuntime":  pulumi.String(cfg.Shared.ContainerRuntime),
 		"containerdVersion": pulumi.String(containerdVersion),
-		"cgroupDriver":      pulumi.String(cfg.Shared.CgroupDriver),
+		"cgroupDriver":      pulumi.String(cfg.ResolveCgroupDriver()),
 	}); err != nil {
 		return nil, err
 	}
