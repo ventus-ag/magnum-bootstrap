@@ -10,7 +10,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 const (
@@ -44,47 +46,44 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Remove old config file from previous versions.
 	oldConfig := "/etc/zincati/config.d/90-disable-auto-updates.toml"
-	if ch, _ := executor.EnsureAbsent(oldConfig); ch != nil {
-		changes = append(changes, *ch)
+	legacyConfig := hostresource.FileSpec{Path: oldConfig, Absent: true}
+	legacyResult, err := legacyConfig.Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
+	changes = append(changes, legacyResult.Changes...)
 
 	enabled := cfg.Shared.OSAutoUpgradeEnabled
 	content := buildConfig(enabled, cfg.ResolveNodeIP())
+	configResource := hostresource.FileSpec{
+		Path:    configPath,
+		Content: []byte(content),
+		Mode:    0o644,
+	}
 
-	if ch, err := executor.EnsureFile(configPath, []byte(content), 0o644); err != nil {
+	configResult, err := configResource.Apply(executor)
+	if err != nil {
 		return moduleapi.Result{}, fmt.Errorf("failed to write zincati config: %w", err)
-	} else if ch != nil {
-		changes = append(changes, *ch)
-		req.Restarts.Add(serviceName, "zincati config changed")
+	}
+	changes = append(changes, configResult.Changes...)
+
+	serviceResource := hostresource.SystemdServiceSpec{Unit: serviceName, SkipIfMissing: true}
+	if enabled {
+		serviceResource.Enabled = hostresource.BoolPtr(true)
+		serviceResource.Restart = configResult.Changed
+		serviceResource.RestartReason = "zincati config changed"
+		serviceResource.RestartOnChange = true
+		serviceResource.RestartToken = hostresource.BytesSHA256([]byte(content))
+	} else {
+		serviceResource.Active = hostresource.BoolPtr(false)
+		serviceResource.Enabled = hostresource.BoolPtr(false)
 	}
 
-	if enabled {
-		if err := executor.Run("systemctl", "enable", serviceName); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("failed to enable %s: %w", serviceName, err)
-		}
-		if req.Restarts.NeedsRestart(serviceName) {
-			if err := executor.Run("systemctl", "restart", serviceName); err != nil {
-				return moduleapi.Result{}, fmt.Errorf("failed to restart %s: %w", serviceName, err)
-			}
-			changes = append(changes, host.Change{
-				Action:  host.ActionRestart,
-				Summary: fmt.Sprintf("restart %s (config changed)", serviceName),
-			})
-		}
-	} else {
-		if executor.SystemctlIsActive(serviceName) {
-			if err := executor.Run("systemctl", "stop", serviceName); err != nil {
-				return moduleapi.Result{}, fmt.Errorf("failed to stop %s: %w", serviceName, err)
-			}
-			changes = append(changes, host.Change{
-				Action:  host.ActionOther,
-				Summary: fmt.Sprintf("stop %s (OS auto-upgrade disabled)", serviceName),
-			})
-		}
-		if err := executor.Run("systemctl", "disable", serviceName); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("failed to disable %s: %w", serviceName, err)
-		}
+	serviceResult, err := serviceResource.Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
+	changes = append(changes, serviceResult.Changes...)
 
 	return moduleapi.Result{Changes: changes}, nil
 }
@@ -134,6 +133,35 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:Zincati", name, res, opts...); err != nil {
 		return nil, err
 	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
+
+	enabled := heat.Cfg.Shared.OSAutoUpgradeEnabled
+	content := []byte(buildConfig(enabled, heat.Cfg.ResolveNodeIP()))
+	legacyConfig := hostresource.FileSpec{Path: "/etc/zincati/config.d/90-disable-auto-updates.toml", Absent: true}
+	legacyRes, err := hostsdk.RegisterFileSpec(ctx, name+"-legacy-config", legacyConfig, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	configResource := hostresource.FileSpec{Path: configPath, Content: content, Mode: 0o644}
+	configRes, err := hostsdk.RegisterFileSpec(ctx, name+"-config", configResource, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	serviceResource := hostresource.SystemdServiceSpec{Unit: serviceName, SkipIfMissing: true}
+	if enabled {
+		serviceResource.Enabled = hostresource.BoolPtr(true)
+		serviceResource.RestartOnChange = true
+		serviceResource.RestartToken = hostresource.BytesSHA256(content)
+		serviceResource.RestartReason = "zincati config changed"
+	} else {
+		serviceResource.Active = hostresource.BoolPtr(false)
+		serviceResource.Enabled = hostresource.BoolPtr(false)
+	}
+	serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, legacyRes, configRes)
+	if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-service", serviceResource, serviceOpts...); err != nil {
+		return nil, err
+	}
+
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"osAutoUpgradeEnabled": pulumi.Bool(heat.Cfg.Shared.OSAutoUpgradeEnabled),
 	}); err != nil {

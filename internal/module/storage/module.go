@@ -12,8 +12,10 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -74,13 +76,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	// Ensure storage directory exists.
-	change, err := executor.EnsureDir(storageDir, 0o755)
+	dirResult, err := (hostresource.DirectorySpec{Path: storageDir, Mode: 0o755}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	// Format only if not already xfs.
 	fstype, _ := executor.RunCapture("blkid", "-s", "TYPE", "-o", "value", devicePath)
@@ -94,13 +94,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Ensure fstab entry.
 	fstabLine := fmt.Sprintf("%s %s xfs defaults 0 0", devicePath, storageDir)
-	change, err = executor.EnsureLine("/etc/fstab", fstabLine, 0o644)
+	lineResult, err := (hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, lineResult.Changes...)
 
 	// Mount only the target device — avoid mount -a which would mount all fstab entries.
 	if !executor.IsMountpoint(storageDir) {
@@ -188,6 +186,23 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:Storage", name, res, opts...); err != nil {
 		return nil, err
 	}
+	if heat.Cfg.Shared.DockerVolumeSize > 0 {
+		childOpts := append(opts, pulumi.Parent(res))
+		storageDir := storageDirForRuntime(heat.Cfg)
+		dirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir", hostresource.DirectorySpec{Path: storageDir, Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		executor := host.NewExecutor(false, nil)
+		devicePath, err := findDevicePath(heat.Cfg, executor, nil)
+		if err == nil && devicePath != "" {
+			fstabLine := fmt.Sprintf("%s %s xfs defaults 0 0", devicePath, storageDir)
+			fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
+			if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"dockerVolumeSize": pulumi.Int(heat.Cfg.Shared.DockerVolumeSize),
 		"containerRuntime": pulumi.String(heat.Cfg.Shared.ContainerRuntime),
@@ -195,4 +210,11 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func storageDirForRuntime(cfg config.Config) string {
+	if cfg.Shared.ContainerRuntime == "containerd" {
+		return "/var/lib/containerd"
+	}
+	return "/var/lib/docker"
 }

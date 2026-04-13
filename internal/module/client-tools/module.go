@@ -12,7 +12,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -45,26 +47,22 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	changes := make([]host.Change, 0)
 
 	for _, dir := range []string{"/srv/magnum/bin", "/srv/magnum/k8s", moduleStateDir(req)} {
-		change, err := executor.EnsureDir(dir, 0o755)
+		result, err := (hostresource.DirectorySpec{Path: dir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
 	}
 
 	for _, line := range []string{
 		"export PATH=/srv/magnum/bin:$PATH",
 		"export HISTCONTROL=ignoredups",
 	} {
-		change, err := executor.EnsureLine("/root/.bashrc", line, 0o644)
+		result, err := (hostresource.LineSpec{Path: "/root/.bashrc", Line: line, Mode: 0o644}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
 	}
 
 	desired := installState{
@@ -106,13 +104,11 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		}
 
 		if needsKubectlCopy {
-			change, err := executor.EnsureCopy("/usr/local/bin/kubectl", "/srv/magnum/bin/kubectl", 0o755)
+			copyResult, err := (hostresource.CopySpec{Source: "/usr/local/bin/kubectl", Path: "/srv/magnum/bin/kubectl", Mode: 0o755}).Apply(executor)
 			if err != nil {
 				return moduleapi.Result{}, err
 			}
-			if change != nil {
-				changes = append(changes, *change)
-			}
+			changes = append(changes, copyResult.Changes...)
 		}
 		desired.KubectlCopySHA256, _ = host.FileSHA256("/srv/magnum/bin/kubectl")
 
@@ -123,20 +119,26 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			return moduleapi.Result{}, err
 		}
 	} else {
-		if change := plannedBinaryChange("/usr/local/bin/kubelet", desired.KubeletURL, needsKubelet, fmt.Sprintf("download kubelet %s", cfg.Shared.KubeTag)); change != nil {
-			changes = append(changes, *change)
-		}
-		if change := plannedBinaryChange("/usr/local/bin/kubectl", desired.KubectlURL, needsKubectl, fmt.Sprintf("download kubectl %s", cfg.Shared.KubeTag)); change != nil {
-			changes = append(changes, *change)
-		}
-		if needsKubectlCopy {
-			change, err := plannedCopyChange("/usr/local/bin/kubectl", "/srv/magnum/bin/kubectl", 0o755)
+		if needsKubelet {
+			result, err := (hostresource.DownloadSpec{URL: desired.KubeletURL, Path: "/usr/local/bin/kubelet", Mode: 0o755, Retries: 5}).Apply(executor)
 			if err != nil {
 				return moduleapi.Result{}, err
 			}
-			if change != nil {
-				changes = append(changes, *change)
+			changes = append(changes, result.Changes...)
+		}
+		if needsKubectl {
+			result, err := (hostresource.DownloadSpec{URL: desired.KubectlURL, Path: "/usr/local/bin/kubectl", Mode: 0o755, Retries: 5}).Apply(executor)
+			if err != nil {
+				return moduleapi.Result{}, err
 			}
+			changes = append(changes, result.Changes...)
+		}
+		if needsKubectlCopy {
+			copyResult, err := (hostresource.CopySpec{Source: "/usr/local/bin/kubectl", Path: "/srv/magnum/bin/kubectl", Mode: 0o755}).Apply(executor)
+			if err != nil {
+				return moduleapi.Result{}, err
+			}
+			changes = append(changes, copyResult.Changes...)
 		}
 	}
 
@@ -161,14 +163,14 @@ func downloadClientBinaries(ctx context.Context, executor *host.Executor, desire
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			kubeletDownload, kubeletErr = executor.DownloadFileWithRetry(ctx, desired.KubeletURL, "/usr/local/bin/kubelet", 0o755, 5)
+			kubeletDownload, kubeletErr = (hostresource.DownloadSpec{URL: desired.KubeletURL, Path: "/usr/local/bin/kubelet", Mode: 0o755, Retries: 5}).ApplyWithResultContext(ctx, executor)
 		}()
 	}
 	if needsKubectl {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			kubectlDownload, kubectlErr = executor.DownloadFileWithRetry(ctx, desired.KubectlURL, "/usr/local/bin/kubectl", 0o755, 5)
+			kubectlDownload, kubectlErr = (hostresource.DownloadSpec{URL: desired.KubectlURL, Path: "/usr/local/bin/kubectl", Mode: 0o755, Retries: 5}).ApplyWithResultContext(ctx, executor)
 		}()
 	}
 	wg.Wait()
@@ -198,6 +200,41 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	cfg := heat.Cfg
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:InstallClients", name, res, opts...); err != nil {
+		return nil, err
+	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
+	var binDirRes pulumi.Resource
+	for _, dir := range []string{"/srv/magnum/bin", "/srv/magnum/k8s"} {
+		resDir, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir-"+filepath.Base(dir), hostresource.DirectorySpec{Path: dir, Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		if dir == "/srv/magnum/bin" {
+			binDirRes = resDir
+		}
+	}
+	for _, line := range []struct {
+		name string
+		line string
+	}{
+		{name: "path-export", line: "export PATH=/srv/magnum/bin:$PATH"},
+		{name: "histcontrol", line: "export HISTCONTROL=ignoredups"},
+	} {
+		if _, err := hostsdk.RegisterLineSpec(ctx, name+"-bashrc-"+line.name, hostresource.LineSpec{Path: "/root/.bashrc", Line: line.line, Mode: 0o644}, childOpts...); err != nil {
+			return nil, err
+		}
+	}
+	kubeletRes, err := hostsdk.RegisterDownloadSpec(ctx, name+"-kubelet", hostresource.DownloadSpec{URL: kubeletURL(cfg), Path: "/usr/local/bin/kubelet", Mode: 0o755, Retries: 5}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	_ = kubeletRes
+	kubectlRes, err := hostsdk.RegisterDownloadSpec(ctx, name+"-kubectl", hostresource.DownloadSpec{URL: kubectlURL(cfg), Path: "/usr/local/bin/kubectl", Mode: 0o755, Retries: 5}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	copyOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, kubectlRes, binDirRes)
+	if _, err := hostsdk.RegisterCopySpec(ctx, name+"-kubectl-copy", hostresource.CopySpec{Source: "/usr/local/bin/kubectl", Path: "/srv/magnum/bin/kubectl", Mode: 0o755}, copyOpts...); err != nil {
 		return nil, err
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{

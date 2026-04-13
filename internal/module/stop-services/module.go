@@ -9,6 +9,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -63,7 +64,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		serviceList, _ := executor.RunCapture("podman", "ps", "-f", "name=kube", "--format", "{{.Names}}")
 		for _, svc := range strings.Fields(serviceList) {
 			if executor.SystemctlIsActive(svc) {
-				_ = executor.Run("systemctl", "stop", svc)
+				stopResult, _ := (hostresource.SystemdServiceSpec{Unit: svc, SkipIfMissing: true, Active: hostresource.BoolPtr(false)}).Apply(executor)
 				// Remove container and image so podman pulls fresh on restart.
 				containerID, _ := executor.RunCapture("podman", "ps", "--filter", "name="+svc, "-a", "-q")
 				if containerID != "" {
@@ -73,13 +74,14 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 				if imageID != "" {
 					_ = executor.Run("podman", "rmi", imageID)
 				}
-				changes = append(changes, host.Change{Action: host.ActionOther, Summary: fmt.Sprintf("stop and clean %s", svc)})
+				changes = append(changes, stopResult.Changes...)
+				changes = append(changes, host.Change{Action: host.ActionOther, Summary: fmt.Sprintf("clean %s container/image", svc)})
 			}
 		}
 
 		if executor.SystemctlIsActive("kubelet") {
-			_ = executor.Run("systemctl", "stop", "kubelet")
-			changes = append(changes, host.Change{Action: host.ActionOther, Summary: "stop kubelet"})
+			stopResult, _ := (hostresource.SystemdServiceSpec{Unit: "kubelet", SkipIfMissing: true, Active: hostresource.BoolPtr(false)}).Apply(executor)
+			changes = append(changes, stopResult.Changes...)
 		}
 	}
 

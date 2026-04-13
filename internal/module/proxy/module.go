@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -39,13 +42,12 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		runtimeService = "containerd.service"
 	}
 
-	change, err := executor.EnsureDir(serviceDirectory, 0o755)
+	dropInDir := hostresource.DirectorySpec{Path: serviceDirectory, Mode: 0o755}
+	dirResult, err := dropInDir.Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	runtimeChanged := false
 	for _, item := range []struct {
@@ -58,49 +60,39 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		{path: serviceDirectory + "/https_proxy.conf", envName: "HTTPS_PROXY", value: cfg.Shared.HTTPSProxy, bashVar: "https_proxy"},
 		{path: serviceDirectory + "/no_proxy.conf", envName: "NO_PROXY", value: cfg.Shared.NoProxy, bashVar: "no_proxy"},
 	} {
+		fileSpec := hostresource.FileSpec{Path: item.path, Mode: 0o644, Absent: item.value == ""}
 		if item.value != "" {
-			content := fmt.Sprintf("[Service]\nEnvironment=%s=%s\n", item.envName, item.value)
-			change, err := executor.EnsureFile(item.path, []byte(content), 0o644)
-			if err != nil {
-				return moduleapi.Result{}, err
-			}
-			if change != nil {
-				changes = append(changes, *change)
-				runtimeChanged = true
-			}
-		} else {
-			change, err := executor.EnsureAbsent(item.path)
-			if err != nil {
-				return moduleapi.Result{}, err
-			}
-			if change != nil {
-				changes = append(changes, *change)
-				runtimeChanged = true
-			}
+			fileSpec.Content = []byte(fmt.Sprintf("[Service]\nEnvironment=%s=%s\n", item.envName, item.value))
 		}
-
-		change, err := executor.UpsertExport("/root/.bashrc", item.bashVar, item.value, 0o644)
+		fileResult, err := fileSpec.Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
+		changes = append(changes, fileResult.Changes...)
+		runtimeChanged = runtimeChanged || fileResult.Changed
+
+		exportSpec := hostresource.ExportSpec{Path: "/root/.bashrc", VarName: item.bashVar, Value: item.value, Mode: 0o644}
+		exportResult, err := exportSpec.Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
 		}
+		changes = append(changes, exportResult.Changes...)
 	}
 
 	if runtimeChanged {
-		changes = append(changes,
-			host.Change{Action: host.ActionReload, Path: "systemd", Summary: "reload systemd manager configuration"},
-			host.Change{Action: host.ActionRestart, Path: runtimeService, Summary: fmt.Sprintf("restart %s", runtimeService)},
-		)
-		if req.Apply {
-			if err := executor.Run("systemctl", "daemon-reload"); err != nil {
-				return moduleapi.Result{}, err
-			}
-			if err := executor.Run("systemctl", "restart", runtimeService); err != nil {
-				return moduleapi.Result{}, err
-			}
+		serviceResource := hostresource.SystemdServiceSpec{
+			Unit:            runtimeService,
+			DaemonReload:    true,
+			Restart:         true,
+			RestartOnChange: true,
+			RestartReason:   "proxy configuration changed",
+			RestartToken:    hostresource.BytesSHA256([]byte(strings.Join([]string{cfg.Shared.HTTPProxy, cfg.Shared.HTTPSProxy, cfg.Shared.NoProxy}, "\x00"))),
 		}
+		serviceResult, err := serviceResource.Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, serviceResult.Changes...)
 	}
 
 	return moduleapi.Result{
@@ -130,6 +122,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:Proxy", name, res, opts...); err != nil {
 		return nil, err
 	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
 
 	serviceDirectory := "/etc/systemd/system/docker.service.d"
 	runtimeService := "docker.service"
@@ -138,8 +131,53 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		runtimeService = "containerd.service"
 	}
 
+	dropInDir := hostresource.DirectorySpec{Path: serviceDirectory, Mode: 0o755}
+	dropInDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dropin-dir", dropInDir, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
 	dropIns := pulumi.StringMap{}
 	bashExports := pulumi.StringMap{}
+	dropInResources := []pulumi.Resource{dropInDirRes}
+	for _, item := range []struct {
+		name    string
+		envName string
+		value   string
+		bashVar string
+	}{
+		{name: "http", envName: "HTTP_PROXY", value: cfg.Shared.HTTPProxy, bashVar: "http_proxy"},
+		{name: "https", envName: "HTTPS_PROXY", value: cfg.Shared.HTTPSProxy, bashVar: "https_proxy"},
+		{name: "no", envName: "NO_PROXY", value: cfg.Shared.NoProxy, bashVar: "no_proxy"},
+	} {
+		fileSpec := hostresource.FileSpec{Path: serviceDirectory + "/" + item.name + "_proxy.conf", Mode: 0o644, Absent: item.value == ""}
+		if item.value != "" {
+			fileSpec.Content = []byte(fmt.Sprintf("[Service]\nEnvironment=%s=%s\n", item.envName, item.value))
+		}
+		fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropInDirRes)
+		fileRes, err := hostsdk.RegisterFileSpec(ctx, name+"-"+item.name+"-dropin", fileSpec, fileOpts...)
+		if err != nil {
+			return nil, err
+		}
+		dropInResources = append(dropInResources, fileRes)
+		exportSpec := hostresource.ExportSpec{Path: "/root/.bashrc", VarName: item.bashVar, Value: item.value, Mode: 0o644}
+		if _, err := hostsdk.RegisterExportSpec(ctx, name+"-"+item.name+"-export", exportSpec, childOpts...); err != nil {
+			return nil, err
+		}
+	}
+
+	serviceResource := hostresource.SystemdServiceSpec{
+		Unit:            runtimeService,
+		DaemonReload:    true,
+		RestartOnChange: true,
+		RestartReason:   "proxy configuration changed",
+		RestartToken:    hostresource.BytesSHA256([]byte(strings.Join([]string{cfg.Shared.HTTPProxy, cfg.Shared.HTTPSProxy, cfg.Shared.NoProxy}, "\x00"))),
+	}
+	serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropInResources...)
+	if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-runtime-service", serviceResource, serviceOpts...); err != nil {
+		return nil, err
+	}
+
 	if cfg.Shared.HTTPProxy != "" {
 		dropIns["http_proxy.conf"] = pulumi.String(fmt.Sprintf("[Service]\nEnvironment=HTTP_PROXY=%s\n", cfg.Shared.HTTPProxy))
 		bashExports["http_proxy"] = pulumi.String(cfg.Shared.HTTPProxy)

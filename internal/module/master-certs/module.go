@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -34,13 +38,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	var changes []host.Change
 
 	certDir := "/etc/kubernetes/certs"
-	change, err := executor.EnsureDir(certDir, 0o550)
+	dirResult, err := (hostresource.DirectorySpec{Path: certDir, Mode: 0o550}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	// Build SANs list.
 	sans := buildMasterSANs(cfg)
@@ -140,13 +142,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		if err != nil {
 			return moduleapi.Result{}, fmt.Errorf("master-certificates: %w", err)
 		}
-		change, err := executor.EnsureFile(caCertPath, []byte(caPEM), 0o444)
+		fileResult, err := (hostresource.FileSpec{Path: caCertPath, Content: []byte(caPEM), Mode: 0o444}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 	}
 
 	// Generate and sign certificates in parallel, then write files in
@@ -169,41 +169,33 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		keyPath := fmt.Sprintf("%s/%s.key", certDir, spec.Name)
 		certPath := fmt.Sprintf("%s/%s.crt", certDir, spec.Name)
 
-		change, err := executor.EnsureFile(keyPath, []byte(signed.KeyPEM), 0o440)
+		keyResult, err := (hostresource.FileSpec{Path: keyPath, Content: []byte(signed.KeyPEM), Mode: 0o440}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, keyResult.Changes...)
 
-		change, err = executor.EnsureFile(certPath, []byte(signed.CertPEM), 0o444)
+		certResult, err := (hostresource.FileSpec{Path: certPath, Content: []byte(signed.CertPEM), Mode: 0o444}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, certResult.Changes...)
 	}
 
 	// Write service account keys.
 	if cfg.Shared.KubeServiceAccountKey != "" {
-		change, err := executor.EnsureFile(certDir+"/service_account.key", []byte(cfg.Shared.KubeServiceAccountKey+"\n"), 0o440)
+		fileResult, err := (hostresource.FileSpec{Path: certDir + "/service_account.key", Content: []byte(cfg.Shared.KubeServiceAccountKey + "\n"), Mode: 0o440}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 	}
 	if cfg.Shared.KubeServiceAccountPrivateKey != "" {
-		change, err := executor.EnsureFile(certDir+"/service_account_private.key", []byte(cfg.Shared.KubeServiceAccountPrivateKey+"\n"), 0o440)
+		fileResult, err := (hostresource.FileSpec{Path: certDir + "/service_account_private.key", Content: []byte(cfg.Shared.KubeServiceAccountPrivateKey + "\n"), Mode: 0o440}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 	}
 
 	// Create etcd and kube users/groups and set permissions.
@@ -225,23 +217,39 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		req.Logger.Infof("master-certificates: usermod kube (non-fatal): %v", err)
 	}
 	// chown MUST succeed — wrong permissions will break services.
-	if err := executor.Run("chown", "-R", "kube:kube_etcd", certDir); err != nil {
+	ownershipResult, err := (hostresource.OwnershipSpec{Path: certDir, Owner: "kube", Group: "kube_etcd", Recursive: true}).Apply(executor)
+	if err != nil {
 		return moduleapi.Result{}, fmt.Errorf("master-certificates: set cert dir ownership: %w", err)
 	}
+	changes = append(changes, ownershipResult.Changes...)
 
 	// Copy certs to etcd certs directory.
 	etcdCertDir := "/etc/etcd/certs"
-	change, err = executor.EnsureDir(etcdCertDir, 0o550)
+	etcdDirResult, err := (hostresource.DirectorySpec{Path: etcdCertDir, Mode: 0o550}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	changes = append(changes, etcdDirResult.Changes...)
+	for _, fileName := range etcdCopyFiles(cfg) {
+		sourcePath := certDir + "/" + fileName
+		info, statErr := os.Stat(sourcePath)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return moduleapi.Result{}, fmt.Errorf("master-certificates: stat source cert %s: %w", sourcePath, statErr)
+		}
+		copyResult, err := (hostresource.CopySpec{Source: sourcePath, Path: etcdCertDir + "/" + fileName, Mode: info.Mode().Perm()}).Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, fmt.Errorf("master-certificates: copy cert %s to etcd dir: %w", fileName, err)
+		}
+		changes = append(changes, copyResult.Changes...)
 	}
-	// cp MUST succeed — etcd needs its own copy of the cert material.
-	if err := executor.Run("cp", "-a", certDir+"/.", etcdCertDir+"/"); err != nil {
-		return moduleapi.Result{}, fmt.Errorf("master-certificates: copy certs to etcd dir: %w", err)
+	etcdOwnershipResult, err := (hostresource.OwnershipSpec{Path: etcdCertDir, Owner: "kube", Group: "kube_etcd", Recursive: true}).Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, fmt.Errorf("master-certificates: set etcd cert dir ownership: %w", err)
 	}
+	changes = append(changes, etcdOwnershipResult.Changes...)
 
 	// Any certificate material change requires consumers to reload it.
 	if len(changes) > 0 && req.Restarts != nil {
@@ -385,6 +393,76 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:MasterCertificates", name, res, opts...); err != nil {
 		return nil, err
 	}
+	if !cfg.Shared.TLSDisabled {
+		childOpts := hostresource.ChildResourceOptions(res, opts...)
+		kubeDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-kube-cert-dir", hostresource.DirectorySpec{Path: "/etc/kubernetes/certs", Mode: 0o550}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		etcdDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-etcd-cert-dir", hostresource.DirectorySpec{Path: "/etc/etcd/certs", Mode: 0o550}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		kubeFileResources := []pulumi.Resource{kubeDirRes}
+		sourceResources := map[string]pulumi.Resource{}
+		for _, path := range []string{
+			"/etc/kubernetes/certs/ca.crt",
+			"/etc/kubernetes/certs/server.key",
+			"/etc/kubernetes/certs/server.crt",
+			"/etc/kubernetes/certs/kubelet.key",
+			"/etc/kubernetes/certs/kubelet.crt",
+			"/etc/kubernetes/certs/admin.key",
+			"/etc/kubernetes/certs/admin.crt",
+			"/etc/kubernetes/certs/proxy.key",
+			"/etc/kubernetes/certs/proxy.crt",
+			"/etc/kubernetes/certs/controller.key",
+			"/etc/kubernetes/certs/controller.crt",
+			"/etc/kubernetes/certs/scheduler.key",
+			"/etc/kubernetes/certs/scheduler.crt",
+			"/etc/kubernetes/certs/service_account.key",
+			"/etc/kubernetes/certs/service_account_private.key",
+		} {
+			if data, err := os.ReadFile(path); err == nil {
+				mode := os.FileMode(0o444)
+				if strings.HasSuffix(path, ".key") {
+					mode = 0o440
+				}
+				fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, kubeDirRes)
+				fileRes, err := hostsdk.RegisterFileSpec(ctx, name+"-"+strings.ReplaceAll(strings.Trim(path, "/"), "/", "-"), hostresource.FileSpec{Path: path, Content: data, Mode: mode}, fileOpts...)
+				if err != nil {
+					return nil, err
+				}
+				kubeFileResources = append(kubeFileResources, fileRes)
+				sourceResources[filepath.Base(path)] = fileRes
+			}
+		}
+		ownershipOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, kubeFileResources...)
+		if _, err := hostsdk.RegisterOwnershipSpec(ctx, name+"-kube-cert-ownership", hostresource.OwnershipSpec{Path: "/etc/kubernetes/certs", Owner: "kube", Group: "kube_etcd", Recursive: true}, ownershipOpts...); err != nil {
+			return nil, err
+		}
+		etcdCopyResources := []pulumi.Resource{etcdDirRes}
+		for _, fileName := range etcdCopyFiles(cfg) {
+			sourcePath := "/etc/kubernetes/certs/" + fileName
+			mode := os.FileMode(0o444)
+			if strings.HasSuffix(fileName, ".key") {
+				mode = 0o440
+			}
+			deps := []pulumi.Resource{etcdDirRes}
+			if sourceRes, ok := sourceResources[fileName]; ok {
+				deps = append(deps, sourceRes)
+			}
+			copyOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, deps...)
+			copyRes, err := hostsdk.RegisterCopySpec(ctx, name+"-etcd-copy-"+strings.ReplaceAll(fileName, ".", "-"), hostresource.CopySpec{Source: sourcePath, Path: "/etc/etcd/certs/" + fileName, Mode: mode}, copyOpts...)
+			if err != nil {
+				return nil, err
+			}
+			etcdCopyResources = append(etcdCopyResources, copyRes)
+		}
+		etcdOwnershipOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, etcdCopyResources...)
+		if _, err := hostsdk.RegisterOwnershipSpec(ctx, name+"-etcd-cert-ownership", hostresource.OwnershipSpec{Path: "/etc/etcd/certs", Owner: "kube", Group: "kube_etcd", Recursive: true}, etcdOwnershipOpts...); err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"tlsDisabled": pulumi.Bool(cfg.Shared.TLSDisabled),
 		"clusterUuid": pulumi.String(cfg.Shared.ClusterUUID),
@@ -393,4 +471,29 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func etcdCopyFiles(cfg config.Config) []string {
+	files := []string{
+		"ca.crt",
+		"server.key",
+		"server.crt",
+		"kubelet.key",
+		"kubelet.crt",
+		"admin.key",
+		"admin.crt",
+		"proxy.key",
+		"proxy.crt",
+		"controller.key",
+		"controller.crt",
+		"scheduler.key",
+		"scheduler.crt",
+	}
+	if cfg.Shared.KubeServiceAccountKey != "" {
+		files = append(files, "service_account.key")
+	}
+	if cfg.Shared.KubeServiceAccountPrivateKey != "" {
+		files = append(files, "service_account_private.key")
+	}
+	return files
 }

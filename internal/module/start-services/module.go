@@ -9,8 +9,10 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -47,13 +49,14 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	// Only start services that aren't already running.
 	for _, svc := range serviceList {
 		if !executor.SystemctlIsActive(svc) {
-			if err := executor.Run("systemctl", "start", svc); err != nil {
+			result, err := (hostresource.SystemdServiceSpec{Unit: svc, Active: hostresource.BoolPtr(true)}).Apply(executor)
+			if err != nil {
 				return moduleapi.Result{}, fmt.Errorf("start %s: %w", svc, err)
 			}
 			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
 				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
 			}
-			changes = append(changes, host.Change{Action: host.ActionRestart, Summary: fmt.Sprintf("start %s", svc)})
+			changes = append(changes, result.Changes...)
 		}
 	}
 
@@ -96,19 +99,16 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Create uncordon service for reboot resilience.
 	uncordonService := buildUncordonService(cfg)
-	change, err := executor.EnsureFile("/etc/systemd/system/uncordon.service", []byte(uncordonService), 0o644)
+	change, err := (hostresource.FileSpec{Path: "/etc/systemd/system/uncordon.service", Content: []byte(uncordonService), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-		if err := executor.Run("systemctl", "daemon-reload"); err != nil {
-			return moduleapi.Result{}, err
-		}
-		if err := executor.Run("systemctl", "enable", "uncordon.service"); err != nil {
-			return moduleapi.Result{}, err
-		}
+	changes = append(changes, change.Changes...)
+	serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "uncordon.service", DaemonReload: change.Changed, Enabled: hostresource.BoolPtr(true)}).Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
+	changes = append(changes, serviceResult.Changes...)
 
 	return moduleapi.Result{
 		Changes: changes,
@@ -137,6 +137,15 @@ WantedBy=multi-user.target
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:StartServices", name, res, opts...); err != nil {
+		return nil, err
+	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
+	fileRes, err := hostsdk.RegisterFileSpec(ctx, name+"-uncordon-file", hostresource.FileSpec{Path: "/etc/systemd/system/uncordon.service", Content: []byte(buildUncordonService(heat.Cfg)), Mode: 0o644}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, fileRes)
+	if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-uncordon-service", hostresource.SystemdServiceSpec{Unit: "uncordon.service", Enabled: hostresource.BoolPtr(true)}, serviceOpts...); err != nil {
 		return nil, err
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{

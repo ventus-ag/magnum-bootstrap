@@ -286,6 +286,12 @@ func (e *Executor) SystemctlIsEnabled(unit string) bool {
 	return err == nil && strings.TrimSpace(out) == "enabled"
 }
 
+// SystemctlIsMasked returns true if the given unit is masked.
+func (e *Executor) SystemctlIsMasked(unit string) bool {
+	out, err := e.RunCapture("systemctl", "is-enabled", unit)
+	return err == nil && strings.TrimSpace(out) == "masked"
+}
+
 // WaitForSystemctlActive polls until the given unit becomes active or the
 // timeout expires.
 func (e *Executor) WaitForSystemctlActive(unit string, timeout, interval time.Duration) bool {

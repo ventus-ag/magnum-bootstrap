@@ -10,7 +10,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -33,21 +35,23 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	changes := make([]host.Change, 0)
 
-	change, err := executor.EnsureDir("/etc/kubernetes", 0o755)
+	dirResource := hostresource.DirectorySpec{Path: "/etc/kubernetes", Mode: 0o755}
+	dirResult, err := dirResource.Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
-	change, err = executor.EnsureCopy("/etc/pki/tls/certs/ca-bundle.crt", "/etc/kubernetes/ca-bundle.crt", 0o644)
+	caBundle := hostresource.CopySpec{
+		Source: "/etc/pki/tls/certs/ca-bundle.crt",
+		Path:   "/etc/kubernetes/ca-bundle.crt",
+		Mode:   0o644,
+	}
+	copyResult, err := caBundle.Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, copyResult.Changes...)
 
 	cloudConfig := buildCloudConfig(cfg)
 	occmConfig := buildOCCMConfig(cfg)
@@ -60,20 +64,18 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		{path: "/etc/kubernetes/kube_openstack_config", content: cloudConfig},
 		{path: "/etc/kubernetes/cloud-config-occm", content: occmConfig},
 	} {
-		var change *host.Change
+		fileSpec := hostresource.FileSpec{Path: file.path, Mode: 0o644, Absent: file.content == ""}
 		if file.content == "" {
-			change, err = executor.EnsureAbsent(file.path)
 		} else {
 			// These files are read from hostPath mounts by in-cluster pods such as
 			// cluster-autoscaler, so root-only permissions break them with EACCES.
-			change, err = executor.EnsureFile(file.path, []byte(file.content), 0o644)
+			fileSpec.Content = []byte(file.content)
 		}
+		fileResult, err := fileSpec.Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 	}
 
 	return moduleapi.Result{
@@ -106,9 +108,43 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:WriteKubeOSConfig", name, res, opts...); err != nil {
 		return nil, err
 	}
+	childOpts := append(opts, pulumi.Parent(res))
 
 	cloudConfig := buildCloudConfig(cfg)
 	occmConfig := buildOCCMConfig(cfg)
+
+	dirResource := hostresource.DirectorySpec{Path: "/etc/kubernetes", Mode: 0o755}
+	dirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir", dirResource, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+	caBundle := hostresource.CopySpec{
+		Source: "/etc/pki/tls/certs/ca-bundle.crt",
+		Path:   "/etc/kubernetes/ca-bundle.crt",
+		Mode:   0o644,
+	}
+	copyOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
+	if _, err := hostsdk.RegisterCopySpec(ctx, name+"-ca-bundle", caBundle, copyOpts...); err != nil {
+		return nil, err
+	}
+	for _, file := range []struct {
+		name    string
+		path    string
+		content string
+	}{
+		{name: "cloud-config", path: "/etc/kubernetes/cloud-config", content: cloudConfig},
+		{name: "kube-openstack-config", path: "/etc/kubernetes/kube_openstack_config", content: cloudConfig},
+		{name: "cloud-config-occm", path: "/etc/kubernetes/cloud-config-occm", content: occmConfig},
+	} {
+		fileSpec := hostresource.FileSpec{Path: file.path, Mode: 0o644, Absent: file.content == ""}
+		if file.content != "" {
+			fileSpec.Content = []byte(file.content)
+		}
+		fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-"+file.name, fileSpec, fileOpts...); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"cloudConfigPath": pulumi.String("/etc/kubernetes/cloud-config"),

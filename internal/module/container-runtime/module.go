@@ -10,7 +10,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 // containerdVersions maps Kubernetes minor version to the containerd version.
@@ -46,12 +48,12 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		changes = append(changes, cs...)
 		configChanged = changed
 	} else {
-		cs, err := reconcileDocker(cfg, executor)
+		cs, changed, err := reconcileDocker(cfg, executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, cs...)
-		configChanged = len(cs) > 0
+		configChanged = changed
 	}
 
 	// Signal restart only if the runtime config actually changed (not just
@@ -78,15 +80,18 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	var changes []host.Change
 	configChanged := false
 
-	// Stop, disable, and mask docker if it's running. Mask prevents
-	// socket-activation or dependency-based starts on subsequent boots,
-	// so this block only fires once.
-	if executor.SystemctlIsActive("docker") {
-		_ = executor.Run("systemctl", "stop", "docker")
-		_ = executor.Run("systemctl", "disable", "docker")
-		_ = executor.Run("systemctl", "mask", "docker")
-		_ = executor.Run("systemctl", "mask", "docker.socket")
-		changes = append(changes, host.Change{Action: host.ActionOther, Summary: "disable docker in favour of containerd"})
+	for _, unit := range []string{"docker", "docker.socket"} {
+		res, err := (hostresource.SystemdServiceSpec{
+			Unit:          unit,
+			SkipIfMissing: true,
+			Enabled:       hostresource.BoolPtr(false),
+			Active:        hostresource.BoolPtr(false),
+			Masked:        hostresource.BoolPtr(true),
+		}).Apply(executor)
+		if err != nil {
+			return nil, false, err
+		}
+		changes = append(changes, res.Changes...)
 	}
 
 	// Select containerd version by Kubernetes version.
@@ -127,30 +132,27 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	needsInstall := !versionOK
 
 	if needsInstall && executor.SystemctlIsActive("containerd") {
-		_ = executor.Run("systemctl", "stop", "containerd")
-		changes = append(changes, host.Change{
-			Action:  host.ActionOther,
-			Summary: fmt.Sprintf("stop old containerd (want %s)", containerdVersion),
-		})
+		res, err := (hostresource.SystemdServiceSpec{
+			Unit:          "containerd",
+			SkipIfMissing: true,
+			Active:        hostresource.BoolPtr(false),
+		}).Apply(executor)
+		if err != nil {
+			return nil, false, err
+		}
+		changes = append(changes, res.Changes...)
 	}
 
 	if versionOK {
 		// Already on the requested containerd version; skip download.
-	} else if !executor.Apply {
-		changes = append(changes, host.Change{
-			Action:  host.ActionReplace,
-			Path:    "/srv/magnum/containerd.tar.gz",
-			Summary: fmt.Sprintf("download containerd tarball from %s", tarballURL),
-		})
 	} else {
 		localPath := "/srv/magnum/containerd.tar.gz"
-		dl, err := executor.DownloadFileWithRetry(ctx, tarballURL, localPath, 0o644, 5)
+		download := hostresource.DownloadSpec{URL: tarballURL, Path: localPath, Mode: 0o644, Retries: 5}
+		dl, err := download.ApplyContext(ctx, executor)
 		if err != nil {
 			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
 		}
-		if dl.Change != nil {
-			changes = append(changes, *dl.Change)
-		}
+		changes = append(changes, dl.Changes...)
 		if useV2Layout {
 			// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
 			if err := executor.Run("tar", "xzf", localPath,
@@ -183,33 +185,27 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	// ostree systems, so we cannot replace the binary in-place.
 	if useV2Layout {
 		dropinDir := "/etc/systemd/system/containerd.service.d"
-		change, err := executor.EnsureDir(dropinDir, 0o755)
+		dirResult, err := (hostresource.DirectorySpec{Path: dropinDir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return nil, false, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, dirResult.Changes...)
 		dropin := "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\n"
-		change, err = executor.EnsureFile(dropinDir+"/10-exec-start.conf", []byte(dropin), 0o644)
+		fileResult, err := (hostresource.FileSpec{Path: dropinDir + "/10-exec-start.conf", Content: []byte(dropin), Mode: 0o644}).Apply(executor)
 		if err != nil {
 			return nil, false, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-			configChanged = true
-		}
+		changes = append(changes, fileResult.Changes...)
+		configChanged = configChanged || fileResult.Changed
 	}
 
 	// Ensure directories.
 	for _, dir := range []string{"/etc/containerd", "/etc/containerd/certs.d", "/opt/cni/bin"} {
-		change, err := executor.EnsureDir(dir, 0o755)
+		result, err := (hostresource.DirectorySpec{Path: dir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return nil, false, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
 	}
 
 	// Write containerd config.toml — EnsureFile is idempotent.
@@ -222,14 +218,12 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	} else {
 		configContent = containerdV2Config(pause)
 	}
-	change, err := executor.EnsureFile("/etc/containerd/config.toml", []byte(configContent), 0o644)
+	configResult, err := (hostresource.FileSpec{Path: "/etc/containerd/config.toml", Content: []byte(configContent), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return nil, false, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-		configChanged = true
-	}
+	changes = append(changes, configResult.Changes...)
+	configChanged = configChanged || configResult.Changed
 
 	// Write Docker Hub registry host config (containerd 2.x registry config_path).
 	if useV2Layout {
@@ -238,39 +232,30 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 [host."https://registry-1.docker.io"]
   capabilities = ["pull", "resolve"]
 `
-		change, err = executor.EnsureDir("/etc/containerd/certs.d/docker.io", 0o755)
+		dirResult, err := (hostresource.DirectorySpec{Path: "/etc/containerd/certs.d/docker.io", Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return nil, false, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
-		change, err = executor.EnsureFile("/etc/containerd/certs.d/docker.io/hosts.toml", []byte(dockerHubHost), 0o644)
+		changes = append(changes, dirResult.Changes...)
+		hostsResult, err := (hostresource.FileSpec{Path: "/etc/containerd/certs.d/docker.io/hosts.toml", Content: []byte(dockerHubHost), Mode: 0o644}).Apply(executor)
 		if err != nil {
 			return nil, false, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-			configChanged = true
-		}
+		changes = append(changes, hostsResult.Changes...)
+		configChanged = configChanged || hostsResult.Changed
 	}
 
-	// Daemon-reload when binaries or config changed.
-	if configChanged {
-		_ = executor.Run("systemctl", "daemon-reload")
+	serviceResult, err := (hostresource.SystemdServiceSpec{
+		Unit:          "containerd",
+		SkipIfMissing: true,
+		DaemonReload:  configChanged,
+		Enabled:       hostresource.BoolPtr(true),
+		Active:        hostresource.BoolPtr(true),
+	}).Apply(executor)
+	if err != nil {
+		return nil, false, err
 	}
-
-	// Enable + start. After a fresh install the service was stopped above,
-	// so this starts the correct binary. On idempotent runs where nothing
-	// changed, this is a no-op (already running).
-	_ = executor.Run("systemctl", "enable", "containerd")
-
-	if !executor.SystemctlIsActive("containerd") {
-		if err := executor.Run("systemctl", "start", "containerd"); err != nil {
-			return nil, false, err
-		}
-		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: fmt.Sprintf("start containerd %s", containerdVersion)})
-	}
+	changes = append(changes, serviceResult.Changes...)
 
 	return changes, configChanged, nil
 }
@@ -294,41 +279,54 @@ func containerdVersionMatches(executor *host.Executor, desiredVersion string) bo
 	return false
 }
 
-func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
+func reconcileDocker(cfg config.Config, executor *host.Executor) ([]host.Change, bool, error) {
 	var changes []host.Change
+	configChanged := false
 
 	cgroupDriver := cfg.ResolveCgroupDriver()
 
 	dropinDir := "/etc/systemd/system/docker.service.d"
-	change, err := executor.EnsureDir(dropinDir, 0o755)
+	dirResult, err := (hostresource.DirectorySpec{Path: dropinDir, Mode: 0o755}).Apply(executor)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	content := fmt.Sprintf("[Service]\nExecStart=\nExecStart=/usr/bin/dockerd --exec-opt native.cgroupdriver=%s\n", cgroupDriver)
-	change, err = executor.EnsureFile(dropinDir+"/cgroupdriver.conf", []byte(content), 0o644)
+	fileResult, err := (hostresource.FileSpec{Path: dropinDir + "/cgroupdriver.conf", Content: []byte(content), Mode: 0o644}).Apply(executor)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-		_ = executor.Run("systemctl", "daemon-reload")
+	changes = append(changes, fileResult.Changes...)
+	configChanged = fileResult.Changed
+
+	serviceResult, err := (hostresource.SystemdServiceSpec{
+		Unit:          "docker",
+		SkipIfMissing: true,
+		Masked:        hostresource.BoolPtr(false),
+		DaemonReload:  configChanged,
+		Enabled:       hostresource.BoolPtr(true),
+		Active:        hostresource.BoolPtr(true),
+	}).Apply(executor)
+	if err != nil {
+		return nil, false, err
 	}
+	changes = append(changes, serviceResult.Changes...)
 
-	_ = executor.Run("systemctl", "enable", "docker")
+	return changes, configChanged, nil
+}
 
-	// Detect drift: if docker should be running but isn't, start it.
-	if !executor.SystemctlIsActive("docker") {
-		if err := executor.Run("systemctl", "start", "docker"); err != nil {
-			return nil, err
-		}
-		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: "start docker (was not running)"})
+func containerdTarballURL(version string, useV2Layout bool) string {
+	if useV2Layout {
+		return fmt.Sprintf(
+			"https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz",
+			version, version,
+		)
 	}
-
-	return changes, nil
+	return fmt.Sprintf(
+		"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
+		version, version,
+	)
 }
 
 // pauseImage returns the appropriate pause container image for the given K8s version.
@@ -484,9 +482,104 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:ContainerRuntime", name, res, opts...); err != nil {
 		return nil, err
 	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
+
+	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
+	useV2Layout := false
+	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
+		useV2Layout = true
+	}
+
+	if cfg.Shared.ContainerRuntime == "containerd" {
+		var tarballRes pulumi.Resource
+		var serviceDeps []pulumi.Resource
+		var err error
+		for _, unit := range []string{"docker", "docker.socket"} {
+			if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-disable-"+strings.ReplaceAll(unit, ".", "-"), hostresource.SystemdServiceSpec{
+				Unit:          unit,
+				SkipIfMissing: true,
+				Enabled:       hostresource.BoolPtr(false),
+				Active:        hostresource.BoolPtr(false),
+				Masked:        hostresource.BoolPtr(true),
+			}, childOpts...); err != nil {
+				return nil, err
+			}
+		}
+		tarballRes, err = hostsdk.RegisterDownloadSpec(ctx, name+"-tarball", hostresource.DownloadSpec{URL: containerdTarballURL(containerdVersion, useV2Layout), Path: "/srv/magnum/containerd.tar.gz", Mode: 0o644, Retries: 5}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		serviceDeps = append(serviceDeps, tarballRes)
+		dirResources := map[string]pulumi.Resource{}
+		for _, dir := range []string{"/etc/containerd", "/etc/containerd/certs.d", "/opt/cni/bin"} {
+			resDir, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir-"+strings.ReplaceAll(strings.Trim(dir, "/"), "/", "-"), hostresource.DirectorySpec{Path: dir, Mode: 0o755}, childOpts...)
+			if err != nil {
+				return nil, err
+			}
+			dirResources[dir] = resDir
+		}
+		pause := pauseImage(cfg.Shared.KubeTag)
+		configContent := containerdV2Config(pause)
+		var configDeps []pulumi.Resource
+		configDeps = append(configDeps, dirResources["/etc/containerd"])
+		if useV2Layout {
+			configContent = containerdV3Config(pause)
+			dropinDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-containerd-dropin-dir", hostresource.DirectorySpec{Path: "/etc/systemd/system/containerd.service.d", Mode: 0o755}, childOpts...)
+			if err != nil {
+				return nil, err
+			}
+			dropinOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropinDirRes)
+			dropinRes, err := hostsdk.RegisterFileSpec(ctx, name+"-containerd-dropin", hostresource.FileSpec{Path: "/etc/systemd/system/containerd.service.d/10-exec-start.conf", Content: []byte("[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\n"), Mode: 0o644}, dropinOpts...)
+			if err != nil {
+				return nil, err
+			}
+			serviceDeps = append(serviceDeps, dropinRes)
+			dockerioDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dockerio-dir", hostresource.DirectorySpec{Path: "/etc/containerd/certs.d/docker.io", Mode: 0o755}, childOpts...)
+			if err != nil {
+				return nil, err
+			}
+			hostsOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dockerioDirRes)
+			hostsRes, err := hostsdk.RegisterFileSpec(ctx, name+"-dockerio-hosts", hostresource.FileSpec{Path: "/etc/containerd/certs.d/docker.io/hosts.toml", Content: []byte(`server = "https://registry-1.docker.io"
+
+[host."https://registry-1.docker.io"]
+  capabilities = ["pull", "resolve"]
+`), Mode: 0o644}, hostsOpts...)
+			if err != nil {
+				return nil, err
+			}
+			configDeps = append(configDeps, hostsRes)
+		}
+		configOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, configDeps...)
+		configRes, err := hostsdk.RegisterFileSpec(ctx, name+"-config", hostresource.FileSpec{Path: "/etc/containerd/config.toml", Content: []byte(configContent), Mode: 0o644}, configOpts...)
+		if err != nil {
+			return nil, err
+		}
+		serviceDeps = append(serviceDeps, configRes)
+		serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, serviceDeps...)
+		if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-service", hostresource.SystemdServiceSpec{Unit: "containerd", SkipIfMissing: true, Enabled: hostresource.BoolPtr(true), Active: hostresource.BoolPtr(true)}, serviceOpts...); err != nil {
+			return nil, err
+		}
+	} else {
+		dropinDir := "/etc/systemd/system/docker.service.d"
+		content := fmt.Sprintf("[Service]\nExecStart=\nExecStart=/usr/bin/dockerd --exec-opt native.cgroupdriver=%s\n", cfg.ResolveCgroupDriver())
+		dropinDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-docker-dropin-dir", hostresource.DirectorySpec{Path: dropinDir, Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		dropinOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropinDirRes)
+		dropinRes, err := hostsdk.RegisterFileSpec(ctx, name+"-docker-dropin", hostresource.FileSpec{Path: dropinDir + "/cgroupdriver.conf", Content: []byte(content), Mode: 0o644}, dropinOpts...)
+		if err != nil {
+			return nil, err
+		}
+		serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropinRes)
+		if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-docker-service", hostresource.SystemdServiceSpec{Unit: "docker", SkipIfMissing: true, Masked: hostresource.BoolPtr(false), Enabled: hostresource.BoolPtr(true), Active: hostresource.BoolPtr(true)}, serviceOpts...); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"containerRuntime":  pulumi.String(cfg.Shared.ContainerRuntime),
-		"containerdVersion": pulumi.String(config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)),
+		"containerdVersion": pulumi.String(containerdVersion),
 		"cgroupDriver":      pulumi.String(cfg.Shared.CgroupDriver),
 	}); err != nil {
 		return nil, err

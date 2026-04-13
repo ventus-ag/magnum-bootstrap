@@ -3,8 +3,12 @@ package kubemasterconfig
 import (
 	"fmt"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 func writeServiceFiles(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -13,30 +17,54 @@ func writeServiceFiles(cfg config.Config, executor *host.Executor) ([]host.Chang
 	}
 
 	var changes []host.Change
-	services := map[string]string{
-		"kube-apiserver":          apiServerService(cfg),
-		"kube-controller-manager": controllerManagerService(cfg),
-		"kube-scheduler":          schedulerService(cfg),
-		"kubelet":                 kubeletService(),
-		"kube-proxy":              kubeProxyService(cfg),
+	serviceFiles := []struct {
+		name    string
+		content string
+	}{
+		{name: "kube-apiserver", content: apiServerService(cfg)},
+		{name: "kube-controller-manager", content: controllerManagerService(cfg)},
+		{name: "kube-scheduler", content: schedulerService(cfg)},
+		{name: "kubelet", content: kubeletService()},
+		{name: "kube-proxy", content: kubeProxyService(cfg)},
 	}
 
-	for name, content := range services {
-		path := fmt.Sprintf("/etc/systemd/system/%s.service", name)
-		change, err := executor.EnsureFile(path, []byte(content), 0o644)
+	reloadNeeded := false
+	for _, service := range serviceFiles {
+		path := fmt.Sprintf("/etc/systemd/system/%s.service", service.name)
+		result, err := (hostresource.FileSpec{Path: path, Content: []byte(service.content), Mode: 0o644}).Apply(executor)
 		if err != nil {
 			return nil, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
+		reloadNeeded = reloadNeeded || result.Changed
 	}
 
-	if len(changes) > 0 {
+	if reloadNeeded {
 		_ = executor.Run("systemctl", "daemon-reload")
 	}
 
 	return changes, nil
+}
+
+func registerServiceFileResources(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) error {
+	if !cfg.Shared.UsePodman {
+		return nil
+	}
+	for _, service := range []struct {
+		name    string
+		content string
+	}{
+		{name: "kube-apiserver", content: apiServerService(cfg)},
+		{name: "kube-controller-manager", content: controllerManagerService(cfg)},
+		{name: "kube-scheduler", content: schedulerService(cfg)},
+		{name: "kubelet", content: kubeletService()},
+		{name: "kube-proxy", content: kubeProxyService(cfg)},
+	} {
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-"+service.name, hostresource.FileSpec{Path: fmt.Sprintf("/etc/systemd/system/%s.service", service.name), Content: []byte(service.content), Mode: 0o644}, opts...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func apiServerService(cfg config.Config) string {

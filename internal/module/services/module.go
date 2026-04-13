@@ -11,8 +11,10 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -48,34 +50,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	var serviceList []string
-	if cfg.Role() == config.RoleMaster {
-		runtimeService := "docker"
-		if cfg.Shared.ContainerRuntime == "containerd" {
-			runtimeService = "containerd"
-		}
-		serviceList = []string{
-			"etcd",
-			runtimeService,
-			"kube-apiserver",
-			"kube-controller-manager",
-			"kube-scheduler",
-			"kubelet",
-			"kube-proxy",
-		}
-	} else {
+	serviceList := desiredServices(cfg)
+	if cfg.Role() != config.RoleMaster {
 		// Stop docker before re-enabling (flannel subnet pickup). Matches bash.
 		if cfg.Shared.ContainerRuntime != "containerd" {
-			_ = executor.Run("systemctl", "stop", "docker")
-		}
-		runtimeService := "docker"
-		if cfg.Shared.ContainerRuntime == "containerd" {
-			runtimeService = "containerd"
-		}
-		serviceList = []string{
-			runtimeService,
-			"kubelet",
-			"kube-proxy",
+			result, err := (hostresource.SystemdServiceSpec{Unit: "docker", SkipIfMissing: true, Active: hostresource.BoolPtr(false)}).Apply(executor)
+			if err != nil {
+				return moduleapi.Result{}, err
+			}
+			changes = append(changes, result.Changes...)
 		}
 	}
 
@@ -87,7 +70,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			wg.Add(1)
 			go func(svc string) {
 				defer wg.Done()
-				if err := executor.Run("systemctl", "enable", svc); err != nil {
+				if _, err := (hostresource.SystemdServiceSpec{Unit: svc, Enabled: hostresource.BoolPtr(true)}).Apply(executor); err != nil {
 					errs <- fmt.Errorf("enable %s: %w", svc, err)
 				}
 			}(svc)
@@ -113,37 +96,33 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	startOrRestart := func(svc string) error {
 		needsRestart := req.Restarts != nil && req.Restarts.NeedsRestart(svc)
 		isActive := executor.SystemctlIsActive(svc)
+		reason := ""
+		if req.Restarts != nil {
+			if all := req.Restarts.All(); all[svc] != "" {
+				reason = all[svc]
+			}
+		}
 
 		switch {
 		case needsRestart:
-			if err := executor.Run("systemctl", "restart", svc); err != nil {
+			result, err := (hostresource.SystemdServiceSpec{Unit: svc, Restart: true, RestartReason: reason}).Apply(executor)
+			if err != nil {
 				return fmt.Errorf("restart %s: %w", svc, err)
 			}
-			reason := ""
-			if req.Restarts != nil {
-				if all := req.Restarts.All(); all[svc] != "" {
-					reason = " (" + all[svc] + ")"
-				}
-			}
 			mu.Lock()
-			changes = append(changes, host.Change{
-				Action:  host.ActionRestart,
-				Summary: fmt.Sprintf("restart %s%s", svc, reason),
-			})
+			changes = append(changes, result.Changes...)
 			mu.Unlock()
 			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
 				return fmt.Errorf("service %s did not become active after restart", svc)
 			}
 
 		case !isActive:
-			if err := executor.Run("systemctl", "start", svc); err != nil {
+			result, err := (hostresource.SystemdServiceSpec{Unit: svc, Active: hostresource.BoolPtr(true)}).Apply(executor)
+			if err != nil {
 				return fmt.Errorf("start %s: %w", svc, err)
 			}
 			mu.Lock()
-			changes = append(changes, host.Change{
-				Action:  host.ActionCreate,
-				Summary: fmt.Sprintf("start %s", svc),
-			})
+			changes = append(changes, result.Changes...)
 			mu.Unlock()
 			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
 				return fmt.Errorf("service %s did not become active after start", svc)
@@ -250,8 +229,7 @@ func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Reques
 			if req.Logger != nil {
 				req.Logger.Infof("services destroy: stopping %s", svc)
 			}
-			_ = executor.Run("systemctl", "stop", svc)
-			_ = executor.Run("systemctl", "disable", svc)
+			_, _ = (hostresource.SystemdServiceSpec{Unit: svc, SkipIfMissing: true, Active: hostresource.BoolPtr(false), Enabled: hostresource.BoolPtr(false)}).Apply(executor)
 		}(svc)
 	}
 	wg.Wait()
@@ -262,6 +240,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:Services", name, res, opts...); err != nil {
 		return nil, err
+	}
+	childOpts := append(opts, pulumi.Parent(res))
+	for _, svc := range desiredServices(heat.Cfg) {
+		if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-"+svc, hostresource.SystemdServiceSpec{Unit: svc, Enabled: hostresource.BoolPtr(true), Active: hostresource.BoolPtr(true)}, childOpts...); err != nil {
+			return nil, err
+		}
 	}
 	nodeRole := "master"
 	if kubeletconfig.KubeMinorAtLeast(heat.Cfg.Shared.KubeTag, 25) {
@@ -284,4 +268,23 @@ func serviceReadyTimeout(service string) time.Duration {
 	default:
 		return 30 * time.Second
 	}
+}
+
+func desiredServices(cfg config.Config) []string {
+	runtimeService := "docker"
+	if cfg.Shared.ContainerRuntime == "containerd" {
+		runtimeService = "containerd"
+	}
+	if cfg.Role() == config.RoleMaster {
+		return []string{
+			"etcd",
+			runtimeService,
+			"kube-apiserver",
+			"kube-controller-manager",
+			"kube-scheduler",
+			"kubelet",
+			"kube-proxy",
+		}
+	}
+	return []string{runtimeService, "kubelet", "kube-proxy"}
 }

@@ -13,7 +13,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 // etcdImageTags maps K8s minor version to the etcd image tag that kubeadm bundles.
@@ -190,34 +192,10 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	if volume == "" {
 		return nil, nil
 	}
-	prefix := volume
-	if len(prefix) > 20 {
-		prefix = prefix[:20]
-	}
-
-	// Wait for the device to appear, matching bash behavior:
-	// retry up to 60 times with udevadm trigger and 0.5s sleep.
 	devicePath := ""
-	for attempt := 0; attempt < 60; attempt++ {
-		_ = executor.Run("udevadm", "trigger")
-		entries, err := os.ReadDir("/dev/disk/by-id")
-		if err == nil {
-			for _, entry := range entries {
-				if strings.HasSuffix(entry.Name(), prefix) {
-					devicePath = "/dev/disk/by-id/" + entry.Name()
-					break
-				}
-			}
-		}
-		if devicePath != "" {
-			break
-		}
-		if executor.Apply {
-			time.Sleep(500 * time.Millisecond)
-		}
-	}
+	devicePath, err := findEtcdVolumeDevice(cfg, executor)
 	if devicePath == "" {
-		return nil, fmt.Errorf("etcd volume device with prefix %q never appeared in /dev/disk/by-id after 60 attempts", prefix)
+		return nil, fmt.Errorf("etcd volume device for volume %q never appeared in /dev/disk/by-id after 60 attempts", volume)
 	}
 
 	var changes []host.Change
@@ -231,21 +209,19 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 		}
 	}
 
-	change, err := executor.EnsureDir("/var/lib/etcd", 0o755)
+	dirResult, err := (hostresource.DirectorySpec{Path: "/var/lib/etcd", Mode: 0o755}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	fstabLine := fmt.Sprintf("%s /var/lib/etcd xfs defaults 0 0", devicePath)
-	change, err = executor.EnsureLine("/etc/fstab", fstabLine, 0o644)
+	lineResult, err := (hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	if lineResult.Changed {
+		changes = append(changes, lineResult.Changes...)
 		_ = executor.Run("mount", "-a")
 		_ = executor.Run("chown", "-R", "etcd.etcd", "/var/lib/etcd")
 		_ = executor.Run("chmod", "755", "/var/lib/etcd")
@@ -254,18 +230,64 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	return changes, nil
 }
 
+func findEtcdVolumeDevice(cfg config.Config, executor *host.Executor) (string, error) {
+	if cfg.Master == nil || cfg.Master.EtcdVolume == "" {
+		return "", nil
+	}
+	prefix := cfg.Master.EtcdVolume
+	if len(prefix) > 20 {
+		prefix = prefix[:20]
+	}
+	devicePath := ""
+	for attempt := 0; attempt < 60; attempt++ {
+		_ = executor.Run("udevadm", "trigger")
+		entries, err := os.ReadDir("/dev/disk/by-id")
+		if err == nil {
+			for _, entry := range entries {
+				if strings.HasSuffix(entry.Name(), prefix) {
+					devicePath = "/dev/disk/by-id/" + entry.Name()
+					break
+				}
+			}
+		}
+		if devicePath != "" {
+			return devicePath, nil
+		}
+		if executor.Apply {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return "", fmt.Errorf("etcd volume device with prefix %q never appeared in /dev/disk/by-id after 60 attempts", prefix)
+}
+
 func writeEtcdService(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	if !cfg.Shared.UsePodman {
 		return nil, nil
 	}
 
+	content := buildEtcdService(cfg)
+	fileResult, err := (hostresource.FileSpec{Path: "/etc/systemd/system/etcd.service", Content: []byte(content), Mode: 0o644}).Apply(executor)
+	if err != nil {
+		return nil, err
+	}
+	if fileResult.Changed {
+		serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true}).Apply(executor)
+		if err != nil {
+			return nil, err
+		}
+		return append(fileResult.Changes, serviceResult.Changes...), nil
+	}
+	return nil, nil
+}
+
+func buildEtcdService(cfg config.Config) string {
 	containerImage := cfg.Shared.ContainerInfraPrefix
 	if containerImage == "" {
 		containerImage = "registry.k8s.io/"
 	}
 	containerImage += "etcd"
 
-	content := fmt.Sprintf(`[Unit]
+	return fmt.Sprintf(`[Unit]
 Description=Etcd server
 After=network-online.target
 Wants=network-online.target
@@ -293,16 +315,6 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 `, containerImage, etcdTag(cfg))
-
-	change, err := executor.EnsureFile("/etc/systemd/system/etcd.service", []byte(content), 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if change != nil {
-		_ = executor.Run("systemctl", "daemon-reload")
-		return []host.Change{*change}, nil
-	}
-	return nil, nil
 }
 
 func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -333,16 +345,14 @@ func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, 
 		}}, nil
 	}
 
-	change, err := executor.EnsureDir(etcdDir, 0o755)
+	dirResult, err := (hostresource.DirectorySpec{Path: etcdDir, Mode: 0o755}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
 	var changes []host.Change
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
-	dl, err := executor.DownloadFileWithRetry(context.Background(), tgzURL, tgzPath, 0o644, 5)
+	dl, err := (hostresource.DownloadSpec{URL: tgzURL, Path: tgzPath, Mode: 0o644, Retries: 5}).ApplyWithResultContext(context.Background(), executor)
 	if err != nil {
 		return nil, fmt.Errorf("download etcdctl: %w", err)
 	}
@@ -586,39 +596,35 @@ func extractMasterIndex(memberLine string) int {
 }
 
 func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDir string, tlsDisabled bool, waitForEndpointHealth bool) ([]host.Change, error) {
-	change, err := executor.EnsureDir("/etc/etcd", 0o755)
+	dirResult, err := (hostresource.DirectorySpec{Path: "/etc/etcd", Mode: 0o755}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
 	var changes []host.Change
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
-	change, err = executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(config), 0o644)
+	fileResult, err := (hostresource.FileSpec{Path: "/etc/etcd/etcd.conf.yaml", Content: []byte(config), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
-	configChanged := change != nil
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	configChanged := fileResult.Changed
+	changes = append(changes, fileResult.Changes...)
 
 	started := false
 	if configChanged {
-		_ = executor.Run("systemctl", "daemon-reload")
-		if err := executor.Run("systemctl", "restart", "etcd"); err != nil {
+		serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true, Restart: true, RestartReason: "etcd config changed"}).Apply(executor)
+		if err != nil {
 			return nil, fmt.Errorf("restart etcd: %w", err)
 		}
-		changes = append(changes, host.Change{Action: host.ActionRestart, Summary: "restart etcd (config changed)"})
+		changes = append(changes, serviceResult.Changes...)
 		started = true
 	} else if !executor.SystemctlIsActive("etcd") {
 		// Drift: etcd should be running but isn't.
-		_ = executor.Run("systemctl", "daemon-reload")
-		if err := executor.Run("systemctl", "start", "etcd"); err != nil {
+		serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true, Active: hostresource.BoolPtr(true)}).Apply(executor)
+		if err != nil {
 			return nil, fmt.Errorf("start etcd: %w", err)
 		}
-		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: "start etcd (was not running)"})
+		changes = append(changes, serviceResult.Changes...)
 		started = true
 	}
 
@@ -669,11 +675,14 @@ func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, p
 
 	// Determine mode and rebuild.
 	content := string(data)
+	configChanged := false
 	if strings.Contains(content, "discovery:") {
 		conf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		if _, err := executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644); err != nil {
+		result, err := (hostresource.FileSpec{Path: "/etc/etcd/etcd.conf.yaml", Content: []byte(conf), Mode: 0o644}).Apply(executor)
+		if err != nil {
 			return fmt.Errorf("rebuild etcd config (discovery mode): %w", err)
 		}
+		configChanged = result.Changed
 	} else if strings.Contains(content, "initial-cluster:") {
 		// Extract initial-cluster value.
 		for _, line := range strings.Split(content, "\n") {
@@ -681,16 +690,19 @@ func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, p
 				ic := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "initial-cluster:"))
 				ic = strings.Trim(ic, "\"")
 				conf := buildConfig(cfg, nodeIP, protocol, "existing", ic)
-				if _, err := executor.EnsureFile("/etc/etcd/etcd.conf.yaml", []byte(conf), 0o644); err != nil {
+				result, err := (hostresource.FileSpec{Path: "/etc/etcd/etcd.conf.yaml", Content: []byte(conf), Mode: 0o644}).Apply(executor)
+				if err != nil {
 					return fmt.Errorf("rebuild etcd config (existing cluster mode): %w", err)
 				}
+				configChanged = result.Changed
 				break
 			}
 		}
 	}
 
-	_ = executor.Run("systemctl", "daemon-reload")
-	_ = executor.Run("systemctl", "restart", "etcd")
+	if configChanged {
+		_, _ = (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true, Restart: true, RestartReason: "rebuilt etcd config"}).Apply(executor)
+	}
 	return nil
 }
 
@@ -839,8 +851,7 @@ func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Reques
 	}
 
 	// Stop etcd service.
-	_ = executor.Run("systemctl", "stop", "etcd")
-	_ = executor.Run("systemctl", "disable", "etcd")
+	_, _ = (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, Active: hostresource.BoolPtr(false), Enabled: hostresource.BoolPtr(false)}).Apply(executor)
 
 	// Clean etcd data directory.
 	etcdDataDir := "/var/lib/etcd"
@@ -857,6 +868,51 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:Etcd", name, res, opts...); err != nil {
 		return nil, err
+	}
+	if cfg.Master != nil {
+		childOpts := hostresource.ChildResourceOptions(res, opts...)
+		executor := host.NewExecutor(false, nil)
+		if cfg.Master.EtcdVolumeSize > 0 {
+			dataDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-data-dir", hostresource.DirectorySpec{Path: "/var/lib/etcd", Mode: 0o755}, childOpts...)
+			if err != nil {
+				return nil, err
+			}
+			if devicePath, err := findEtcdVolumeDevice(cfg, executor); err == nil && devicePath != "" {
+				fstabLine := fmt.Sprintf("%s /var/lib/etcd xfs defaults 0 0", devicePath)
+				fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dataDirRes)
+				if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if cfg.Shared.UsePodman {
+			if _, err := hostsdk.RegisterFileSpec(ctx, name+"-service-file", hostresource.FileSpec{Path: "/etc/systemd/system/etcd.service", Content: []byte(buildEtcdService(cfg)), Mode: 0o644}, childOpts...); err != nil {
+				return nil, err
+			}
+		}
+		if etcdVersion := desiredEtcdctlVersion(cfg); etcdVersion != "" {
+			etcdDir := "/srv/magnum/etcd"
+			tgzURL := fmt.Sprintf("https://github.com/etcd-io/etcd/releases/download/v%s/etcd-v%s-linux-amd64.tar.gz", etcdVersion, etcdVersion)
+			tgzPath := fmt.Sprintf("%s/etcd-v%s-linux-amd64.tar.gz", etcdDir, etcdVersion)
+			etcdDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-etcdctl-dir", hostresource.DirectorySpec{Path: etcdDir, Mode: 0o755}, childOpts...)
+			if err != nil {
+				return nil, err
+			}
+			downloadOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, etcdDirRes)
+			if _, err := hostsdk.RegisterDownloadSpec(ctx, name+"-etcdctl-download", hostresource.DownloadSpec{URL: tgzURL, Path: tgzPath, Mode: 0o644, Retries: 5}, downloadOpts...); err != nil {
+				return nil, err
+			}
+		}
+		configDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-config-dir", hostresource.DirectorySpec{Path: "/etc/etcd", Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		if data, err := os.ReadFile("/etc/etcd/etcd.conf.yaml"); err == nil {
+			configOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, configDirRes)
+			if _, err := hostsdk.RegisterFileSpec(ctx, name+"-config-file", hostresource.FileSpec{Path: "/etc/etcd/etcd.conf.yaml", Content: data, Mode: 0o644}, configOpts...); err != nil {
+				return nil, err
+			}
+		}
 	}
 	outputs := pulumi.Map{
 		"role": pulumi.String(cfg.Role().String()),

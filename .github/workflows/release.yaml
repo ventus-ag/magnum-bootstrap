@@ -27,20 +27,21 @@ jobs:
 
       - name: Build binary
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.VERSION }}" \
-            -trimpath -o bootstrap ./cmd/bootstrap
+          make build VERSION=${{ steps.version.outputs.VERSION }} REPOSITORY=${{ github.repository }}
 
       - name: Generate checksums
         id: checksum
         run: |
-          sha256sum bootstrap > bootstrap.sha256
-          echo "SHA256=$(awk '{print $1}' bootstrap.sha256)" >> "$GITHUB_OUTPUT"
+          sha256sum dist/bootstrap > dist/bootstrap.sha256
+          sha256sum dist/pulumi-resource-magnumhost > dist/pulumi-resource-magnumhost.sha256
+          echo "BOOTSTRAP_SHA256=$(awk '{print $1}' dist/bootstrap.sha256)" >> "$GITHUB_OUTPUT"
+          echo "HOST_PROVIDER_SHA256=$(awk '{print $1}' dist/pulumi-resource-magnumhost.sha256)" >> "$GITHUB_OUTPUT"
 
       - name: Verify binary runs
         run: |
-          chmod +x bootstrap
-          ./bootstrap --help
+          chmod +x dist/bootstrap dist/pulumi-resource-magnumhost
+          ./dist/bootstrap --help
+          ./dist/pulumi-resource-magnumhost >/dev/null 2>&1 || true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -48,28 +49,49 @@ jobs:
           name: "${{ steps.version.outputs.VERSION }}"
           generate_release_notes: true
           files: |
-            bootstrap
-            bootstrap.sha256
+            dist/bootstrap
+            dist/bootstrap.sha256
+            dist/pulumi-resource-magnumhost
+            dist/pulumi-resource-magnumhost.sha256
           body: |
-            ## Reconciler Binary
+            ## Reconciler Artifacts
 
-            **Download:**
+            **Bootstrap download:**
             ```bash
             curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/bootstrap -o bootstrap
             chmod +x bootstrap
             ```
 
-            **SHA256:** `${{ steps.checksum.outputs.SHA256 }}`
+            **Bootstrap SHA256:** `${{ steps.checksum.outputs.BOOTSTRAP_SHA256 }}`
 
-            **Verify:**
+            **Host provider download:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/pulumi-resource-magnumhost -o pulumi-resource-magnumhost
+            chmod +x pulumi-resource-magnumhost
+            ```
+
+            **Host provider SHA256:** `${{ steps.checksum.outputs.HOST_PROVIDER_SHA256 }}`
+
+            **Verify bootstrap:**
             ```bash
             curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/bootstrap.sha256 -o bootstrap.sha256
             sha256sum -c bootstrap.sha256
             ```
 
+            **Verify host provider:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/pulumi-resource-magnumhost.sha256 -o pulumi-resource-magnumhost.sha256
+            sha256sum -c pulumi-resource-magnumhost.sha256
+            ```
+
+            **Default runtime behavior:**
+            `bootstrap` now defaults to downloading `pulumi-resource-magnumhost`
+            from the same GitHub release tag, so no extra provider env vars are
+            required for tagged release builds.
+
             **Heat params:**
             ```
             RECONCILER_VERSION="${{ steps.version.outputs.VERSION }}"
             RECONCILER_BINARY_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/bootstrap"
-            RECONCILER_BINARY_URL_SHA256="${{ steps.checksum.outputs.SHA256 }}"
+            RECONCILER_BINARY_URL_SHA256="${{ steps.checksum.outputs.BOOTSTRAP_SHA256 }}"
             ```

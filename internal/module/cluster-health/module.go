@@ -20,17 +20,7 @@ type Resource struct {
 
 func (Module) PhaseID() string { return "cluster-health" }
 func (Module) Dependencies() []string {
-	return []string{
-		"cluster-flannel",
-		"cluster-coredns",
-		"cluster-occm",
-		"cluster-cinder-csi",
-		"cluster-manila-csi",
-		"cluster-metrics-server",
-		"cluster-dashboard",
-		"cluster-auto-healer",
-		"cluster-autoscaler",
-	}
+	return monitoredAddonPhases()
 }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -169,10 +159,31 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:cluster:ClusterHealth", name, res, opts...); err != nil {
 		return nil, err
 	}
+	addonPhases := make(pulumi.StringArray, 0, len(monitoredAddonPhases()))
+	for _, phase := range monitoredAddonPhases() {
+		addonPhases = append(addonPhases, pulumi.String(phase))
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
-		"scope": pulumi.String("all-namespaces"),
+		"scope":              pulumi.String("all-namespaces"),
+		"monitoredAddons":    addonPhases,
+		"detectsCrashLoops":  pulumi.Bool(true),
+		"deletesPodsOnApply": pulumi.Bool(true),
 	}); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+func monitoredAddonPhases() []string {
+	return []string{
+		"cluster-flannel",
+		"cluster-coredns",
+		"cluster-occm",
+		"cluster-cinder-csi",
+		"cluster-manila-csi",
+		"cluster-metrics-server",
+		"cluster-dashboard",
+		"cluster-auto-healer",
+		"cluster-autoscaler",
+	}
 }

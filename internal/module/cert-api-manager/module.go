@@ -8,7 +8,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -17,7 +19,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "cert-api-manager" }
+func (Module) PhaseID() string        { return "cert-api-manager" }
 func (Module) Dependencies() []string { return []string{"master-certificates"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -29,23 +31,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	var changes []host.Change
 
 	certDir := "/etc/kubernetes/certs"
-	change, err := executor.EnsureDir(certDir, 0o550)
+	dirResult, err := (hostresource.DirectorySpec{Path: certDir, Mode: 0o550}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	// Write CA private key (only if it doesn't exist — matches bash idempotency).
 	caKeyPath := certDir + "/ca.key"
-	change, err = executor.EnsureFile(caKeyPath, []byte(cfg.Shared.CAKey+"\n"), 0o400)
+	fileResult, err := (hostresource.FileSpec{Path: caKeyPath, Content: []byte(cfg.Shared.CAKey + "\n"), Mode: 0o400}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, fileResult.Changes...)
 
 	return moduleapi.Result{
 		Changes: changes,
@@ -67,6 +65,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:CertApiManager", name, res, opts...); err != nil {
 		return nil, err
+	}
+	if heat.Cfg.Shared.CertManagerAPI {
+		childOpts := hostresource.ChildResourceOptions(res, opts...)
+		dirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-cert-dir", hostresource.DirectorySpec{Path: "/etc/kubernetes/certs", Mode: 0o550}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-ca-key", hostresource.FileSpec{Path: "/etc/kubernetes/certs/ca.key", Content: []byte(heat.Cfg.Shared.CAKey + "\n"), Mode: 0o400}, fileOpts...); err != nil {
+			return nil, err
+		}
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"certManagerApi": pulumi.Bool(heat.Cfg.Shared.CertManagerAPI),

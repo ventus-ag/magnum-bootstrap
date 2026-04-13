@@ -9,7 +9,9 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -18,7 +20,7 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string { return "registry" }
+func (Module) PhaseID() string        { return "registry" }
 func (Module) Dependencies() []string { return []string{"container-runtime"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
@@ -31,26 +33,26 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Write registry config.
 	registryConfig := buildRegistryConfig(cfg)
-	change, err := executor.EnsureFile("/etc/sysconfig/registry-config.yml", []byte(registryConfig), 0o644)
+	configResult, err := (hostresource.FileSpec{Path: "/etc/sysconfig/registry-config.yml", Content: []byte(registryConfig), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, configResult.Changes...)
 
 	// Write registry systemd unit.
 	serviceContent := buildRegistryService(cfg)
-	change, err = executor.EnsureFile("/etc/systemd/system/registry.service", []byte(serviceContent), 0o644)
+	serviceFileResult, err := (hostresource.FileSpec{Path: "/etc/systemd/system/registry.service", Content: []byte(serviceContent), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, serviceFileResult.Changes...)
 
-	if err := executor.Run("systemctl", "daemon-reload"); err != nil {
-		return moduleapi.Result{}, err
+	if configResult.Changed || serviceFileResult.Changed {
+		serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "registry.service", DaemonReload: true}).Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, serviceResult.Changes...)
 	}
 
 	return moduleapi.Result{
@@ -135,6 +137,15 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:Registry", name, res, opts...); err != nil {
 		return nil, err
+	}
+	if heat.Cfg.Worker != nil && heat.Cfg.Worker.RegistryEnabled {
+		childOpts := append(opts, pulumi.Parent(res))
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-config", hostresource.FileSpec{Path: "/etc/sysconfig/registry-config.yml", Content: []byte(buildRegistryConfig(heat.Cfg)), Mode: 0o644}, childOpts...); err != nil {
+			return nil, err
+		}
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-service-file", hostresource.FileSpec{Path: "/etc/systemd/system/registry.service", Content: []byte(buildRegistryService(heat.Cfg)), Mode: 0o644}, childOpts...); err != nil {
+			return nil, err
+		}
 	}
 	outputs := pulumi.Map{
 		"registryEnabled": pulumi.Bool(heat.Cfg.Worker != nil && heat.Cfg.Worker.RegistryEnabled),

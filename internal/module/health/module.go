@@ -12,6 +12,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/internal/paths"
 )
 
 type Module struct{}
@@ -237,12 +238,30 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:Health", name, res, opts...); err != nil {
 		return nil, err
 	}
+	healthReq := moduleapi.Request{Paths: paths.Paths{HeatParamsFile: "/etc/sysconfig/heat-params"}}
+	pathsList := requiredPaths(cfg, healthReq)
+	requiredPathsArray := make(pulumi.StringArray, 0, len(pathsList))
+	for _, path := range pathsList {
+		requiredPathsArray = append(requiredPathsArray, pulumi.String(path))
+	}
+	requiredServicesArray := make(pulumi.StringArray, 0, len(requiredServices(cfg)))
+	for _, service := range requiredServices(cfg) {
+		requiredServicesArray = append(requiredServicesArray, pulumi.String(service))
+	}
+	requiredMountsArray := make(pulumi.StringArray, 0, len(requiredMounts(cfg)))
+	for _, mount := range requiredMounts(cfg) {
+		requiredMountsArray = append(requiredMountsArray, pulumi.String(mount))
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"checks": pulumi.StringArray{
 			pulumi.String("role=" + cfg.Role().String()),
 			pulumi.String("operation=" + cfg.Operation().String()),
 			pulumi.String("instance=" + cfg.Shared.InstanceName),
 		},
+		"requiredPaths":     requiredPathsArray,
+		"requiredServices":  requiredServicesArray,
+		"requiredMounts":    requiredMountsArray,
+		"verifiesMasterAPI": pulumi.Bool(cfg.Role() == config.RoleMaster),
 	}); err != nil {
 		return nil, err
 	}

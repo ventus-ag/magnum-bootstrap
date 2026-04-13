@@ -10,9 +10,11 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -104,14 +106,11 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 		sysctlContent := `net.ipv4.conf.all.rp_filter = 1
 vm.max_map_count = 262144
 `
-		change, err := executor.EnsureFile("/etc/sysctl.d/calico.conf", []byte(sysctlContent), 0o644)
+		sysctlResult, err := (hostresource.SysctlSpec{Path: "/etc/sysctl.d/calico.conf", Content: []byte(sysctlContent), Mode: 0o644, ReloadArg: []string{"-p", "/etc/sysctl.d/calico.conf"}}).Apply(executor)
 		if err != nil {
 			return nil, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-			_ = executor.Run("sysctl", "-p", "/etc/sysctl.d/calico.conf")
-		}
+		changes = append(changes, sysctlResult.Changes...)
 
 		// If NetworkManager is active, tell it to ignore calico/tunl interfaces.
 		nmActive, _ := executor.RunCapture("systemctl", "is-active", "NetworkManager")
@@ -119,13 +118,11 @@ vm.max_map_count = 262144
 			nmConf := `[keyfile]
 unmanaged-devices=interface-name:cali*;interface-name:tunl*
 `
-			change, err = executor.EnsureFile("/etc/NetworkManager/conf.d/calico.conf", []byte(nmConf), 0o644)
+			fileResult, err := (hostresource.FileSpec{Path: "/etc/NetworkManager/conf.d/calico.conf", Content: []byte(nmConf), Mode: 0o644}).Apply(executor)
 			if err != nil {
 				return nil, err
 			}
-			if change != nil {
-				changes = append(changes, *change)
-			}
+			changes = append(changes, fileResult.Changes...)
 		}
 	}
 
@@ -135,12 +132,12 @@ unmanaged-devices=interface-name:cali*;interface-name:tunl*
 func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
 	var changes []host.Change
 
-	change, err := executor.EnsureDir("/etc/kubernetes/manifests", 0o755)
+	change, err := (hostresource.DirectorySpec{Path: "/etc/kubernetes/manifests", Mode: 0o755}).Apply(executor)
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	if change.Changed {
+		changes = append(changes, change.Changes...)
 	}
 
 	dnsClusterDomain := cfg.Shared.DNSClusterDomain
@@ -158,12 +155,12 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		FeatureGates:     kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag),
 	}
 
-	change, err = executor.EnsureFile("/etc/kubernetes/kubelet-config.yaml", []byte(kubecommon.RenderKubeletConfig(opts)), 0o644)
+	change, err = applyWorkerFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/kubelet-config.yaml", Content: []byte(kubecommon.RenderKubeletConfig(opts)), Mode: 0o644})
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	if change.Changed {
+		changes = append(changes, change.Changes...)
 	}
 
 	// Kubelet args.
@@ -173,12 +170,12 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 KUBELET_HOSTNAME="--hostname-override=%s"
 KUBELET_ARGS="%s"
 `, nodeIP, cfg.Shared.InstanceName, kubeletArgs)
-	change, err = executor.EnsureFile("/etc/kubernetes/kubelet.env", []byte(kubeletEnv), 0o644)
+	change, err = applyWorkerFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/kubelet.env", Content: []byte(kubeletEnv), Mode: 0o644})
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	if change.Changed {
+		changes = append(changes, change.Changes...)
 	}
 
 	return changes, nil
@@ -204,12 +201,12 @@ func configureDockerSysconfig(cfg config.Config, executor *host.Executor) ([]hos
 		content += fmt.Sprintf("INSECURE_REGISTRY=\"--insecure-registry %s\"\n", cfg.Shared.InsecureRegistryURL)
 	}
 
-	change, err := executor.EnsureFile("/etc/sysconfig/docker", []byte(content), 0o644)
+	change, err := applyWorkerFileResource(executor, hostresource.FileSpec{Path: "/etc/sysconfig/docker", Content: []byte(content), Mode: 0o644})
 	if err != nil {
 		return nil, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
+	if change.Changed {
+		changes = append(changes, change.Changes...)
 	}
 
 	return changes, nil
@@ -239,6 +236,30 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err := ctx.RegisterComponentResource("magnum:module:KubeWorkerConfig", name, res, opts...); err != nil {
 		return nil, err
 	}
+	childOpts := append(opts, pulumi.Parent(res))
+	if err := registerServiceFileResources(ctx, name+"-service-files", cfg, childOpts...); err != nil {
+		return nil, err
+	}
+	if err := registerKubeConfigResources(ctx, name+"-kubeconfigs", cfg, childOpts...); err != nil {
+		return nil, err
+	}
+	if err := registerKubeletConfigResources(ctx, name+"-kubelet", cfg, childOpts...); err != nil {
+		return nil, err
+	}
+	if err := registerNetworkResources(ctx, name+"-network", cfg, childOpts...); err != nil {
+		return nil, err
+	}
+	if err := registerDockerSysconfigResource(ctx, name+"-docker-sysconfig", cfg, childOpts...); err != nil {
+		return nil, err
+	}
+	if err := kubecommon.RegisterKubernetesSysctl(ctx, name+"-k8s-sysctl", childOpts...); err != nil {
+		return nil, err
+	}
+	if cfg.Shared.NetworkDriver == "flannel" {
+		if err := kubecommon.RegisterFlannelCNI(ctx, name+"-flannel-cni", childOpts...); err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"kubeTag":       pulumi.String(cfg.Shared.KubeTag),
 		"networkDriver": pulumi.String(cfg.Shared.NetworkDriver),
@@ -246,4 +267,68 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func registerKubeletConfigResources(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) error {
+	if _, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir-manifests", hostresource.DirectorySpec{Path: "/etc/kubernetes/manifests", Mode: 0o755}, opts...); err != nil {
+		return err
+	}
+	executor := host.NewExecutor(false, nil)
+	dnsClusterDomain := cfg.Shared.DNSClusterDomain
+	if dnsClusterDomain == "" {
+		dnsClusterDomain = "cluster.local"
+	}
+	optsCfg := kubecommon.KubeletConfigOpts{
+		CertDir:          "/etc/kubernetes/certs",
+		CgroupDriver:     cfg.ResolveCgroupDriver(),
+		DNSServiceIP:     cfg.Shared.DNSServiceIP,
+		DNSClusterDomain: dnsClusterDomain,
+		NodeIP:           cfg.ResolveNodeIP(),
+		InstanceID:       kubecommon.FetchInstanceID(executor),
+		FeatureGates:     kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag),
+	}
+	if _, err := hostsdk.RegisterFileSpec(ctx, name+"-config", hostresource.FileSpec{Path: "/etc/kubernetes/kubelet-config.yaml", Content: []byte(kubecommon.RenderKubeletConfig(optsCfg)), Mode: 0o644}, opts...); err != nil {
+		return err
+	}
+	kubeletEnv := fmt.Sprintf(`KUBELET_ADDRESS="--node-ip=%s"
+KUBELET_HOSTNAME="--hostname-override=%s"
+KUBELET_ARGS="%s"
+`, optsCfg.NodeIP, cfg.Shared.InstanceName, kubecommon.BuildKubeletArgs(cfg))
+	_, err := hostsdk.RegisterFileSpec(ctx, name+"-env", hostresource.FileSpec{Path: "/etc/kubernetes/kubelet.env", Content: []byte(kubeletEnv), Mode: 0o644}, opts...)
+	return err
+}
+
+func registerNetworkResources(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) error {
+	if cfg.Shared.NetworkDriver != "calico" {
+		return nil
+	}
+	if _, err := hostsdk.RegisterSysctlSpec(ctx, name+"-calico-sysctl", hostresource.SysctlSpec{Path: "/etc/sysctl.d/calico.conf", Content: []byte("net.ipv4.conf.all.rp_filter = 1\nvm.max_map_count = 262144\n"), Mode: 0o644, ReloadArg: []string{"-p", "/etc/sysctl.d/calico.conf"}}, opts...); err != nil {
+		return err
+	}
+	executor := host.NewExecutor(false, nil)
+	nmActive, _ := executor.RunCapture("systemctl", "is-active", "NetworkManager")
+	if strings.TrimSpace(nmActive) != "active" {
+		return nil
+	}
+	_, err := hostsdk.RegisterFileSpec(ctx, name+"-nm-config", hostresource.FileSpec{Path: "/etc/NetworkManager/conf.d/calico.conf", Content: []byte("[keyfile]\nunmanaged-devices=interface-name:cali*;interface-name:tunl*\n"), Mode: 0o644}, opts...)
+	return err
+}
+
+func registerDockerSysconfigResource(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) error {
+	if cfg.Shared.ContainerRuntime != "docker" {
+		return nil
+	}
+	if _, err := os.Stat("/etc/sysconfig/docker"); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	content := `OPTIONS="--log-driver=json-file --log-opt max-size=10m --log-opt max-file=5"
+`
+	if cfg.Shared.InsecureRegistryURL != "" {
+		content += fmt.Sprintf("INSECURE_REGISTRY=\"--insecure-registry %s\"\n", cfg.Shared.InsecureRegistryURL)
+	}
+	_, err := hostsdk.RegisterFileSpec(ctx, name, hostresource.FileSpec{Path: "/etc/sysconfig/docker", Content: []byte(content), Mode: 0o644}, opts...)
+	return err
 }

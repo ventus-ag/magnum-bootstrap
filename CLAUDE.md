@@ -58,8 +58,10 @@ bootstrap print-last-result # Print last result JSON
    each module decides internally whether to act)
 5. Recover interrupted runs (PID-based detection)
 6. Select or create Pulumi stack (select-first, upsert on 404):
-   - `stack.Refresh()` syncs Pulumi state with actual node state
-     (run-once: off, run-periodic/up: on; 2 retries, non-fatal on failure)
+   - `stack.Refresh()` syncs Pulumi state with Pulumi-managed resources
+     (mainly Kubernetes/Helm resources). Host-level drift in files/services is
+     still detected by module `Run()` logic on every execution. (run-once: off,
+     run-periodic/up: on; 2 retries, non-fatal on failure)
    - `stack.Preview()` (preview mode) or `stack.Up()` (apply mode)
    - Stale lock detection via `runWithAutoCancel()`
 7. Stream Pulumi engine events to terminal (colored, real-time)
@@ -88,10 +90,28 @@ Every module follows the desired-state pattern:
 - **Self-bootstrapping CLI**: `auto.InstallPulumiCommand()` on first run
 - **Local file backend**: `file:///var/lib/magnum/pulumi` (no cloud, no secrets)
 - **Stack naming**: `node-{sanitized-instance-name}`
+- **Pulumi resource model**: node-level phases are custom component resources
+  backed by imperative `Run()` logic; cluster-addon phases use native Pulumi
+  Kubernetes/Helm resources
+- **Host resource migration layer**: `internal/hostresource` centralizes common
+  host state shapes (directory, file, copy, export, line, download, systemd
+  service, module-load, sysctl, tar extract, mode, ownership). This is a transitional step toward a real
+  Pulumi host provider; today these resources improve structure and Pulumi state
+  visibility but do not yet provide independent `Read()`-based refresh of node
+  state.
+- **Provider-ready read/diff step**: core host resources (`directory`, `file`,
+  `line`, `systemd`, `mode`, `ownership`) now expose observed state and drift
+  reasons during `Register()`. This is still not a real Pulumi provider, but it
+  establishes the `Read`/drift contract that a provider plugin would need.
 - **DAG dependencies**: Each module declares `Dependencies()`. The program
   builder runs ready module `Run()` phases concurrently up to `--parallelism`
   and wires the same dependencies into Pulumi `DependsOn` edges. Failed modules
   still call `Register()` to keep the DAG intact for downstream phases.
+- **Hierarchy vs ordering**: `Parent(...)` is used for resource hierarchy and
+  grouping; it is not the primary ordering mechanism. Cross-phase ordering comes
+  from `DependsOn(...)`, and provider-ready sibling ordering now uses
+  `hostresource.ChildResourceOptionsWithDeps(...)` where intra-module sequence
+  matters (for example, unit file before systemd unit state).
 - **Stale lock recovery**: `runWithAutoCancel()` detects
   `IsConcurrentUpdateError`, extracts PID, verifies liveness, auto-cancels stale
   locks
@@ -134,6 +154,8 @@ type Module interface {
 
 ```
 cmd/bootstrap/main.go       Entry point
+cmd/pulumi-resource-magnumhost/main.go
+                          Real Pulumi host provider plugin entrypoint
 internal/
   app/app.go                CLI commands, orchestration wrapper
   config/
@@ -141,12 +163,13 @@ internal/
     heatparams.go           Heat-params KEY=VALUE parser
   display/output.go         ANSI colored terminal output, Pulumi event streaming
   host/ops.go               Idempotent host file/command primitives
+  hostresource/             Shared host resource specs used by Run()+Register()
   journal/run_state.go      Run lifecycle tracking (running/completed/failed/interrupted)
   logging/logger.go         Structured file + stderr logging
   magnum/client.go          Keystone auth, Magnum CA fetch, parallel CSR signing
   module/
     module.go               Type alias for moduleapi.Module
-    registry.go             Module registry (31 modules)
+    registry.go             Module registry (32 modules)
     prereq-validation/      Input validation checks
     container-runtime/      Docker/containerd install, config, drift detection
     client-tools/           kubectl/kubelet binary download & install
@@ -198,6 +221,23 @@ internal/
   reconcile/reconciler.go   Main reconcile orchestration, parallelism
   result/result.go          Result JSON, Heat signal text rendering
   state/state.go            Reconciler state persistence
+provider/
+  hostplugin/              In-repo Pulumi host provider package
+    provider.go            Provider builder and schema metadata
+    file_resource.go       Real custom resource: host file
+    directory_resource.go  Real custom resource: host directory
+    line_resource.go       Real custom resource: required line in file
+    export_resource.go     Real custom resource: shell export in file
+    copy_resource.go       Real custom resource: copied file
+    download_resource.go   Real custom resource: downloaded file
+    systemd_resource.go    Real custom resource: systemd unit state
+    mode_resource.go       Real custom resource: filesystem mode enforcement
+    ownership_resource.go  Real custom resource: filesystem ownership enforcement
+    sysctl_resource.go     Real custom resource: sysctl file + reload
+    moduleload_resource.go Real custom resource: module-load file + modprobe
+    extract_resource.go    Real custom resource: tar extraction workflow
+    common.go              Provider constants and helpers
+  hostsdk/                 Handwritten Go SDK wrapper for real host provider resources
 ```
 
 ## Phase Catalog
@@ -206,7 +246,7 @@ All operations (create, upgrade, resize, ca-rotate, periodic) use the **same
 unified phase list** per role.  Each module internally decides whether to act
 based on current vs desired state.
 
-### Master (28 phases)
+### Master (29 phases)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|
@@ -273,8 +313,69 @@ based on current vs desired state.
 
 ### Drift Detection
 - `--refresh` defaults to true for preview/up/run-periodic and false for run-once
+- Pulumi refresh reconciles Pulumi state for provider-managed resources; it does
+  not inspect host files or systemd units by itself
 - Services module detects crashed services via `SystemctlIsActive`
-- File modules detect content drift via SHA256 comparison
+- File modules detect content drift via content comparison or SHA256 checks
+
+### Hostresource Migration Status
+- Migrated modules: `proxy-env`, `zincati`, `kube-os-config`,
+  `container-runtime`, `client-tools`, `admin-kubeconfig`, `storage`,
+  `docker-registry`, `cert-api-manager`
+- Master/worker config modules now register shared host resources for kubelet
+  files, kubeconfigs, systemd unit files, Calico/Docker config tails, and
+  common network/sysctl helpers
+- Shared helpers migrated and registered from parent modules: `kubecommon`
+  sysctl and flannel CNI resources now appear in `kube-master-config` and
+  `kube-worker-config`
+- Service orchestration modules now use shared systemd/file resources for the
+  reusable state transitions (enable/start/restart/stop and `uncordon.service`),
+  while tiered ordering, readiness waits, drain/uncordon, and cleanup remain
+  imperative
+- `etcd-config` now routes low-risk file state through shared resources
+  (data dir, fstab line, service file, config dir/file, etcdctl download),
+  while membership, discovery, mount, and health orchestration remain imperative
+- `master-certificates` and `worker-certificates` now use shared resources for
+  low-risk certificate file and directory writes; `master-certificates` also
+  uses shared ownership and file-copy resources for the etcd cert handoff, while
+  user/group creation and signing workflows remain imperative
+- Remaining work: move more master/worker file+service operations into
+  `hostresource`, then replace the current transition layer with a real Pulumi
+  host provider if full native refresh/diff is required
+- Provider extraction next step: move the new observed-state/drift logic behind
+  provider-style CRUD/Read interfaces and package it as a real Pulumi plugin so
+  refresh can query host state directly instead of only via component outputs
+- Initial provider status: the in-repo `magnumhost` provider now exists as a
+  real plugin binary with custom resources for `File`, `Directory`, `Line`,
+  `Export`, `Copy`, `Download`, `SystemdService`, `Mode`, `Ownership`,
+  `Sysctl`, `ModuleLoad`, and `ExtractTar`.
+- Integration bridge status: `provider/hostsdk` now exposes typed constructors
+  plus `Register...Spec(...)` bridge helpers that choose the real provider when
+  enabled and fall back to legacy `hostresource.Register(...)` otherwise.
+- Provider distribution path: the provider can be supplied either via
+  `MAGNUM_HOST_PROVIDER_PATH` (ambient plugin binary) or
+  `MAGNUM_HOST_PROVIDER_URL` (downloaded by the reconciler into local Pulumi
+  state before preview/up/destroy). This fits publishing the provider binary in
+  the same GitHub release flow as the bootstrap binary.
+- Release-default behavior: tagged release builds now derive the provider URL
+  from the same GitHub release tag as `bootstrap`, so no provider env vars are
+  needed in the normal release path. `MAGNUM_USE_HOST_PROVIDER=false` disables
+  provider usage even when a default release URL is available.
+- Real-provider bridge usage: `cert-api-manager`, `zincati`, `proxy-env`,
+  `docker-registry`, `storage`, `services`, `start-services`,
+  `admin-kubeconfig`, `kube-os-config`, `client-tools`, `container-runtime`,
+  the low-risk registration path of `etcd-config`, plus the cert registration
+  paths in `master-certificates` and `worker-certificates`, now register
+  through the bridge layer, so enabling the provider flips those modules onto
+  real provider resources without additional module-specific wiring.
+- Bridge completion status: there are no direct `hostresource.Register(...)`
+  callsites left under `internal/`; all current hostresource-backed register
+  paths now flow through `provider/hostsdk` and can switch to real provider
+  resources via env-based enablement.
+- Remaining hybrid surface: `Run()` apply paths are still mostly imperative,
+  and operational workflow modules (health, cluster-health, CA rotation,
+  membership/join logic, drain/uncordon, storage mount/format, cert signing)
+  remain intentionally non-provider-managed.
 
 ### Migration from Bash
 - Cluster-addon K8s resources use `patchForce` annotation to adopt existing resources

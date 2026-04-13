@@ -4,11 +4,18 @@ Kubernetes node reconciliation engine for OpenStack Magnum. Replaces legacy bash
 
 ## Features
 
-- **31 native modules** covering full node lifecycle: create, upgrade, resize, CA rotation
+- **32 reconcile modules** covering full node lifecycle: create, upgrade, resize, CA rotation
 - **Unified phase plan** — same phases for all operations; each module decides internally whether to act
 - **Dependency-aware phase parallelism** — independent module phases run concurrently up to `--parallelism`
 - **Parallel certificate signing** — cert modules generate keys/CSRs and call Magnum signing concurrently, then write files deterministically
 - **Cluster-level addons** via Pulumi Kubernetes/Helm providers (Flannel, CoreDNS, OCCM, Cinder CSI, Manila CSI, metrics-server, autoscaler, auto-healer)
+- **Mixed Pulumi model** — host phases use imperative reconciliation plus Pulumi component tracking; cluster addons are native Pulumi Kubernetes/Helm resources
+- **Shared hostresource layer** — common host state shapes now live in reusable resource specs (`file`, `copy`, `line`, `download`, `systemd`, `sysctl`, `module-load`, `extract`, `mode`, `ownership`)
+- **Provider-ready hostresource core** — core resources now expose observed state and drift reasons during registration, which is the first step toward a real host provider with native `Read`/diff behavior
+- **In-repo real provider started** — `cmd/pulumi-resource-magnumhost` and `provider/hostplugin` now provide a real Pulumi provider binary for `File`, `Directory`, `Line`, `Export`, `Copy`, `Download`, `SystemdService`, `Mode`, `Ownership`, `Sysctl`, `ModuleLoad`, and `ExtractTar`
+- **Integration path started** — `provider/hostsdk` is a handwritten Go SDK wrapper plus `Register...Spec(...)` bridge layer for the real provider, and the reconciler can source the provider binary either from `MAGNUM_HOST_PROVIDER_PATH` or by downloading `MAGNUM_HOST_PROVIDER_URL` into local Pulumi state
+- **Release default** — tagged release builds of `bootstrap` now default to downloading `pulumi-resource-magnumhost` from the same GitHub release, so no provider env vars are required in the normal release path; `MAGNUM_USE_HOST_PROVIDER=false` disables that behavior if needed
+- **Dependency model** — use `Parent(...)` for hierarchy, `DependsOn(...)` for real ordering, and explicit sibling dependencies where provider-backed resources must not race under Pulumi parallelism
 - **Desired-state reconciliation** — idempotent, drift-detecting, change-driven restarts
 - **Crash recovery** — stale Pulumi lock detection, PID verification, auto-cancel
 - **Resilient refresh** — 2 retries, non-fatal on failure (K8s API may be down during rotation)
@@ -58,7 +65,7 @@ make build
 ```
 --diff                 Show diff-oriented output
 --allow-partial        Skip unimplemented modules, run only implemented ones
---refresh              Pulumi refresh to detect drift (default: true except run-once)
+--refresh              Pulumi refresh provider-managed resources before preview/up (default: true except run-once)
 --target-phase STRING  Execute only the specified phase
 --parallelism INT      Maximum phase/resource operations to run in parallel (default: 10)
 --debug                Enable Pulumi debug logging and verbose event output
@@ -94,7 +101,7 @@ admin-kubeconfig → stop-services → kube-master-config → storage → proxy-
 services → start-services → health → cluster-rbac → cluster-flannel →
 cluster-coredns → cluster-occm → cluster-cinder-csi → cluster-manila-csi →
 cluster-metrics-server → cluster-dashboard → cluster-auto-healer →
-cluster-autoscaler → cluster-health → zincati
+cluster-autoscaler → cluster-gpu-operator → cluster-health → zincati
 
 ### Worker Phases
 
@@ -145,7 +152,13 @@ result.Write() → Heat-compatible JSON
 
 Key design:
 - **RestartTracker** — config modules signal which services need restart; services module only restarts what changed
-- **Drift detection** — `--refresh` syncs Pulumi state; services module starts crashed services
+- **Drift detection** — `--refresh` syncs Pulumi state for provider-managed resources; host-level drift is detected by each module's own checks and by the services module
+- **Pulumi model** — host phases register custom component resources and do imperative convergence in `Run()`; cluster addons are native Pulumi Kubernetes/Helm resources
+- **Migration status** — `proxy-env`, `zincati`, `kube-os-config`, `container-runtime`, `client-tools`, `admin-kubeconfig`, `storage`, `docker-registry`, and `cert-api-manager` are partially migrated to the shared `hostresource` layer; master/worker modules now also register kubelet files, kubeconfigs, unit files, Calico/Docker config tails, and kubecommon sysctl/flannel resources through shared host resources
+- **Provider bridge status** — all current hostresource-backed `Register()` callsites now go through the provider bridge, so enabling the host provider moves those modules onto real provider-backed resources without more module rewrites
+- **Hybrid boundary** — `Register()` is now provider-ready across the hostresource-backed path, but `Run()` and operational workflow phases still remain intentionally imperative where they model runtime orchestration rather than durable resource state
+- **Etcd/cert migration status** — `etcd-config` now routes low-risk file state through shared resources (dir/line/file/download) while join/rejoin/mount orchestration remains imperative; `cert-api-manager`, `master-certificates`, and `worker-certificates` now use shared resources for cert file state, and `master-certificates` also routes etcd cert copy plus ownership/permission state through shared resources while signing and user/group flows remain imperative
+- **Service migration status** — `services`, `start-services`, and parts of `stop-services` now use shared systemd/file resources for reusable service state, while tiered startup, readiness checks, drain/uncordon, and podman cleanup remain imperative
 - **Migration** — `patchForce` annotation adopts existing K8s resources; Helm releases auto-adopted from bash
 - **Idempotent** — second run with same config = zero changes
 - **Error handling** — critical ops (cert copy, config write) fail hard; expected failures (useradd, etcd quorum) log and continue
@@ -160,10 +173,11 @@ internal/
   config/               heat-params parser, Config types, ResolveNodeIP
   display/              Colored terminal output, Pulumi event streaming
   host/                 Idempotent file/command primitives (EnsureFile, Run, etc.)
+  hostresource/         Shared host resource specs bridging imperative ops to Pulumi state
   journal/              Run state tracking, crash recovery
   logging/              Structured logger with auto-trim at 100MB
   magnum/               Keystone auth, Magnum CA fetch, parallel CSR signing
-  module/               31 reconcile modules (see CLAUDE.md for details)
+  module/               32 reconcile modules (see CLAUDE.md for details)
     kubecommon/          Shared: CNI plugins, sysctl, kubeconfig builders, kubelet config
   moduleapi/            Module interface, RestartTracker, HeatParamsComponent
   paths/                Runtime path resolution from environment

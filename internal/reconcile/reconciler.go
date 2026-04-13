@@ -19,6 +19,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optup"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 
+	"github.com/ventus-ag/magnum-bootstrap/internal/buildinfo"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
@@ -30,6 +31,7 @@ import (
 	pulumipkg "github.com/ventus-ag/magnum-bootstrap/internal/pulumi"
 	"github.com/ventus-ag/magnum-bootstrap/internal/result"
 	"github.com/ventus-ag/magnum-bootstrap/internal/state"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 // Run executes a reconcile run using the Pulumi Automation API.
@@ -77,10 +79,18 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		return result.Result{}, state.State{}, fmt.Errorf("failed to install pulumi cli: %w", err)
 	}
 
+	hostProviderDir, err := ensureHostProviderPlugin(ctx, runtimePaths, req.Logger)
+	if err != nil {
+		return result.Result{}, state.State{}, err
+	}
+
 	// Use the local file backend with an empty passphrase — no cloud auth and
 	// no password required. Our stack carries no secrets so no encryption is needed.
 	envVars := map[string]string{
 		"PULUMI_CONFIG_PASSPHRASE": "",
+	}
+	if hostProviderDir != "" {
+		envVars["PATH"] = hostProviderDir + string(os.PathListSeparator) + os.Getenv("PATH")
 	}
 	if runtimePaths.PulumiBackend != "" {
 		envVars["PULUMI_BACKEND_URL"] = runtimePaths.PulumiBackend
@@ -359,8 +369,16 @@ func Destroy(ctx context.Context, cfg config.Config, runtimePaths paths.Paths, r
 		return result.Result{}, fmt.Errorf("failed to install pulumi cli: %w", err)
 	}
 
+	hostProviderDir, err := ensureHostProviderPlugin(ctx, runtimePaths, req.Logger)
+	if err != nil {
+		return result.Result{}, err
+	}
+
 	envVars := map[string]string{
 		"PULUMI_CONFIG_PASSPHRASE": "",
+	}
+	if hostProviderDir != "" {
+		envVars["PATH"] = hostProviderDir + string(os.PathListSeparator) + os.Getenv("PATH")
 	}
 	if runtimePaths.PulumiBackend != "" {
 		envVars["PULUMI_BACKEND_URL"] = runtimePaths.PulumiBackend
@@ -452,6 +470,26 @@ func Destroy(ctx context.Context, cfg config.Config, runtimePaths paths.Paths, r
 		PulumiSummary: pulumiSummary,
 		Warnings:      warnings,
 	}, nil
+}
+
+func ensureHostProviderPlugin(ctx context.Context, runtimePaths paths.Paths, logger *logging.Logger) (string, error) {
+	if providerDir := hostsdk.ProviderDir(); providerDir != "" {
+		return providerDir, nil
+	}
+	providerURL := hostsdk.ProviderURL()
+	if providerURL == "" {
+		return "", nil
+	}
+	pluginDir := filepath.Join(runtimePaths.PulumiStateDir, "providers")
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create host provider dir: %w", err)
+	}
+	pluginPath := filepath.Join(pluginDir, buildinfo.HostProviderAsset)
+	executor := host.NewExecutor(true, logger)
+	if _, err := executor.DownloadFileWithRetry(ctx, providerURL, pluginPath, 0o755, 3); err != nil {
+		return "", fmt.Errorf("failed to download magnumhost provider: %w", err)
+	}
+	return pluginDir, nil
 }
 
 func buildSuccessResult(mode string, _ bool, cfg config.Config, _ paths.Paths, reconcilePlan plan.Plan, phaseChanges []string, changeLog []host.Change, warnings []string, _ map[string]string, missing []string) result.Result {

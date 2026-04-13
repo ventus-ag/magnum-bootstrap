@@ -5,13 +5,16 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -39,13 +42,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes := make([]host.Change, 0)
 
 	for _, dir := range []string{"/etc/kubernetes", "/root/.kube"} {
-		change, err := executor.EnsureDir(dir, 0o755)
+		result, err := (hostresource.DirectorySpec{Path: dir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
 	}
 
 	for _, file := range []struct {
@@ -56,13 +57,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		{path: "/etc/kubernetes/admin.conf", content: content, mode: 0o644},
 		{path: "/root/.kube/config", content: content, mode: 0o600},
 	} {
-		change, err := executor.EnsureFile(file.path, []byte(file.content), file.mode)
+		result, err := (hostresource.FileSpec{Path: file.path, Content: []byte(file.content), Mode: file.mode}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, result.Changes...)
 	}
 
 	// Copy kubeconfig to non-root user home directories so operators can
@@ -73,30 +72,24 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			continue
 		}
 		kubeDir := homeDir + "/.kube"
-		change, err := executor.EnsureDir(kubeDir, 0o755)
+		dirResult, err := (hostresource.DirectorySpec{Path: kubeDir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
-		change, err = executor.EnsureFile(kubeDir+"/config", []byte(content), 0o600)
+		changes = append(changes, dirResult.Changes...)
+		fileResult, err := (hostresource.FileSpec{Path: kubeDir + "/config", Content: []byte(content), Mode: 0o600}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 		_ = executor.Run("chown", "-R", user+":"+user, kubeDir)
 	}
 
-	change, err := executor.UpsertExport("/etc/bashrc", "KUBECONFIG", "/etc/kubernetes/admin.conf", 0o644)
+	exportResult, err := (hostresource.ExportSpec{Path: "/etc/bashrc", VarName: "KUBECONFIG", Value: "/etc/kubernetes/admin.conf", Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, exportResult.Changes...)
 
 	return moduleapi.Result{
 		Changes: changes,
@@ -131,6 +124,53 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	content, err := buildContent(cfg)
 	if err != nil {
+		return nil, err
+	}
+	childOpts := hostresource.ChildResourceOptions(res, opts...)
+	dirResources := map[string]pulumi.Resource{}
+	var adminConfRes pulumi.Resource
+	for _, dir := range []string{"/etc/kubernetes", "/root/.kube"} {
+		resDir, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir-"+strings.ReplaceAll(strings.Trim(dir, "/"), "/", "-"), hostresource.DirectorySpec{Path: dir, Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		dirResources[dir] = resDir
+	}
+	for _, file := range []struct {
+		name string
+		path string
+		mode os.FileMode
+	}{
+		{name: "admin-conf", path: "/etc/kubernetes/admin.conf", mode: 0o644},
+		{name: "root-kubeconfig", path: "/root/.kube/config", mode: 0o600},
+	} {
+		parentDir := filepath.Dir(file.path)
+		fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirResources[parentDir])
+		fileRes, err := hostsdk.RegisterFileSpec(ctx, name+"-"+file.name, hostresource.FileSpec{Path: file.path, Content: []byte(content), Mode: file.mode}, fileOpts...)
+		if err != nil {
+			return nil, err
+		}
+		if file.name == "admin-conf" {
+			adminConfRes = fileRes
+		}
+	}
+	for _, user := range []string{"core", "ubuntu"} {
+		homeDir := "/home/" + user
+		if _, err := os.Stat(homeDir); err != nil {
+			continue
+		}
+		kubeDir := homeDir + "/.kube"
+		userDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-"+user+"-dir", hostresource.DirectorySpec{Path: kubeDir, Mode: 0o755}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		userFileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, userDirRes, adminConfRes)
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-"+user+"-config", hostresource.FileSpec{Path: kubeDir + "/config", Content: []byte(content), Mode: 0o600}, userFileOpts...); err != nil {
+			return nil, err
+		}
+	}
+	exportOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, adminConfRes)
+	if _, err := hostsdk.RegisterExportSpec(ctx, name+"-bashrc-export", hostresource.ExportSpec{Path: "/etc/bashrc", VarName: "KUBECONFIG", Value: "/etc/kubernetes/admin.conf", Mode: 0o644}, exportOpts...); err != nil {
 		return nil, err
 	}
 

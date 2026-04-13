@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
+	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
 type Module struct{}
@@ -34,13 +37,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	var changes []host.Change
 
 	certDir := "/etc/kubernetes/certs"
-	change, err := executor.EnsureDir(certDir, 0o550)
+	dirResult, err := (hostresource.DirectorySpec{Path: certDir, Mode: 0o550}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	if change != nil {
-		changes = append(changes, *change)
-	}
+	changes = append(changes, dirResult.Changes...)
 
 	// Build SANs for worker node — fall back to metadata service.
 	nodeIP := cfg.ResolveNodeIP()
@@ -119,13 +120,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		if err != nil {
 			return moduleapi.Result{}, fmt.Errorf("worker-certificates: %w", err)
 		}
-		change, err = executor.EnsureFile(caCertPath, []byte(caPEM), 0o444)
+		fileResult, err := (hostresource.FileSpec{Path: caCertPath, Content: []byte(caPEM), Mode: 0o444}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, fileResult.Changes...)
 	}
 
 	// Generate and sign certificates in parallel, then write files in
@@ -148,32 +147,30 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		keyPath := fmt.Sprintf("%s/%s.key", certDir, spec.Name)
 		certPath := fmt.Sprintf("%s/%s.crt", certDir, spec.Name)
 
-		change, err := executor.EnsureFile(keyPath, []byte(signed.KeyPEM), 0o440)
+		keyResult, err := (hostresource.FileSpec{Path: keyPath, Content: []byte(signed.KeyPEM), Mode: 0o440}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, keyResult.Changes...)
 
-		change, err = executor.EnsureFile(certPath, []byte(signed.CertPEM), 0o444)
+		certResult, err := (hostresource.FileSpec{Path: certPath, Content: []byte(signed.CertPEM), Mode: 0o444}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
-		if change != nil {
-			changes = append(changes, *change)
-		}
+		changes = append(changes, certResult.Changes...)
 	}
 
 	// Set permissions — chmod MUST succeed, kubelet cannot read certs without correct perms.
-	if err := executor.Run("chmod", "550", certDir); err != nil {
-		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod cert dir: %w", err)
-	}
-	if err := executor.Run("chmod", "440", certDir+"/kubelet.key"); err != nil {
-		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod kubelet key: %w", err)
-	}
-	if err := executor.Run("chmod", "440", certDir+"/proxy.key"); err != nil {
-		return moduleapi.Result{}, fmt.Errorf("worker-certificates: chmod proxy key: %w", err)
+	for _, modeSpec := range []hostresource.ModeSpec{
+		{Path: certDir, Mode: 0o550},
+		{Path: certDir + "/kubelet.key", Mode: 0o440, SkipIfMissing: true},
+		{Path: certDir + "/proxy.key", Mode: 0o440, SkipIfMissing: true},
+	} {
+		result, err := modeSpec.Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, fmt.Errorf("worker-certificates: apply mode on %s: %w", modeSpec.Path, err)
+		}
+		changes = append(changes, result.Changes...)
 	}
 
 	// Kubelet and kube-proxy must reload certificate changes on workers.
@@ -240,6 +237,38 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:module:WorkerCertificates", name, res, opts...); err != nil {
 		return nil, err
+	}
+	if !cfg.Shared.TLSDisabled {
+		childOpts := hostresource.ChildResourceOptions(res, opts...)
+		certDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-cert-dir", hostresource.DirectorySpec{Path: "/etc/kubernetes/certs", Mode: 0o550}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		fileDeps := []pulumi.Resource{certDirRes}
+		for _, path := range []string{"/etc/kubernetes/certs/ca.crt", "/etc/kubernetes/certs/kubelet.key", "/etc/kubernetes/certs/kubelet.crt", "/etc/kubernetes/certs/proxy.key", "/etc/kubernetes/certs/proxy.crt"} {
+			if data, err := os.ReadFile(path); err == nil {
+				mode := os.FileMode(0o444)
+				if strings.HasSuffix(path, ".key") {
+					mode = 0o440
+				}
+				fileOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, certDirRes)
+				fileRes, err := hostsdk.RegisterFileSpec(ctx, name+"-"+strings.ReplaceAll(strings.Trim(path, "/"), "/", "-"), hostresource.FileSpec{Path: path, Content: data, Mode: mode}, fileOpts...)
+				if err != nil {
+					return nil, err
+				}
+				fileDeps = append(fileDeps, fileRes)
+			}
+		}
+		for _, modeSpec := range []hostresource.ModeSpec{
+			{Path: "/etc/kubernetes/certs", Mode: 0o550},
+			{Path: "/etc/kubernetes/certs/kubelet.key", Mode: 0o440, SkipIfMissing: true},
+			{Path: "/etc/kubernetes/certs/proxy.key", Mode: 0o440, SkipIfMissing: true},
+		} {
+			modeOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, fileDeps...)
+			if _, err := hostsdk.RegisterModeSpec(ctx, name+"-mode-"+strings.ReplaceAll(strings.Trim(modeSpec.Path, "/"), "/", "-"), modeSpec, modeOpts...); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"tlsDisabled": pulumi.Bool(cfg.Shared.TLSDisabled),
