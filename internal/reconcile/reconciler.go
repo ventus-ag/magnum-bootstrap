@@ -330,6 +330,8 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
 				cfg.StackName(), formatDuration(time.Since(start)), formatUpdateChangeSummary(upRes.Summary.ResourceChanges))
 		}
+		clusterhelm.PromoteManagedReleases()
+		clusterhelm.ClearAllForceUpdateMarkers()
 		pulumiSummaryText = formatUpdateSummaryLine(upRes.Summary.ResourceChanges)
 
 	default:

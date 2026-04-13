@@ -1,6 +1,9 @@
 package clusterhelm
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestParseHelmReleasePair(t *testing.T) {
 	tests := []struct {
@@ -53,4 +56,34 @@ func TestHasHelmNameReuseConflict(t *testing.T) {
 	if HasHelmNameReuseConflict("diag: update failed") {
 		t.Fatal("expected unrelated error to be ignored")
 	}
+}
+
+func TestPromoteManagedReleasesMarksAdopted(t *testing.T) {
+	oldRoot := helmMarkerRootDir
+	helmMarkerRootDir = t.TempDir()
+	defer func() { helmMarkerRootDir = oldRoot }()
+
+	cleanup := []string{
+		managedMarkerPath("kube-flannel", "flannel"),
+		adoptedMarkerPath("kube-flannel", "flannel"),
+	}
+	for _, path := range cleanup {
+		defer func(path string) {
+			_ = removeIfExists(path)
+		}(path)
+	}
+
+	MarkManaged("flannel", "kube-flannel")
+	PromoteManagedReleases()
+
+	if _, err := os.Stat(adoptedMarkerPath("kube-flannel", "flannel")); err != nil {
+		t.Fatalf("expected adopted marker after promoting managed release: %v", err)
+	}
+}
+
+func removeIfExists(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	return os.Remove(path)
 }

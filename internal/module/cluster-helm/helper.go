@@ -16,6 +16,8 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
+var helmMarkerRootDir = "/var/lib/magnum"
+
 // SkipResult returns an empty result for modules that should not run
 // (e.g., not master-0, or feature disabled).
 func SkipResult() (moduleapi.Result, error) {
@@ -41,17 +43,24 @@ func RunNoop(_ context.Context, cfg config.Config, req moduleapi.Request, featur
 
 // adoptedMarkerPath returns the path for the "already adopted" marker file.
 func adoptedMarkerPath(namespace, releaseName string) string {
-	return fmt.Sprintf("/var/lib/magnum/helm-adopted-%s-%s", namespace, releaseName)
+	return filepath.Join(helmMarkerRootDir, fmt.Sprintf("helm-adopted-%s-%s", namespace, releaseName))
 }
 
 // importMarkerPath returns the path for the "needs import" marker file.
 func importMarkerPath(namespace, releaseName string) string {
-	return fmt.Sprintf("/var/lib/magnum/helm-import-%s-%s", namespace, releaseName)
+	return filepath.Join(helmMarkerRootDir, fmt.Sprintf("helm-import-%s-%s", namespace, releaseName))
 }
 
 // forceMarkerPath returns the path for the "needs force update" marker file.
 func forceMarkerPath(namespace, releaseName string) string {
-	return fmt.Sprintf("/var/lib/magnum/helm-force-%s-%s", namespace, releaseName)
+	return filepath.Join(helmMarkerRootDir, fmt.Sprintf("helm-force-%s-%s", namespace, releaseName))
+}
+
+// managedMarkerPath tracks Helm releases bootstrap intends to manage. The
+// marker is written during Run() and only promoted to "adopted" after a
+// successful pulumi up, which avoids stale adopted markers when an update fails.
+func managedMarkerPath(namespace, releaseName string) string {
+	return filepath.Join(helmMarkerRootDir, fmt.Sprintf("helm-managed-%s-%s", namespace, releaseName))
 }
 
 // NeedsForceUpdate returns true if a previous failed upgrade wrote a force
@@ -72,6 +81,12 @@ func ClearForceUpdate(releaseName, namespace string) {
 	_ = os.Remove(forceMarkerPath(namespace, releaseName))
 }
 
+// MarkManaged records that bootstrap intends to manage this release in the
+// current run. Successful updates later promote this to an adopted marker.
+func MarkManaged(releaseName, namespace string) {
+	_ = os.WriteFile(managedMarkerPath(namespace, releaseName), []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
+}
+
 // AdoptHelmRelease prepares a legacy Helm release for Pulumi adoption.
 //
 // On first migration run:
@@ -85,6 +100,8 @@ func ClearForceUpdate(releaseName, namespace string) {
 // On subsequent runs:
 //   - Adopted marker exists → no-op.
 func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
+	MarkManaged(releaseName, namespace)
+
 	adopted := adoptedMarkerPath(namespace, releaseName)
 	importing := importMarkerPath(namespace, releaseName)
 
@@ -96,8 +113,8 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	// Check if the release exists in Helm.
 	_, err := executor.RunCapture("helm", "status", releaseName, "-n", namespace)
 	if err != nil {
-		// Release doesn't exist → write adopted marker, Pulumi will create fresh.
-		_ = os.WriteFile(adopted, []byte("adopted"), 0o644)
+		// Release doesn't exist yet. Leave only the managed marker so a later
+		// successful create can promote it to adopted state.
 		_ = os.Remove(importing)
 		return
 	}
@@ -132,7 +149,7 @@ func CleanupFailedRelease(executor *host.Executor, releaseName, namespace string
 }
 
 // MarkAdopted writes the adopted marker and removes the import marker after a
-// successful Pulumi run. Called from Register() when import succeeds.
+// successful Pulumi run.
 func MarkAdopted(releaseName, namespace string) {
 	_ = os.WriteFile(adoptedMarkerPath(namespace, releaseName), []byte("adopted"), 0o644)
 	_ = os.Remove(importMarkerPath(namespace, releaseName))
@@ -154,7 +171,7 @@ func NeedsImport(releaseName, namespace string) bool {
 // release and wrote an import marker, but Register() has not yet marked them as
 // successfully adopted.
 func PendingImportReleases() []HelmReleasePair {
-	markerPaths, err := filepath.Glob("/var/lib/magnum/helm-import-*")
+	markerPaths, err := filepath.Glob(filepath.Join(helmMarkerRootDir, "helm-import-*"))
 	if err != nil {
 		return nil
 	}
@@ -231,9 +248,12 @@ func CleanupVeryOldLegacyAddons(executor *host.Executor) {
 		_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "-f", manifestPath, "--ignore-not-found=true")
 	}
 
-	_ = executor.Run("helm", "uninstall", "magnum", "-n", "kube-system")
+	_ = executor.Run("helm", "uninstall", "magnum", "-n", "kube-system", "--ignore-not-found")
 
 	legacyDeletes := [][]string{
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-flannel", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-flannel", "--ignore-not-found=true"},
+		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-flannel", "--ignore-not-found=true"},
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-system", "--ignore-not-found=true"},
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-system", "--ignore-not-found=true"},
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-system", "--ignore-not-found=true"},
@@ -242,6 +262,54 @@ func CleanupVeryOldLegacyAddons(executor *host.Executor) {
 	}
 	for _, cmd := range legacyDeletes {
 		_ = executor.Run(cmd[0], cmd[1:]...)
+	}
+}
+
+// ManagedReleases returns releases that bootstrap attempted to manage.
+func ManagedReleases() []HelmReleasePair {
+	markerPaths, err := filepath.Glob(filepath.Join(helmMarkerRootDir, "helm-managed-*"))
+	if err != nil {
+		return nil
+	}
+
+	var releases []HelmReleasePair
+	seen := make(map[string]bool, len(markerPaths))
+	for _, markerPath := range markerPaths {
+		content, err := os.ReadFile(markerPath)
+		if err != nil {
+			continue
+		}
+		pair, ok := parseHelmReleasePair(strings.TrimSpace(string(content)))
+		if !ok {
+			continue
+		}
+		key := pair.Namespace + "/" + pair.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		releases = append(releases, pair)
+	}
+	return releases
+}
+
+// PromoteManagedReleases marks all currently managed releases as adopted after
+// a successful pulumi up.
+func PromoteManagedReleases() {
+	for _, rel := range ManagedReleases() {
+		MarkAdopted(rel.Name, rel.Namespace)
+	}
+}
+
+// ClearAllForceUpdateMarkers removes all force-update markers after a
+// successful update.
+func ClearAllForceUpdateMarkers() {
+	markerPaths, err := filepath.Glob(filepath.Join(helmMarkerRootDir, "helm-force-*"))
+	if err != nil {
+		return
+	}
+	for _, markerPath := range markerPaths {
+		_ = os.Remove(markerPath)
 	}
 }
 
@@ -317,10 +385,6 @@ func DeployHelmRelease(ctx *pulumi.Context, name string, args HelmReleaseArgs, o
 	if err != nil {
 		return nil, err
 	}
-
-	// Mark as adopted and clear any force marker after successful registration.
-	MarkAdopted(args.ReleaseName, args.Namespace)
-	ClearForceUpdate(args.ReleaseName, args.Namespace)
 	return rel, err
 }
 
