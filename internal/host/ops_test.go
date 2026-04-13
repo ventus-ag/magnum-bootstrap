@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+func TestParseSystemctlUnitFileState(t *testing.T) {
+	if got := parseSystemctlUnitFileState("masked\n"); got != "masked" {
+		t.Fatalf("expected masked, got %q", got)
+	}
+	if got := parseSystemctlUnitFileState(" enabled-runtime \n"); got != "enabled-runtime" {
+		t.Fatalf("expected enabled-runtime, got %q", got)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

@@ -288,8 +288,20 @@ func (e *Executor) SystemctlIsEnabled(unit string) bool {
 
 // SystemctlIsMasked returns true if the given unit is masked.
 func (e *Executor) SystemctlIsMasked(unit string) bool {
-	out, err := e.RunCapture("systemctl", "is-enabled", unit)
-	return err == nil && strings.TrimSpace(out) == "masked"
+	state, err := e.systemctlUnitFileState(unit)
+	return err == nil && state == "masked"
+}
+
+func (e *Executor) systemctlUnitFileState(unit string) (string, error) {
+	out, err := e.RunCapture("systemctl", "show", unit, "--property=UnitFileState", "--value")
+	if err != nil {
+		return "", err
+	}
+	return parseSystemctlUnitFileState(out), nil
+}
+
+func parseSystemctlUnitFileState(output string) string {
+	return strings.TrimSpace(output)
 }
 
 // WaitForSystemctlActive polls until the given unit becomes active or the
