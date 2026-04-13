@@ -27,7 +27,7 @@ type CopyState struct {
 	ObservedMode        string   `pulumi:"observedMode"`
 	ObservedMatchesCopy bool     `pulumi:"observedMatchesSource"`
 	Drifted             bool     `pulumi:"drifted"`
-	DriftReasons        []string `pulumi:"driftReasons"`
+	DriftReasons        []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Copy) Create(_ context.Context, req infer.CreateRequest[CopyArgs]) (infer.CreateResponse[CopyState], error) {

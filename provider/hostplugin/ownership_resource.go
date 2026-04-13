@@ -30,7 +30,7 @@ type OwnershipState struct {
 	ObservedGroup          string   `pulumi:"observedGroup"`
 	ObservedRecursiveMatch bool     `pulumi:"observedRecursiveMatch"`
 	Drifted                bool     `pulumi:"drifted"`
-	DriftReasons           []string `pulumi:"driftReasons"`
+	DriftReasons           []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Ownership) Create(_ context.Context, req infer.CreateRequest[OwnershipArgs]) (infer.CreateResponse[OwnershipState], error) {

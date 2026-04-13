@@ -25,7 +25,7 @@ type LineState struct {
 	ObservedMode         string   `pulumi:"observedMode"`
 	ObservedContainsLine bool     `pulumi:"observedContainsLine"`
 	Drifted              bool     `pulumi:"drifted"`
-	DriftReasons         []string `pulumi:"driftReasons"`
+	DriftReasons         []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Line) Create(_ context.Context, req infer.CreateRequest[LineArgs]) (infer.CreateResponse[LineState], error) {

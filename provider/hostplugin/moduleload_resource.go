@@ -20,14 +20,14 @@ type ModuleLoadArgs struct {
 
 type ModuleLoadState struct {
 	Path                  string   `pulumi:"path"`
-	Modules               []string `pulumi:"modules"`
+	Modules               []string `pulumi:"modules,optional"`
 	Mode                  string   `pulumi:"mode"`
 	ContentSHA256         string   `pulumi:"contentSha256"`
 	ObservedExists        bool     `pulumi:"observedExists"`
 	ObservedMode          string   `pulumi:"observedMode"`
 	ObservedContentSHA256 string   `pulumi:"observedContentSha256"`
 	Drifted               bool     `pulumi:"drifted"`
-	DriftReasons          []string `pulumi:"driftReasons"`
+	DriftReasons          []string `pulumi:"driftReasons,optional"`
 }
 
 func (*ModuleLoad) Create(_ context.Context, req infer.CreateRequest[ModuleLoadArgs]) (infer.CreateResponse[ModuleLoadState], error) {

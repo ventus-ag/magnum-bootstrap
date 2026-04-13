@@ -22,12 +22,12 @@ type ExtractTarArgs struct {
 type ExtractTarState struct {
 	ArchivePath       string   `pulumi:"archivePath"`
 	Destination       string   `pulumi:"destination"`
-	CheckPaths        []string `pulumi:"checkPaths"`
+	CheckPaths        []string `pulumi:"checkPaths,optional"`
 	ChmodExecutables  bool     `pulumi:"chmodExecutables"`
 	ObservedSatisfied bool     `pulumi:"observedSatisfied"`
-	MissingCheckPaths []string `pulumi:"missingCheckPaths"`
+	MissingCheckPaths []string `pulumi:"missingCheckPaths,optional"`
 	Drifted           bool     `pulumi:"drifted"`
-	DriftReasons      []string `pulumi:"driftReasons"`
+	DriftReasons      []string `pulumi:"driftReasons,optional"`
 }
 
 func (*ExtractTar) Create(_ context.Context, req infer.CreateRequest[ExtractTarArgs]) (infer.CreateResponse[ExtractTarState], error) {

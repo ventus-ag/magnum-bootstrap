@@ -40,7 +40,7 @@ type SystemdServiceState struct {
 	ObservedActive  bool     `pulumi:"observedActive"`
 	ObservedMasked  bool     `pulumi:"observedMasked"`
 	Drifted         bool     `pulumi:"drifted"`
-	DriftReasons    []string `pulumi:"driftReasons"`
+	DriftReasons    []string `pulumi:"driftReasons,optional"`
 }
 
 func (*SystemdService) Create(_ context.Context, req infer.CreateRequest[SystemdServiceArgs]) (infer.CreateResponse[SystemdServiceState], error) {

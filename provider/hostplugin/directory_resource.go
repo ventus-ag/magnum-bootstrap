@@ -24,7 +24,7 @@ type DirectoryState struct {
 	ObservedIsDir  bool     `pulumi:"observedIsDir"`
 	ObservedMode   string   `pulumi:"observedMode"`
 	Drifted        bool     `pulumi:"drifted"`
-	DriftReasons   []string `pulumi:"driftReasons"`
+	DriftReasons   []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Directory) Create(_ context.Context, req infer.CreateRequest[DirectoryArgs]) (infer.CreateResponse[DirectoryState], error) {

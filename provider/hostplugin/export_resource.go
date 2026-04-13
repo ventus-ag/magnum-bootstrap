@@ -31,7 +31,7 @@ type ExportState struct {
 	ObservedMode       string   `pulumi:"observedMode"`
 	ObservedHasDesired bool     `pulumi:"observedHasDesiredValue"`
 	Drifted            bool     `pulumi:"drifted"`
-	DriftReasons       []string `pulumi:"driftReasons"`
+	DriftReasons       []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Export) Create(_ context.Context, req infer.CreateRequest[ExportArgs]) (infer.CreateResponse[ExportState], error) {

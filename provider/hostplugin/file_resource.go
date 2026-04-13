@@ -29,7 +29,7 @@ type FileState struct {
 	ObservedMode          string   `pulumi:"observedMode"`
 	ObservedContentSHA256 string   `pulumi:"observedContentSha256"`
 	Drifted               bool     `pulumi:"drifted"`
-	DriftReasons          []string `pulumi:"driftReasons"`
+	DriftReasons          []string `pulumi:"driftReasons,optional"`
 }
 
 func (*File) Create(_ context.Context, req infer.CreateRequest[FileArgs]) (infer.CreateResponse[FileState], error) {

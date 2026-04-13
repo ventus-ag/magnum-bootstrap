@@ -24,7 +24,7 @@ type ModeState struct {
 	ObservedExists bool     `pulumi:"observedExists"`
 	ObservedMode   string   `pulumi:"observedMode"`
 	Drifted        bool     `pulumi:"drifted"`
-	DriftReasons   []string `pulumi:"driftReasons"`
+	DriftReasons   []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Mode) Create(_ context.Context, req infer.CreateRequest[ModeArgs]) (infer.CreateResponse[ModeState], error) {

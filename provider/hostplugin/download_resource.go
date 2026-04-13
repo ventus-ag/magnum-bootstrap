@@ -29,7 +29,7 @@ type DownloadState struct {
 	ObservedMode     string   `pulumi:"observedMode"`
 	ObservedChecksum string   `pulumi:"observedChecksum"`
 	Drifted          bool     `pulumi:"drifted"`
-	DriftReasons     []string `pulumi:"driftReasons"`
+	DriftReasons     []string `pulumi:"driftReasons,optional"`
 }
 
 func (*Download) Create(ctx context.Context, req infer.CreateRequest[DownloadArgs]) (infer.CreateResponse[DownloadState], error) {
