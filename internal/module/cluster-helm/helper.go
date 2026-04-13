@@ -33,6 +33,9 @@ func RunNoop(_ context.Context, cfg config.Config, req moduleapi.Request, featur
 		return SkipResult()
 	}
 	if req.Apply && releaseName != "" {
+		if req.Logger != nil {
+			req.Logger.Infof("helm migration: evaluating release %s/%s", namespace, releaseName)
+		}
 		executor := host.NewExecutor(req.Apply, req.Logger)
 		AdoptHelmRelease(executor, releaseName, namespace)
 	}
@@ -107,6 +110,9 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 
 	// Already adopted by Pulumi → skip.
 	if _, err := os.Stat(adopted); err == nil {
+		if executor != nil && executor.Logger != nil {
+			executor.Logger.Infof("helm migration: release %s/%s already marked adopted, skipping import preparation", namespace, releaseName)
+		}
 		return
 	}
 
@@ -115,6 +121,9 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	if err != nil {
 		// Release doesn't exist yet. Leave only the managed marker so a later
 		// successful create can promote it to adopted state.
+		if executor != nil && executor.Logger != nil {
+			executor.Logger.Infof("helm migration: release %s/%s not found in Helm, will create fresh", namespace, releaseName)
+		}
 		_ = os.Remove(importing)
 		return
 	}
@@ -123,6 +132,9 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	if _, err := os.Stat(importing); err == nil {
 		// Import marker exists from a previous run → import already failed once.
 		// Fallback: uninstall the release so Pulumi can create a fresh one.
+		if executor != nil && executor.Logger != nil {
+			executor.Logger.Warnf("helm migration: release %s/%s still has pending import marker, uninstalling legacy release for fresh create", namespace, releaseName)
+		}
 		_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
 		_ = os.WriteFile(adopted, []byte("adopted"), 0o644)
 		_ = os.Remove(importing)
@@ -130,6 +142,9 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	}
 
 	// First attempt: write import marker. Register() will try pulumi.Import().
+	if executor != nil && executor.Logger != nil {
+		executor.Logger.Infof("helm migration: release %s/%s exists in Helm, preparing Pulumi import", namespace, releaseName)
+	}
 	_ = os.WriteFile(importing, []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
 }
 
@@ -324,6 +339,11 @@ func ManagedReleases() []HelmReleasePair {
 // a successful pulumi up.
 func PromoteManagedReleases() {
 	for _, rel := range ManagedReleases() {
+		if _, err := os.Stat(importMarkerPath(rel.Namespace, rel.Name)); err == nil {
+			// Import marker still present means this release still needs a later
+			// repair or recreate path; don't promote it yet.
+			continue
+		}
 		MarkAdopted(rel.Name, rel.Namespace)
 	}
 }

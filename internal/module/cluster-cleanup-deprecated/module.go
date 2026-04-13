@@ -25,7 +25,8 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{}, nil
 	}
 	if req.Apply {
-		clusterhelm.CleanupVeryOldLegacyAddons(host.NewExecutor(req.Apply, req.Logger))
+		executor := host.NewExecutor(req.Apply, req.Logger)
+		clusterhelm.CleanupVeryOldLegacyAddons(executor)
 	}
 	return moduleapi.Result{
 		Outputs: map[string]string{"firstMaster": "true"},
