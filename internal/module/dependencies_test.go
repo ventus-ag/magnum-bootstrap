@@ -61,7 +61,8 @@ func TestMasterDependencyContracts(t *testing.T) {
 		"master-certificates",
 		"etcd",
 	)
-	assertDependsOn(t, reconcilePlan, registry, "health", "services", "start-services", "proxy-env")
+	assertDependsOn(t, reconcilePlan, registry, "heat-container-agent", "start-services")
+	assertDependsOn(t, reconcilePlan, registry, "health", "services", "heat-container-agent", "proxy-env")
 	assertDependsOn(t, reconcilePlan, registry, "cluster-rbac", "health")
 	assertDependsOn(t, reconcilePlan, registry, "cluster-cleanup-deprecated", "cluster-rbac")
 
@@ -116,7 +117,8 @@ func TestWorkerDependencyContracts(t *testing.T) {
 		"container-runtime",
 		"worker-certificates",
 	)
-	assertDependsOn(t, reconcilePlan, registry, "health", "services", "start-services", "proxy-env")
+	assertDependsOn(t, reconcilePlan, registry, "heat-container-agent", "start-services")
+	assertDependsOn(t, reconcilePlan, registry, "health", "services", "heat-container-agent", "proxy-env")
 }
 
 func assertDependsOn(t *testing.T, reconcilePlan plan.Plan, registry map[string]Module, phaseID string, expectedDeps ...string) {

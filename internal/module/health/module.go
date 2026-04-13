@@ -26,7 +26,7 @@ type Resource struct {
 func (Module) PhaseID() string {
 	return "health"
 }
-func (Module) Dependencies() []string { return []string{"start-services", "proxy-env"} }
+func (Module) Dependencies() []string { return []string{"heat-container-agent", "proxy-env"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)

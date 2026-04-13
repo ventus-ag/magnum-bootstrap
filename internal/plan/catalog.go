@@ -26,6 +26,7 @@ func masterPhases() []Phase {
 		newPhase("proxy-env", "reconcile environment proxy settings", false),
 		newPhase("services", "reconcile master services to desired state", true),
 		newPhase("start-services", "uncordon node after disruptive changes (upgrade/resize only)", true),
+		newPhase("heat-container-agent", "reconcile the Heat container agent service", false),
 		newPhase("health", "verify master health after reconciliation", false),
 		// Cluster-level addons — only execute on master-0, skip on other masters.
 		newPhase("cluster-rbac", "reconcile RBAC roles, secrets, and pod security for cluster", false),
@@ -62,6 +63,7 @@ func workerPhases() []Phase {
 		newPhase("proxy-env", "reconcile environment proxy settings", false),
 		newPhase("services", "reconcile worker services to desired state", true),
 		newPhase("start-services", "uncordon node after disruptive changes (upgrade/resize only)", true),
+		newPhase("heat-container-agent", "reconcile the Heat container agent service", false),
 		newPhase("health", "verify worker health after reconciliation", false),
 		newPhase("zincati", "reconcile OS auto-upgrade (Zincati) settings", false),
 	}

@@ -23,6 +23,7 @@ import (
 	dockerregistry "github.com/ventus-ag/magnum-bootstrap/internal/module/docker-registry"
 	etcdconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/etcd-config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module/health"
+	heatcontaineragent "github.com/ventus-ag/magnum-bootstrap/internal/module/heat-container-agent"
 	kubemasterconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/kube-master-config"
 	kubeosconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/kube-os-config"
 	kubeworkerconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/kube-worker-config"
@@ -40,26 +41,27 @@ import (
 
 func BuildRegistry(_ config.Config) map[string]Module {
 	return map[string]Module{
-		"prereq-validation":   prereqvalidation.Module{},
-		"container-runtime":   containerruntime.Module{},
-		"client-tools":        clienttools.Module{},
-		"master-certificates": mastercerts.Module{},
-		"worker-certificates": workercerts.Module{},
-		"cert-api-manager":    certapimanager.Module{},
-		"etcd":                etcdconfig.Module{},
-		"kube-os-config":      kubeosconfig.Module{},
-		"admin-kubeconfig":    adminkubeconfig.Module{},
-		"kube-master-config":  kubemasterconfig.Module{},
-		"kube-worker-config":  kubeworkerconfig.Module{},
-		"registry":            dockerregistry.Module{},
-		"storage":             storage.Module{},
-		"services":            services.Module{},
-		"stop-services":       stopservices.Module{},
-		"start-services":      startservices.Module{},
-		"proxy-env":           proxy.Module{},
-		"health":              health.Module{},
-		"ca-rotation":         carotation.Module{},
-		"zincati":             zincati.Module{},
+		"prereq-validation":    prereqvalidation.Module{},
+		"container-runtime":    containerruntime.Module{},
+		"client-tools":         clienttools.Module{},
+		"master-certificates":  mastercerts.Module{},
+		"worker-certificates":  workercerts.Module{},
+		"cert-api-manager":     certapimanager.Module{},
+		"etcd":                 etcdconfig.Module{},
+		"kube-os-config":       kubeosconfig.Module{},
+		"admin-kubeconfig":     adminkubeconfig.Module{},
+		"kube-master-config":   kubemasterconfig.Module{},
+		"kube-worker-config":   kubeworkerconfig.Module{},
+		"registry":             dockerregistry.Module{},
+		"storage":              storage.Module{},
+		"services":             services.Module{},
+		"stop-services":        stopservices.Module{},
+		"start-services":       startservices.Module{},
+		"heat-container-agent": heatcontaineragent.Module{},
+		"proxy-env":            proxy.Module{},
+		"health":               health.Module{},
+		"ca-rotation":          carotation.Module{},
+		"zincati":              zincati.Module{},
 		// Cluster-level addons (master-0 only).
 		"cluster-rbac":               clusterrbac.Module{},
 		"cluster-cleanup-deprecated": clustercleanupdeprecated.Module{},
