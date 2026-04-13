@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -149,6 +150,61 @@ func NeedsImport(releaseName, namespace string) bool {
 	return false
 }
 
+// PendingImportReleases lists releases whose Run() phase detected a legacy Helm
+// release and wrote an import marker, but Register() has not yet marked them as
+// successfully adopted.
+func PendingImportReleases() []HelmReleasePair {
+	markerPaths, err := filepath.Glob("/var/lib/magnum/helm-import-*")
+	if err != nil {
+		return nil
+	}
+
+	var releases []HelmReleasePair
+	seen := make(map[string]bool, len(markerPaths))
+	for _, markerPath := range markerPaths {
+		content, err := os.ReadFile(markerPath)
+		if err != nil {
+			continue
+		}
+		pair, ok := parseHelmReleasePair(strings.TrimSpace(string(content)))
+		if !ok {
+			continue
+		}
+		key := pair.Namespace + "/" + pair.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		releases = append(releases, pair)
+	}
+	return releases
+}
+
+func parseHelmReleasePair(value string) (HelmReleasePair, bool) {
+	namespace, name, ok := strings.Cut(strings.TrimSpace(value), "/")
+	if !ok || namespace == "" || name == "" {
+		return HelmReleasePair{}, false
+	}
+	return HelmReleasePair{Namespace: namespace, Name: name}, true
+}
+
+// CleanupPendingImportReleases uninstalls any legacy Helm releases that still
+// have import markers and marks them as adopted so the retry can create them
+// fresh under Pulumi management.
+func CleanupPendingImportReleases(executor *host.Executor) []HelmReleasePair {
+	pending := PendingImportReleases()
+	var cleaned []HelmReleasePair
+	for _, rel := range pending {
+		if executor != nil && executor.Logger != nil {
+			executor.Logger.Warnf("helm adoption fallback: uninstalling legacy release %s/%s after import conflict", rel.Namespace, rel.Name)
+		}
+		_ = executor.Run("helm", "uninstall", rel.Name, "-n", rel.Namespace)
+		MarkAdopted(rel.Name, rel.Namespace)
+		cleaned = append(cleaned, rel)
+	}
+	return cleaned
+}
+
 // RegisterSkipped registers an empty component for phases that are skipped
 // (not master-0 or feature disabled). On first run Pulumi shows "+ create"
 // but on subsequent runs these are "= same" (no-op).
@@ -288,4 +344,10 @@ func ParseHelmPatchFailures(errMsg string) []HelmReleasePair {
 		releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
 	}
 	return releases
+}
+
+// HasHelmNameReuseConflict reports whether a Helm release create failed because
+// the release name already exists outside Pulumi state.
+func HasHelmNameReuseConflict(errMsg string) bool {
+	return strings.Contains(errMsg, "cannot re-use a name that is still in use")
 }

@@ -285,6 +285,40 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 				upRes, err = stack.Up(ctx, retryOpts...)
 				stopHeartbeat()
 			}
+			// Legacy clusters may already have Helm releases created outside
+			// Pulumi state. If adoption/import still results in Helm reporting
+			// "name is still in use", uninstall only the still-pending import
+			// releases and retry once so Pulumi can recreate them fresh.
+			if err != nil && clusterhelm.HasHelmNameReuseConflict(err.Error()) {
+				executor := host.NewExecutor(true, req.Logger)
+				pending := clusterhelm.CleanupPendingImportReleases(executor)
+				if len(pending) > 0 {
+					names := make([]string, len(pending))
+					for i, rel := range pending {
+						names[i] = rel.Namespace + "/" + rel.Name
+					}
+					if req.Logger != nil {
+						req.Logger.Warnf("helm release import conflict for %v, retrying after uninstalling legacy releases", names)
+					}
+
+					retryOpts := []optup.Option{
+						optup.Parallel(parallelism),
+						optup.ProgressStreams(progressWriters...),
+						optup.ErrorProgressStreams(errorProgressWriters...),
+					}
+					if diff {
+						retryOpts = append(retryOpts, optup.Diff())
+					}
+					if pulumiDebugOpts != nil {
+						retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
+					}
+
+					start = time.Now()
+					stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, "up (import retry)", cfg.StackName(), start)
+					upRes, err = stack.Up(ctx, retryOpts...)
+					stopHeartbeat()
+				}
+			}
 			if err != nil {
 				if req.Logger != nil {
 					req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
