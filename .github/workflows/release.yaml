@@ -41,7 +41,7 @@ jobs:
         run: |
           chmod +x dist/bootstrap dist/pulumi-resource-magnumhost
           ./dist/bootstrap --help
-          ./dist/pulumi-resource-magnumhost >/dev/null 2>&1 || true
+          test -x dist/pulumi-resource-magnumhost
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
