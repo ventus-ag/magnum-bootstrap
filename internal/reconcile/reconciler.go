@@ -241,6 +241,24 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		var upRes auto.UpResult
 		var err error
+		retryUp := func(label string) {
+			retryOpts := []optup.Option{
+				optup.Parallel(parallelism),
+				optup.ProgressStreams(progressWriters...),
+				optup.ErrorProgressStreams(errorProgressWriters...),
+			}
+			if diff {
+				retryOpts = append(retryOpts, optup.Diff())
+			}
+			if pulumiDebugOpts != nil {
+				retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
+			}
+
+			start = time.Now()
+			stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, label, cfg.StackName(), start)
+			upRes, err = stack.Up(ctx, retryOpts...)
+			stopHeartbeat()
+		}
 		upRes, err = stack.Up(ctx, upOpts...)
 		stopHeartbeat()
 		if err != nil {
@@ -265,58 +283,40 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 					clusterhelm.CleanupFailedRelease(executor, rel.Name, rel.Namespace)
 				}
 
-				// Rebuild up options without EventStreams — the Pulumi SDK
-				// closes the event channel after stack.Up() returns, so
-				// reusing it would panic on the retry.
-				retryOpts := []optup.Option{
-					optup.Parallel(parallelism),
-					optup.ProgressStreams(progressWriters...),
-					optup.ErrorProgressStreams(errorProgressWriters...),
-				}
-				if diff {
-					retryOpts = append(retryOpts, optup.Diff())
-				}
-				if pulumiDebugOpts != nil {
-					retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
-				}
-
-				start = time.Now()
-				stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, "up (force retry)", cfg.StackName(), start)
-				upRes, err = stack.Up(ctx, retryOpts...)
-				stopHeartbeat()
+				retryUp("up (force retry)")
 			}
 			// Legacy clusters may already have Helm releases created outside
 			// Pulumi state. If adoption/import still results in Helm reporting
-			// "name is still in use", uninstall only the still-pending import
-			// releases and retry once so Pulumi can recreate them fresh.
+			// "name is still in use", first repair stale import markers for
+			// existing managed releases and retry import. If that still fails,
+			// uninstall only the still-pending import releases and retry once so
+			// Pulumi can recreate them fresh.
 			if err != nil && clusterhelm.HasHelmNameReuseConflict(err.Error()) {
 				executor := host.NewExecutor(true, req.Logger)
-				pending := clusterhelm.CleanupPendingImportReleases(executor)
-				if len(pending) > 0 {
-					names := make([]string, len(pending))
-					for i, rel := range pending {
+				repaired := clusterhelm.PrepareManagedImports(executor)
+				if len(repaired) > 0 {
+					names := make([]string, len(repaired))
+					for i, rel := range repaired {
 						names[i] = rel.Namespace + "/" + rel.Name
 					}
 					if req.Logger != nil {
-						req.Logger.Warnf("helm release import conflict for %v, retrying after uninstalling legacy releases", names)
+						req.Logger.Warnf("helm release name conflict for %v, retrying after re-preparing import markers", names)
 					}
+					retryUp("up (import repair retry)")
+				}
+				if err != nil && clusterhelm.HasHelmNameReuseConflict(err.Error()) {
+					pending := clusterhelm.CleanupPendingImportReleases(executor)
+					if len(pending) > 0 {
+						names := make([]string, len(pending))
+						for i, rel := range pending {
+							names[i] = rel.Namespace + "/" + rel.Name
+						}
+						if req.Logger != nil {
+							req.Logger.Warnf("helm release import conflict for %v, retrying after uninstalling legacy releases", names)
+						}
 
-					retryOpts := []optup.Option{
-						optup.Parallel(parallelism),
-						optup.ProgressStreams(progressWriters...),
-						optup.ErrorProgressStreams(errorProgressWriters...),
+						retryUp("up (import retry)")
 					}
-					if diff {
-						retryOpts = append(retryOpts, optup.Diff())
-					}
-					if pulumiDebugOpts != nil {
-						retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
-					}
-
-					start = time.Now()
-					stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, "up (import retry)", cfg.StackName(), start)
-					upRes, err = stack.Up(ctx, retryOpts...)
-					stopHeartbeat()
 				}
 			}
 			if err != nil {

@@ -222,6 +222,33 @@ func CleanupPendingImportReleases(executor *host.Executor) []HelmReleasePair {
 	return cleaned
 }
 
+// PrepareManagedImports re-arms import markers for managed releases that still
+// exist in Helm. This repairs stale adopted markers left behind by older
+// bootstrap versions or failed migration attempts so the next pulumi up retries
+// import before escalating to uninstall/recreate.
+func PrepareManagedImports(executor *host.Executor) []HelmReleasePair {
+	managed := ManagedReleases()
+	var prepared []HelmReleasePair
+	for _, rel := range managed {
+		if executor == nil {
+			continue
+		}
+		if _, err := executor.RunCapture("helm", "status", rel.Name, "-n", rel.Namespace); err != nil {
+			continue
+		}
+		if NeedsImport(rel.Name, rel.Namespace) {
+			continue
+		}
+		if executor.Logger != nil {
+			executor.Logger.Warnf("helm adoption repair: preparing import marker for existing release %s/%s", rel.Namespace, rel.Name)
+		}
+		_ = os.Remove(adoptedMarkerPath(rel.Namespace, rel.Name))
+		_ = os.WriteFile(importMarkerPath(rel.Namespace, rel.Name), []byte(rel.Namespace+"/"+rel.Name), 0o644)
+		prepared = append(prepared, rel)
+	}
+	return prepared
+}
+
 // CleanupVeryOldLegacyAddons removes manifest-era addon resources from very old
 // clusters before Helm-based addon reconciliation starts. All operations are
 // best-effort and intentionally ignore missing resources.
