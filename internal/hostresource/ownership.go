@@ -3,9 +3,9 @@ package hostresource
 import (
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -33,7 +33,7 @@ type OwnershipState struct {
 }
 
 func (spec OwnershipSpec) Apply(executor *host.Executor) (ApplyResult, error) {
-	uid, gid, resolveErr := resolveIDs(spec.Owner, spec.Group)
+	uid, gid, resolveErr := resolveIDs(executor, spec.Owner, spec.Group)
 	if !executor.Apply && resolveErr != nil {
 		return ApplyResult{Changes: []host.Change{{
 			Action:  host.ActionUpdate,
@@ -69,7 +69,7 @@ func (spec OwnershipSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 	return ApplyResult{Changes: []host.Change{change}, Changed: true}, nil
 }
 
-func (spec OwnershipSpec) Observe(_ *host.Executor) (OwnershipState, error) {
+func (spec OwnershipSpec) Observe(executor *host.Executor) (OwnershipState, error) {
 	info, err := os.Stat(spec.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -77,15 +77,16 @@ func (spec OwnershipSpec) Observe(_ *host.Executor) (OwnershipState, error) {
 		}
 		return OwnershipState{}, err
 	}
-	owner, group, err := lookupOwnerGroup(info)
+	owner, group, err := lookupOwnerGroup(spec.Path, info, executor)
 	if err != nil {
 		return OwnershipState{}, err
 	}
 	state := OwnershipState{Exists: true, Owner: owner, Group: group, RecursiveMatch: true}
 	if spec.Recursive {
-		uid, gid, err := resolveIDs(spec.Owner, spec.Group)
+		uid, gid, err := resolveIDs(executor, spec.Owner, spec.Group)
 		if err != nil {
-			return OwnershipState{}, err
+			state.RecursiveMatch = false
+			return state, nil
 		}
 		needsApply, err := spec.needsApply(uid, gid)
 		if err != nil {
@@ -190,38 +191,45 @@ func ownershipMismatch(info os.FileInfo, uid, gid int) (bool, error) {
 	return int(stat.Uid) != uid || int(stat.Gid) != gid, nil
 }
 
-func resolveIDs(owner, group string) (int, int, error) {
-	u, err := user.Lookup(owner)
+func resolveIDs(executor *host.Executor, owner, group string) (int, int, error) {
+	passwdLine, err := executor.RunCapture("getent", "passwd", owner)
 	if err != nil {
 		return 0, 0, err
 	}
-	g, err := user.LookupGroup(group)
+	passwdFields := strings.Split(strings.TrimSpace(passwdLine), ":")
+	if len(passwdFields) < 4 {
+		return 0, 0, fmt.Errorf("unexpected passwd entry for %s", owner)
+	}
+	uid, err := strconv.Atoi(passwdFields[2])
 	if err != nil {
 		return 0, 0, err
 	}
-	uid, err := strconv.Atoi(u.Uid)
+	groupLine, err := executor.RunCapture("getent", "group", group)
 	if err != nil {
 		return 0, 0, err
 	}
-	gid, err := strconv.Atoi(g.Gid)
+	groupFields := strings.Split(strings.TrimSpace(groupLine), ":")
+	if len(groupFields) < 3 {
+		return 0, 0, fmt.Errorf("unexpected group entry for %s", group)
+	}
+	gid, err := strconv.Atoi(groupFields[2])
 	if err != nil {
 		return 0, 0, err
 	}
 	return uid, gid, nil
 }
 
-func lookupOwnerGroup(info os.FileInfo) (string, string, error) {
+func lookupOwnerGroup(path string, info os.FileInfo, executor *host.Executor) (string, string, error) {
+	out, err := executor.RunCapture("stat", "-c", "%U:%G", path)
+	if err == nil {
+		parts := strings.SplitN(strings.TrimSpace(out), ":", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1], nil
+		}
+	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return "", "", fmt.Errorf("unsupported stat type for %s", info.Name())
 	}
-	owner := strconv.Itoa(int(stat.Uid))
-	group := strconv.Itoa(int(stat.Gid))
-	if u, err := user.LookupId(owner); err == nil {
-		owner = u.Username
-	}
-	if g, err := user.LookupGroupId(group); err == nil {
-		group = g.Name
-	}
-	return owner, group, nil
+	return strconv.Itoa(int(stat.Uid)), strconv.Itoa(int(stat.Gid)), nil
 }
