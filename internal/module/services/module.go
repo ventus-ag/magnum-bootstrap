@@ -13,6 +13,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
@@ -169,30 +170,18 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Label master nodes with the appropriate role label(s).
-	// K8s < 1.20:  only "master"
-	// K8s 1.20-1.24: both "master" and "control-plane" (transition period)
-	// K8s >= 1.25: only "control-plane" ("master" label removed upstream)
-	if cfg.Role() == config.RoleMaster {
-		kubeTag := cfg.Shared.KubeTag
-		kubectl := "kubectl"
-		kc := "--kubeconfig=/etc/kubernetes/admin.conf"
-
-		if kubeletconfig.KubeMinorAtLeast(kubeTag, 25) {
-			// 1.25+: control-plane only
-			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-				"node-role.kubernetes.io/control-plane=", "--overwrite")
-		} else if kubeletconfig.KubeMinorAtLeast(kubeTag, 20) {
-			// 1.20-1.24: both labels for backward compatibility
-			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-				"node-role.kubernetes.io/master=", "--overwrite")
-			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-				"node-role.kubernetes.io/control-plane=", "--overwrite")
-		} else {
-			// < 1.20: master only
-			_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-				"node-role.kubernetes.io/master=", "--overwrite")
+	// Reconcile node labels once the node object is visible. This fixes the
+	// create-time race where the API is up but the kubelet has not yet registered
+	// the node, and also corrects label drift on later runs.
+	if req.Apply {
+		labelChanges, err := kubecommon.EnsureNodeLabels(cfg, executor, "kubectl", "/etc/kubernetes/admin.conf", true, 30, 5*time.Second)
+		changes = append(changes, labelChanges...)
+		if err != nil && req.Logger != nil {
+			req.Logger.Warnf("services: failed to reconcile node labels for %s: %v", cfg.Shared.InstanceName, err)
 		}
+	} else {
+		labelChanges, _ := kubecommon.EnsureNodeLabels(cfg, executor, "kubectl", "/etc/kubernetes/admin.conf", false, 1, 0)
+		changes = append(changes, labelChanges...)
 	}
 
 	// Record which labels/taints we applied for observability.

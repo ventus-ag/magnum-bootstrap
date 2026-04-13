@@ -10,7 +10,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
-	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
@@ -77,23 +77,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			}
 		}
 
-		// Label master nodes with version-appropriate role labels.
-		if cfg.Role() == config.RoleMaster {
-			kubeTag := cfg.Shared.KubeTag
-			kc := "--kubeconfig=" + kubeconfig
-
-			if kubeletconfig.KubeMinorAtLeast(kubeTag, 25) {
-				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-					"node-role.kubernetes.io/control-plane=", "--overwrite")
-			} else if kubeletconfig.KubeMinorAtLeast(kubeTag, 20) {
-				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-					"node-role.kubernetes.io/master=", "--overwrite")
-				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-					"node-role.kubernetes.io/control-plane=", "--overwrite")
-			} else {
-				_ = executor.Run(kubectl, kc, "label", "node", cfg.Shared.InstanceName,
-					"node-role.kubernetes.io/master=", "--overwrite")
-			}
+		labelChanges, err := kubecommon.EnsureNodeLabels(cfg, executor, kubectl, kubeconfig, true, 30, 5*time.Second)
+		changes = append(changes, labelChanges...)
+		if err != nil && req.Logger != nil {
+			req.Logger.Warnf("start-services: failed to reconcile node labels for %s: %v", cfg.Shared.InstanceName, err)
 		}
 	}
 

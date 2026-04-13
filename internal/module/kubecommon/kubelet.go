@@ -69,11 +69,16 @@ containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
 
 // BuildKubeletArgs produces the KUBELET_ARGS value for kubelet.env.
 func BuildKubeletArgs(cfg config.Config) string {
+	nodeLabels := []string{
+		fmt.Sprintf("magnum.openstack.org/role=%s", cfg.Shared.NodegroupRole),
+	}
+	if cfg.Shared.NodegroupName != "" {
+		nodeLabels = append(nodeLabels, fmt.Sprintf("magnum.openstack.org/nodegroup=%s", cfg.Shared.NodegroupName))
+	}
 	args := []string{
 		"--kubeconfig /etc/kubernetes/kubelet.conf",
 		"--config=/etc/kubernetes/kubelet-config.yaml",
-		fmt.Sprintf("--node-labels=magnum.openstack.org/role=%s", cfg.Shared.NodegroupRole),
-		fmt.Sprintf("--node-labels=magnum.openstack.org/nodegroup=%s", cfg.Shared.NodegroupName),
+		"--node-labels=" + strings.Join(nodeLabels, ","),
 	}
 	if cfg.Shared.ContainerRuntime == "containerd" {
 		args = append(args, "--runtime-cgroups=/system.slice/containerd.service")
