@@ -25,56 +25,62 @@ func (Module) PhaseID() string        { return "start-services" }
 func (Module) Dependencies() []string { return []string{"services"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	// Uncordon only when KUBE_TAG actually changed (matching stop-services).
-	kubeTagChanged := req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
-	if !kubeTagChanged {
-		return moduleapi.Result{}, nil
-	}
-
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
+	var warnings []string
+	disruptiveCycle := moduleapi.DisruptiveServiceCycleNeeded(cfg, req)
 
-	// Reload systemd and restart services.
-	if err := executor.Run("systemctl", "daemon-reload"); err != nil {
-		return moduleapi.Result{}, err
-	}
+	if disruptiveCycle {
+		// Reload systemd and restart services.
+		if err := executor.Run("systemctl", "daemon-reload"); err != nil {
+			return moduleapi.Result{}, err
+		}
 
-	var serviceList []string
-	if cfg.Role() == config.RoleMaster {
-		serviceList = []string{"kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet", "kube-proxy"}
-	} else {
-		serviceList = []string{"kubelet", "kube-proxy"}
-	}
+		var serviceList []string
+		if cfg.Role() == config.RoleMaster {
+			serviceList = []string{"kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet", "kube-proxy"}
+		} else {
+			serviceList = []string{"kubelet", "kube-proxy"}
+		}
 
-	// Only start services that aren't already running.
-	for _, svc := range serviceList {
-		if !executor.SystemctlIsActive(svc) {
-			result, err := (hostresource.SystemdServiceSpec{Unit: svc, Active: hostresource.BoolPtr(true)}).Apply(executor)
-			if err != nil {
-				return moduleapi.Result{}, fmt.Errorf("start %s: %w", svc, err)
+		// Only start services that aren't already running.
+		for _, svc := range serviceList {
+			if !executor.SystemctlIsActive(svc) {
+				result, err := (hostresource.SystemdServiceSpec{Unit: svc, Active: hostresource.BoolPtr(true)}).Apply(executor)
+				if err != nil {
+					return moduleapi.Result{}, fmt.Errorf("start %s: %w", svc, err)
+				}
+				if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
+					return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
+				}
+				changes = append(changes, result.Changes...)
 			}
-			if req.Apply && !executor.WaitForSystemctlActive(svc, serviceReadyTimeout(svc), 2*time.Second) {
-				return moduleapi.Result{}, fmt.Errorf("service %s did not become active after start", svc)
-			}
-			changes = append(changes, result.Changes...)
 		}
 	}
 
-	// Uncordon the node — check if actually cordoned first.
+	wasCordoned := false
 	if req.Apply {
 		kubeconfig := "/etc/kubernetes/admin.conf"
 		kubectl := "/srv/magnum/bin/kubectl"
 
-		out, _ := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig,
-			"get", "node", cfg.Shared.InstanceName, "-o", "jsonpath={.spec.unschedulable}")
-		if out == "true" {
-			for i := 0; i < 30; i++ {
-				if executor.Run(kubectl, "--kubeconfig="+kubeconfig, "uncordon", cfg.Shared.InstanceName) == nil {
-					changes = append(changes, host.Change{Action: host.ActionOther, Summary: fmt.Sprintf("uncordon node %s", cfg.Shared.InstanceName)})
-					break
-				}
-				time.Sleep(5 * time.Second)
+		cordonState, uncordonChanges, uncordonWarnings := reconcileNodeSchedulable(cfg.Shared.InstanceName, executor, kubectl, kubeconfig)
+		wasCordoned = cordonState
+		changes = append(changes, uncordonChanges...)
+		warnings = append(warnings, uncordonWarnings...)
+
+		if disruptiveCycle || wasCordoned {
+			// Create uncordon service for reboot resilience.
+			uncordonService := buildUncordonService(cfg)
+			change, err := (hostresource.FileSpec{Path: "/etc/systemd/system/uncordon.service", Content: []byte(uncordonService), Mode: 0o644}).Apply(executor)
+			if err != nil {
+				return moduleapi.Result{}, err
 			}
+			changes = append(changes, change.Changes...)
+			serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "uncordon.service", DaemonReload: change.Changed, Enabled: hostresource.BoolPtr(true)}).Apply(executor)
+			if err != nil {
+				return moduleapi.Result{}, err
+			}
+			changes = append(changes, serviceResult.Changes...)
 		}
 
 		labelChanges, err := kubecommon.EnsureNodeLabels(cfg, executor, kubectl, kubeconfig, true, 30, 5*time.Second)
@@ -84,23 +90,42 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
-	// Create uncordon service for reboot resilience.
-	uncordonService := buildUncordonService(cfg)
-	change, err := (hostresource.FileSpec{Path: "/etc/systemd/system/uncordon.service", Content: []byte(uncordonService), Mode: 0o644}).Apply(executor)
-	if err != nil {
-		return moduleapi.Result{}, err
-	}
-	changes = append(changes, change.Changes...)
-	serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "uncordon.service", DaemonReload: change.Changed, Enabled: hostresource.BoolPtr(true)}).Apply(executor)
-	if err != nil {
-		return moduleapi.Result{}, err
-	}
-	changes = append(changes, serviceResult.Changes...)
-
 	return moduleapi.Result{
-		Changes: changes,
-		Outputs: map[string]string{"operation": cfg.Operation().String()},
+		Changes:  changes,
+		Warnings: warnings,
+		Outputs:  map[string]string{"operation": cfg.Operation().String()},
 	}, nil
+}
+
+func reconcileNodeSchedulable(nodeName string, executor *host.Executor, kubectl, kubeconfig string) (bool, []host.Change, []string) {
+	cordoned, err := nodeIsCordoned(nodeName, executor, kubectl, kubeconfig)
+	if err != nil {
+		return false, nil, []string{fmt.Sprintf("start-services: failed to determine cordon state for %s: %v", nodeName, err)}
+	}
+	if !cordoned {
+		return false, nil, nil
+	}
+
+	var lastErr error
+	for i := 0; i < 30; i++ {
+		if _, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig, "uncordon", nodeName); err == nil {
+			return true, []host.Change{{Action: host.ActionOther, Summary: fmt.Sprintf("uncordon node %s", nodeName)}}, nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	return true, nil, []string{fmt.Sprintf("start-services: node %s remains cordoned after uncordon retries: %v", nodeName, lastErr)}
+}
+
+func nodeIsCordoned(nodeName string, executor *host.Executor, kubectl, kubeconfig string) (bool, error) {
+	out, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig,
+		"get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
+	if err != nil {
+		return false, err
+	}
+	return out == "true", nil
 }
 
 func buildUncordonService(cfg config.Config) string {

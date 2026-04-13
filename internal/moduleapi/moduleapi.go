@@ -19,9 +19,15 @@ type Request struct {
 	Logger       *logging.Logger
 	Paths        paths.Paths
 
+	// PreviousSuccessfulGeneration is the desired-generation token from the
+	// last successful reconcile run. stop-services/start-services use it to
+	// run disruptive upgrade/resize work only once per successful generation,
+	// even if IS_UPGRADE or IS_RESIZE remain stuck in heat-params.
+	PreviousSuccessfulGeneration string
+
 	// PreviousKubeTag is the KUBE_TAG from the last successful reconcile run.
-	// Used by stop-services/start-services to detect actual upgrades (KUBE_TAG
-	// changed) vs stale IS_UPGRADE=true that never resets in heat-params.
+	// Upgrade drain/restart work only runs when this differs from the current
+	// desired tag, so same-tag updates with IS_UPGRADE=true stay non-disruptive.
 	PreviousKubeTag string
 
 	// PreviousCARotationID is the last successfully applied CA rotation ID from
@@ -34,6 +40,25 @@ type Request struct {
 	// when they change a file that affects a running service.  The "services"
 	// module reads the tracker and only restarts what actually changed.
 	Restarts *RestartTracker
+}
+
+// DisruptiveServiceCycleNeeded reports whether stop-services/start-services
+// should perform the disruptive node drain/stop/start cycle. Upgrade intent is
+// further gated by an actual KUBE_TAG change so same-tag updates with
+// IS_UPGRADE=true do not drain. Resize still relies on the last successful
+// generation to avoid re-triggering on later periodic runs.
+func DisruptiveServiceCycleNeeded(cfg config.Config, req Request) bool {
+	switch {
+	case cfg.Shared.IsUpgrade:
+		return req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
+	case cfg.Shared.IsResize:
+		if req.PreviousSuccessfulGeneration == "" {
+			return false
+		}
+		return req.PreviousSuccessfulGeneration != cfg.GenerationToken()
+	default:
+		return false
+	}
 }
 
 // RestartTracker is a thread-safe set of systemd service names that need
@@ -163,15 +188,14 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 
 		// Addon feature flags — tracked so Pulumi can diff enabled/disabled
 		// state between runs and show meaningful plan output.
-		"cloudProviderEnabled":   pulumi.Bool(cfg.Shared.CloudProviderEnabled),
-		"kubeDashboardEnabled":   pulumi.Bool(cfg.Shared.KubeDashboardEnabled),
-		"metricsServerEnabled":   pulumi.Bool(cfg.Shared.MetricsServerEnabled),
-		"autoHealingEnabled":    pulumi.Bool(cfg.Shared.AutoHealingEnabled),
-		"autoScalingEnabled": pulumi.Bool(cfg.Shared.AutoScalingEnabled),
-		"osAutoUpgradeEnabled":  pulumi.Bool(cfg.Shared.OSAutoUpgradeEnabled),
-		"cinderCsiEnabled": pulumi.Bool(cfg.Shared.CinderCSIEnabled),
-		"manilaCSIEnabled": pulumi.Bool(cfg.Shared.ManilaCSIEnabled),
-
+		"cloudProviderEnabled": pulumi.Bool(cfg.Shared.CloudProviderEnabled),
+		"kubeDashboardEnabled": pulumi.Bool(cfg.Shared.KubeDashboardEnabled),
+		"metricsServerEnabled": pulumi.Bool(cfg.Shared.MetricsServerEnabled),
+		"autoHealingEnabled":   pulumi.Bool(cfg.Shared.AutoHealingEnabled),
+		"autoScalingEnabled":   pulumi.Bool(cfg.Shared.AutoScalingEnabled),
+		"osAutoUpgradeEnabled": pulumi.Bool(cfg.Shared.OSAutoUpgradeEnabled),
+		"cinderCsiEnabled":     pulumi.Bool(cfg.Shared.CinderCSIEnabled),
+		"manilaCSIEnabled":     pulumi.Bool(cfg.Shared.ManilaCSIEnabled),
 	}
 
 	// Role-specific fields

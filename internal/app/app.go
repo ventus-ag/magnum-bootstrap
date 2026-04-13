@@ -351,12 +351,13 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	}()
 
 	runResult, reconcileState, err := reconcile.Run(ctx, mode, f.diff, f.refresh, f.debug, f.parallelism, cfg, runtimePaths, reconcilePlan, moduleapi.Request{
-		Apply:                mode != "preview",
-		AllowPartial:         f.allowPartial,
-		Logger:               logger,
-		Paths:                runtimePaths,
-		PreviousKubeTag:      previousState.LastKubeTag,
-		PreviousCARotationID: previousState.LastCARotationID,
+		Apply:                        mode != "preview",
+		AllowPartial:                 f.allowPartial,
+		Logger:                       logger,
+		Paths:                        runtimePaths,
+		PreviousSuccessfulGeneration: previousState.LastSuccessfulGeneration,
+		PreviousKubeTag:              previousState.LastKubeTag,
+		PreviousCARotationID:         previousState.LastCARotationID,
 	}, eventCh)
 	safeCloseEngineEvents(eventCh)
 	<-done // wait for event stream to drain
