@@ -43,8 +43,6 @@ func cleanupDeprecatedFlannel(executor *host.Executor) {
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "daemonset", "kube-flannel-ds", "-n", "kube-system", "--ignore-not-found=true"},
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "configmap", "kube-flannel-cfg", "-n", "kube-system", "--ignore-not-found=true"},
 		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "serviceaccount", "flannel", "-n", "kube-system", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrolebinding", "flannel", "--ignore-not-found=true"},
-		{"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "delete", "clusterrole", "flannel", "--ignore-not-found=true"},
 	}
 	for _, cmd := range legacyDeletes {
 		_ = executor.Run(cmd[0], cmd[1:]...)
