@@ -6,7 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
-	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
+	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -53,10 +53,6 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Chart:       "flannel",
 		Version:     "v0.28.2",
 		RepoURL:     "https://flannel-io.github.io/flannel/",
-		// Flannel upgrades are already disruptive at the node-network layer and
-		// old-cluster migrations have repeatedly hit upgrade patch/adoption edge
-		// cases. Prefer force update so Helm replaces changed resources directly.
-		ForceUpdate: true,
 		Values: map[string]interface{}{
 			"podCidr": podCIDR,
 			"flannel": map[string]interface{}{
