@@ -53,6 +53,10 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Chart:       "flannel",
 		Version:     "v0.28.2",
 		RepoURL:     "https://flannel-io.github.io/flannel/",
+		// Flannel upgrades are already disruptive at the node-network layer and
+		// old-cluster migrations have repeatedly hit upgrade patch/adoption edge
+		// cases. Prefer force update so Helm replaces changed resources directly.
+		ForceUpdate: true,
 		Values: map[string]interface{}{
 			"podCidr": podCIDR,
 			"flannel": map[string]interface{}{
