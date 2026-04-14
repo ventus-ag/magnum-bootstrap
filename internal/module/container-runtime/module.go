@@ -80,6 +80,12 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	var changes []host.Change
 	configChanged := false
 
+	legacyDockerUnit, err := (hostresource.FileSpec{Path: "/etc/systemd/system/docker.service", Absent: true}).Apply(executor)
+	if err != nil {
+		return nil, false, err
+	}
+	changes = append(changes, legacyDockerUnit.Changes...)
+
 	for _, unit := range []string{"docker", "docker.socket"} {
 		res, err := (hostresource.SystemdServiceSpec{
 			Unit:          unit,
@@ -499,14 +505,20 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		var tarballRes pulumi.Resource
 		var serviceDeps []pulumi.Resource
 		var err error
+		legacyDockerUnitRes, err := hostsdk.RegisterFileSpec(ctx, name+"-legacy-docker-unit", hostresource.FileSpec{Path: "/etc/systemd/system/docker.service", Absent: true}, childOpts...)
+		if err != nil {
+			return nil, err
+		}
+		serviceDeps = append(serviceDeps, legacyDockerUnitRes)
 		for _, unit := range []string{"docker", "docker.socket"} {
+			serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, serviceDeps...)
 			if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-disable-"+strings.ReplaceAll(unit, ".", "-"), hostresource.SystemdServiceSpec{
 				Unit:          unit,
 				SkipIfMissing: true,
 				Enabled:       hostresource.BoolPtr(false),
 				Active:        hostresource.BoolPtr(false),
 				Masked:        hostresource.BoolPtr(true),
-			}, childOpts...); err != nil {
+			}, serviceOpts...); err != nil {
 				return nil, err
 			}
 		}
