@@ -285,6 +285,30 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 
 				retryUp("up (force retry)")
 			}
+			// Some legacy clusters have Helm release resources whose objects exist
+			// in the cluster without the Helm ownership labels/annotations. Patch
+			// the expected metadata onto those live resources and retry once.
+			if err != nil {
+				ownershipConflicts := clusterhelm.ParseHelmOwnershipConflicts(err.Error())
+				if len(ownershipConflicts) > 0 {
+					executor := host.NewExecutor(true, req.Logger)
+					repaired := clusterhelm.RepairHelmOwnershipConflicts(executor, ownershipConflicts)
+					if len(repaired) > 0 {
+						names := make([]string, len(repaired))
+						for i, conflict := range repaired {
+							if conflict.ResourceNamespace != "" {
+								names[i] = conflict.ResourceNamespace + "/" + strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+							} else {
+								names[i] = strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+							}
+						}
+						if req.Logger != nil {
+							req.Logger.Warnf("helm ownership metadata conflict for %v, retrying after patching live resources", names)
+						}
+						retryUp("up (ownership repair retry)")
+					}
+				}
+			}
 			// Legacy clusters may already have Helm releases created outside
 			// Pulumi state. If adoption/import still results in Helm reporting
 			// "name is still in use", first repair stale import markers for

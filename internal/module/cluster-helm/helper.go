@@ -424,9 +424,22 @@ type HelmReleasePair struct {
 	Name      string
 }
 
+// HelmOwnershipConflict describes a live Kubernetes object that blocks a Helm
+// release update because it exists without the expected Helm ownership labels
+// and annotations.
+type HelmOwnershipConflict struct {
+	ReleaseNamespace  string
+	ReleaseName       string
+	ResourceKind      string
+	ResourceNamespace string
+	ResourceName      string
+}
+
 // helmReleaseRe matches Helm release identifiers in Pulumi error output.
 // Patterns: `Helm release "NAMESPACE/NAME"` or `Helm Release NAMESPACE/NAME:`
 var helmReleaseRe = regexp.MustCompile(`Helm [Rr]elease "?([a-z0-9-]+)/([a-z0-9-]+)"?`)
+
+var helmOwnershipConflictRe = regexp.MustCompile(`(?s)([A-Za-z][A-Za-z0-9]+) "([^"]+)"(?: in namespace "([^"]*)")? exists and cannot be imported into the current release: invalid ownership metadata;.*?meta\.helm\.sh/release-name": must be set to "([^"]+)"; annotation validation error: .*?meta\.helm\.sh/release-namespace": must be set to "([^"]+)"`)
 
 // ParseHelmPatchFailures extracts Helm releases that failed due to patch
 // errors (e.g. "cannot patch", "is invalid") from a Pulumi error message.
@@ -453,4 +466,72 @@ func ParseHelmPatchFailures(errMsg string) []HelmReleasePair {
 // the release name already exists outside Pulumi state.
 func HasHelmNameReuseConflict(errMsg string) bool {
 	return strings.Contains(errMsg, "cannot re-use a name that is still in use")
+}
+
+// ParseHelmOwnershipConflicts extracts resources that block a Helm release
+// update because they exist without the expected Helm ownership metadata.
+func ParseHelmOwnershipConflicts(errMsg string) []HelmOwnershipConflict {
+	if !strings.Contains(errMsg, "exists and cannot be imported into the current release") || !strings.Contains(errMsg, "invalid ownership metadata") {
+		return nil
+	}
+	matches := helmOwnershipConflictRe.FindAllStringSubmatch(errMsg, -1)
+	seen := make(map[string]bool, len(matches))
+	conflicts := make([]HelmOwnershipConflict, 0, len(matches))
+	for _, m := range matches {
+		conflict := HelmOwnershipConflict{
+			ResourceKind:      m[1],
+			ResourceName:      m[2],
+			ResourceNamespace: strings.TrimSpace(m[3]),
+			ReleaseName:       m[4],
+			ReleaseNamespace:  m[5],
+		}
+		key := strings.Join([]string{conflict.ReleaseNamespace, conflict.ReleaseName, conflict.ResourceKind, conflict.ResourceNamespace, conflict.ResourceName}, "/")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		conflicts = append(conflicts, conflict)
+	}
+	return conflicts
+}
+
+// RepairHelmOwnershipConflicts patches the expected Helm labels/annotations
+// onto the conflicting live resources so Helm can adopt them on retry.
+func RepairHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwnershipConflict) []HelmOwnershipConflict {
+	if executor == nil {
+		return nil
+	}
+	var repaired []HelmOwnershipConflict
+	for _, conflict := range conflicts {
+		resourceRef := strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+		labelArgs := []string{"label"}
+		annotateArgs := []string{"annotate"}
+		if conflict.ResourceNamespace != "" {
+			labelArgs = append(labelArgs, "-n", conflict.ResourceNamespace)
+			annotateArgs = append(annotateArgs, "-n", conflict.ResourceNamespace)
+		}
+		labelArgs = append(labelArgs, resourceRef, "app.kubernetes.io/managed-by=Helm", "--overwrite")
+		annotateArgs = append(annotateArgs, resourceRef,
+			"meta.helm.sh/release-name="+conflict.ReleaseName,
+			"meta.helm.sh/release-namespace="+conflict.ReleaseNamespace,
+			"--overwrite",
+		)
+		if executor.Logger != nil {
+			executor.Logger.Warnf("helm ownership repair: patching %s %s for release %s/%s", conflict.ResourceKind, resourceRef, conflict.ReleaseNamespace, conflict.ReleaseName)
+		}
+		if err := executor.Run("kubectl", labelArgs...); err != nil {
+			if executor.Logger != nil {
+				executor.Logger.Warnf("helm ownership repair: failed labeling %s: %v", resourceRef, err)
+			}
+			continue
+		}
+		if err := executor.Run("kubectl", annotateArgs...); err != nil {
+			if executor.Logger != nil {
+				executor.Logger.Warnf("helm ownership repair: failed annotating %s: %v", resourceRef, err)
+			}
+			continue
+		}
+		repaired = append(repaired, conflict)
+	}
+	return repaired
 }
