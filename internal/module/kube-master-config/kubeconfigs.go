@@ -85,7 +85,7 @@ func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change
 	apiServerEnv := fmt.Sprintf(`KUBE_API_ADDRESS="--bind-address=0.0.0.0 --secure-port=%d"
 KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=%s"
 KUBE_API_ARGS="%s"
-KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379,http://127.0.0.1:4001"
+KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
 `, apiPort, cfg.Shared.PortalNetworkCIDR, apiServerArgs)
 	change, err = applyFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/apiserver", Content: []byte(apiServerEnv), Mode: 0o644})
 	if err != nil {
@@ -163,7 +163,7 @@ func registerKubeConfigResources(ctx *pulumi.Context, name string, cfg config.Co
 		{name: "apiserver-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/apiserver", Content: []byte(fmt.Sprintf(`KUBE_API_ADDRESS="--bind-address=0.0.0.0 --secure-port=%d"
 KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=%s"
 KUBE_API_ARGS="%s"
-KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379,http://127.0.0.1:4001"
+KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
 `, apiPort, cfg.Shared.PortalNetworkCIDR, buildAPIServerArgs(cfg))), Mode: 0o644}},
 		{name: "controller-manager-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/controller-manager", Content: []byte(fmt.Sprintf("KUBE_CONTROLLER_MANAGER_ARGS=\"%s\"\n", buildControllerManagerArgs(cfg))), Mode: 0o644}},
 		{name: "scheduler-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/scheduler", Content: []byte("KUBE_SCHEDULER_ARGS=\"--leader-elect=true --kubeconfig=/etc/kubernetes/scheduler-kubeconfig.yaml\"\n"), Mode: 0o644}},
