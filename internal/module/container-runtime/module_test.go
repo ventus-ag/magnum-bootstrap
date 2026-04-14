@@ -1,6 +1,8 @@
 package containerruntime
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -43,4 +45,44 @@ func TestContainerdConfigUsesResolvedCgroupDriver(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLegacyDockerUnitNeedsRemoval(t *testing.T) {
+	t.Run("missing path", func(t *testing.T) {
+		remove, err := legacyDockerUnitNeedsRemoval(filepath.Join(t.TempDir(), "docker.service"))
+		if err != nil {
+			t.Fatalf("legacyDockerUnitNeedsRemoval() error = %v", err)
+		}
+		if remove {
+			t.Fatal("expected missing path to require no removal")
+		}
+	})
+
+	t.Run("regular file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "docker.service")
+		if err := os.WriteFile(path, []byte("[Service]\nExecStart=/usr/bin/dockerd\n"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		remove, err := legacyDockerUnitNeedsRemoval(path)
+		if err != nil {
+			t.Fatalf("legacyDockerUnitNeedsRemoval() error = %v", err)
+		}
+		if !remove {
+			t.Fatal("expected regular file to require removal")
+		}
+	})
+
+	t.Run("masked symlink", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "docker.service")
+		if err := os.Symlink("/dev/null", path); err != nil {
+			t.Fatalf("create symlink: %v", err)
+		}
+		remove, err := legacyDockerUnitNeedsRemoval(path)
+		if err != nil {
+			t.Fatalf("legacyDockerUnitNeedsRemoval() error = %v", err)
+		}
+		if remove {
+			t.Fatal("expected /dev/null symlink to be preserved")
+		}
+	})
 }

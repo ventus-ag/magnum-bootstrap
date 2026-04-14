@@ -80,11 +80,13 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	var changes []host.Change
 	configChanged := false
 
-	legacyDockerUnit, err := (hostresource.FileSpec{Path: "/etc/systemd/system/docker.service", Absent: true}).Apply(executor)
+	legacyDockerUnit, err := removeLegacyDockerUnitOverride(executor, "/etc/systemd/system/docker.service")
 	if err != nil {
 		return nil, false, err
 	}
-	changes = append(changes, legacyDockerUnit.Changes...)
+	if legacyDockerUnit != nil {
+		changes = append(changes, *legacyDockerUnit)
+	}
 
 	for _, unit := range []string{"docker", "docker.socket"} {
 		res, err := (hostresource.SystemdServiceSpec{
@@ -449,6 +451,35 @@ func containerdUsesSystemdCgroup(cgroupDriver string) bool {
 	return strings.EqualFold(cgroupDriver, "systemd")
 }
 
+func removeLegacyDockerUnitOverride(executor *host.Executor, path string) (*host.Change, error) {
+	remove, err := legacyDockerUnitNeedsRemoval(path)
+	if err != nil {
+		return nil, err
+	}
+	if !remove {
+		return nil, nil
+	}
+	return executor.EnsureAbsent(path)
+}
+
+func legacyDockerUnitNeedsRemoval(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return true, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, err
+	}
+	return target != "/dev/null", nil
+}
+
 // parseContainerdMajor extracts the major version from a containerd version
 // string like "2.2.2" or "1.7.27". Returns (major, rest, ok).
 func parseContainerdMajor(version string) (int, string, bool) {
@@ -505,11 +536,6 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		var tarballRes pulumi.Resource
 		var serviceDeps []pulumi.Resource
 		var err error
-		legacyDockerUnitRes, err := hostsdk.RegisterFileSpec(ctx, name+"-legacy-docker-unit", hostresource.FileSpec{Path: "/etc/systemd/system/docker.service", Absent: true}, childOpts...)
-		if err != nil {
-			return nil, err
-		}
-		serviceDeps = append(serviceDeps, legacyDockerUnitRes)
 		for _, unit := range []string{"docker", "docker.socket"} {
 			serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, serviceDeps...)
 			if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-disable-"+strings.ReplaceAll(unit, ".", "-"), hostresource.SystemdServiceSpec{
