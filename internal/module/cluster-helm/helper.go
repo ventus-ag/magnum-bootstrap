@@ -535,3 +535,31 @@ func RepairHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwner
 	}
 	return repaired
 }
+
+// DeleteHelmOwnershipConflicts removes the exact live resources that still
+// block a Helm release update after ownership repair was attempted.
+func DeleteHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwnershipConflict) []HelmOwnershipConflict {
+	if executor == nil {
+		return nil
+	}
+	var deleted []HelmOwnershipConflict
+	for _, conflict := range conflicts {
+		resourceRef := strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+		deleteArgs := []string{"delete"}
+		if conflict.ResourceNamespace != "" {
+			deleteArgs = append(deleteArgs, "-n", conflict.ResourceNamespace)
+		}
+		deleteArgs = append(deleteArgs, resourceRef, "--ignore-not-found=true")
+		if executor.Logger != nil {
+			executor.Logger.Warnf("helm ownership fallback: deleting %s %s for release %s/%s", conflict.ResourceKind, resourceRef, conflict.ReleaseNamespace, conflict.ReleaseName)
+		}
+		if err := executor.Run("kubectl", deleteArgs...); err != nil {
+			if executor.Logger != nil {
+				executor.Logger.Warnf("helm ownership fallback: failed deleting %s: %v", resourceRef, err)
+			}
+			continue
+		}
+		deleted = append(deleted, conflict)
+	}
+	return deleted
+}

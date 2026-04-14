@@ -262,6 +262,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		upRes, err = stack.Up(ctx, upOpts...)
 		stopHeartbeat()
 		if err != nil {
+			executor := host.NewExecutor(true, req.Logger)
 			// Check if the failure is a Helm release patch error. These
 			// happen during chart version upgrades when the strategic merge
 			// patch produces an invalid K8s object. Retry once with
@@ -278,7 +279,6 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 
 				// Clean up Helm releases left in "failed" state by the
 				// first attempt so the retry can start fresh.
-				executor := host.NewExecutor(true, req.Logger)
 				for _, rel := range helmFailures {
 					clusterhelm.CleanupFailedRelease(executor, rel.Name, rel.Namespace)
 				}
@@ -287,25 +287,50 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			}
 			// Some legacy clusters have Helm release resources whose objects exist
 			// in the cluster without the Helm ownership labels/annotations. Patch
-			// the expected metadata onto those live resources and retry once.
+			// the expected metadata onto those live resources and keep retrying
+			// within this run until the next ownership blocker is exposed.
 			if err != nil {
-				ownershipConflicts := clusterhelm.ParseHelmOwnershipConflicts(err.Error())
-				if len(ownershipConflicts) > 0 {
-					executor := host.NewExecutor(true, req.Logger)
+				const maxOwnershipRepairRetries = 10
+				for attempt := 1; err != nil && attempt <= maxOwnershipRepairRetries; attempt++ {
+					ownershipConflicts := clusterhelm.ParseHelmOwnershipConflicts(err.Error())
+					if len(ownershipConflicts) == 0 {
+						break
+					}
 					repaired := clusterhelm.RepairHelmOwnershipConflicts(executor, ownershipConflicts)
-					if len(repaired) > 0 {
-						names := make([]string, len(repaired))
-						for i, conflict := range repaired {
-							if conflict.ResourceNamespace != "" {
-								names[i] = conflict.ResourceNamespace + "/" + strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
-							} else {
-								names[i] = strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+					if len(repaired) == 0 {
+						break
+					}
+					names := make([]string, len(repaired))
+					for i, conflict := range repaired {
+						if conflict.ResourceNamespace != "" {
+							names[i] = conflict.ResourceNamespace + "/" + strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+						} else {
+							names[i] = strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+						}
+					}
+					if req.Logger != nil {
+						req.Logger.Warnf("helm ownership metadata conflict for %v, retrying after patching live resources (attempt %d/%d)", names, attempt, maxOwnershipRepairRetries)
+					}
+					retryUp(fmt.Sprintf("up (ownership repair retry %d)", attempt))
+				}
+				if err != nil {
+					ownershipConflicts := clusterhelm.ParseHelmOwnershipConflicts(err.Error())
+					if len(ownershipConflicts) > 0 {
+						deleted := clusterhelm.DeleteHelmOwnershipConflicts(executor, ownershipConflicts)
+						if len(deleted) > 0 {
+							names := make([]string, len(deleted))
+							for i, conflict := range deleted {
+								if conflict.ResourceNamespace != "" {
+									names[i] = conflict.ResourceNamespace + "/" + strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+								} else {
+									names[i] = strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
+								}
 							}
+							if req.Logger != nil {
+								req.Logger.Warnf("helm ownership conflict persisted for %v, retrying after deleting live resources", names)
+							}
+							retryUp("up (ownership delete retry)")
 						}
-						if req.Logger != nil {
-							req.Logger.Warnf("helm ownership metadata conflict for %v, retrying after patching live resources", names)
-						}
-						retryUp("up (ownership repair retry)")
 					}
 				}
 			}
@@ -316,7 +341,6 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			// uninstall only the still-pending import releases and retry once so
 			// Pulumi can recreate them fresh.
 			if err != nil && clusterhelm.HasHelmNameReuseConflict(err.Error()) {
-				executor := host.NewExecutor(true, req.Logger)
 				repaired := clusterhelm.PrepareManagedImports(executor)
 				if len(repaired) > 0 {
 					names := make([]string, len(repaired))
