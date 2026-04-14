@@ -296,11 +296,6 @@ func ManagedReleases() []HelmReleasePair {
 // a successful pulumi up.
 func PromoteManagedReleases() {
 	for _, rel := range ManagedReleases() {
-		if _, err := os.Stat(importMarkerPath(rel.Namespace, rel.Name)); err == nil {
-			// Import marker still present means this release still needs a later
-			// repair or recreate path; don't promote it yet.
-			continue
-		}
 		MarkAdopted(rel.Name, rel.Namespace)
 	}
 }

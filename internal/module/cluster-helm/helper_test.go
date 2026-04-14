@@ -81,6 +81,26 @@ func TestPromoteManagedReleasesMarksAdopted(t *testing.T) {
 	}
 }
 
+func TestPromoteManagedReleasesClearsImportMarkerAfterSuccessfulImport(t *testing.T) {
+	oldRoot := helmMarkerRootDir
+	helmMarkerRootDir = t.TempDir()
+	defer func() { helmMarkerRootDir = oldRoot }()
+
+	MarkManaged("coredns", "kube-system")
+	if err := os.WriteFile(importMarkerPath("kube-system", "coredns"), []byte("kube-system/coredns"), 0o644); err != nil {
+		t.Fatalf("write import marker: %v", err)
+	}
+
+	PromoteManagedReleases()
+
+	if _, err := os.Stat(adoptedMarkerPath("kube-system", "coredns")); err != nil {
+		t.Fatalf("expected adopted marker after promoting managed imported release: %v", err)
+	}
+	if _, err := os.Stat(importMarkerPath("kube-system", "coredns")); !os.IsNotExist(err) {
+		t.Fatalf("expected import marker to be removed after promoting managed imported release, got: %v", err)
+	}
+}
+
 func removeIfExists(path string) error {
 	if _, err := os.Stat(path); err != nil {
 		return nil
