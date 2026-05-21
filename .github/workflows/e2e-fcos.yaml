@@ -114,6 +114,7 @@ jobs:
         with:
           name: fcos-e2e-${{ matrix.name }}-diag
           path: |
-            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/console.log
+            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/console.*.log
             ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/heat-params.*
+            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/ignition.*.json
           if-no-files-found: ignore

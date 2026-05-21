@@ -172,13 +172,25 @@ boot_node() {
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
     "${net[@]}" &
   QEMU_PIDS[$name]=$!
-  log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH"
-  for _ in $(seq 1 120); do
-    if gssh "$port" true 2>/dev/null; then log "$name SSH up"; return 0; fi
-    kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null || die "$name qemu exited early (see console.${name}.log)"
-    sleep 5
+  local clog="$WORKDIR/console.${name}.log" waited=0
+  log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH on 127.0.0.1:$port (console: $clog)"
+  for attempt in $(seq 1 120); do
+    if gssh "$port" true 2>/dev/null; then log "$name SSH up after ${waited}s"; return 0; fi
+    if ! kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null; then
+      err "$name qemu exited early after ${waited}s — last 40 console lines:"
+      tail -n 40 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
+      die "$name qemu exited early (see $clog)"
+    fi
+    # Heartbeat every ~30s with a console tail so a stuck boot/Ignition is visible.
+    if [ $((attempt % 6)) -eq 0 ]; then
+      log "$name still waiting for SSH (${waited}s elapsed) — console tail:"
+      tail -n 8 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (console log empty — qemu may not have started serial output yet)" >&2
+    fi
+    sleep 5; waited=$((waited + 5))
   done
-  die "$name SSH did not come up (see $WORKDIR/console.${name}.log)"
+  err "$name SSH did not come up after ${waited}s — last 60 console lines:"
+  tail -n 60 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
+  die "$name SSH did not come up (see $clog)"
 }
 
 # provision_node <name> <ssh_port> <start_mock 0|1>
