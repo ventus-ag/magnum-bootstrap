@@ -83,13 +83,14 @@ openstack_packages() {
   esac
 }
 
-# Tools needed even on an OpenStack-only (--no-vm) runner.
+# Tools needed even on an OpenStack-only (--no-vm) runner. `make` builds the
+# reconciler + e2e helpers (run-fcos-e2e.sh calls `make build`).
 base_packages() {
   case "$1" in
-    apt-get) echo "jq curl xz-utils openssh-client ca-certificates" ;;
-    dnf|yum) echo "jq curl xz openssh-clients ca-certificates" ;;
-    pacman)  echo "jq curl xz openssh" ;;
-    zypper)  echo "jq curl xz openssh" ;;
+    apt-get) echo "jq curl xz-utils openssh-client ca-certificates make" ;;
+    dnf|yum) echo "jq curl xz openssh-clients ca-certificates make" ;;
+    pacman)  echo "jq curl xz openssh make" ;;
+    zypper)  echo "jq curl xz openssh make" ;;
   esac
 }
 

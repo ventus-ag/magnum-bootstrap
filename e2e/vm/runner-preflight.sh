@@ -28,6 +28,7 @@ echo "== runner preflight (${MODE} tier) =="
 
 echo "- core tools"
 check_tool go
+check_tool make
 check_tool jq
 check_tool curl
 check_tool ssh

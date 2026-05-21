@@ -100,7 +100,7 @@ trap cleanup EXIT
 
 # --- setup -----------------------------------------------------------------
 preflight() {
-  for t in qemu-system-x86_64 qemu-img jq xz curl ssh scp go; do require "$t"; done
+  for t in qemu-system-x86_64 qemu-img jq xz curl ssh scp go make; do require "$t"; done
   resolve_butane
   log "butane renderer: $BUTANE; workers: $WORKERS"
   [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required"
