@@ -50,12 +50,13 @@ MCAST="${MCAST:-230.0.0.77:34801}"
 MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
 
-# QEMU CPU/accel. QEMU_CPU=auto (default) resolves the model at preflight:
-# on a nested AMD-V host, `-cpu host` makes the FCoS guest stall in early init
-# (nested SVM L2 guests are fragile), so auto switches to a named model
-# ($QEMU_CPU_AMD, default EPYC) which boots reliably; everywhere else auto = host.
-# Override explicitly with e.g. QEMU_CPU=EPYC-Milan / max / Nehalem, or
-# QEMU_ACCEL=tcg QEMU_CPU=qemu64 to rule KVM out entirely (slow).
+# QEMU CPU/accel. QEMU_CPU=auto (default) resolves at preflight. On a nested
+# AMD-V host the FCoS guest soft-locks in early boot with >1 vCPU (TSC warps
+# between vCPUs + a cross-vCPU TLB-flush IPI never completes), so auto uses a
+# named model ($QEMU_CPU_AMD, default EPYC) AND caps to 1 vCPU/node; everywhere
+# else auto = host with the configured vCPU count. Override the model with e.g.
+# QEMU_CPU=EPYC-Milan / max / host, keep multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1,
+# or rule KVM out entirely (slow) with QEMU_ACCEL=tcg QEMU_CPU=qemu64.
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_CPU_AMD="${QEMU_CPU_AMD:-EPYC}"
@@ -104,7 +105,16 @@ resolve_qemu_cpu() {
   vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
   if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
     QEMU_CPU="$QEMU_CPU_AMD"
-    log "QEMU cpu=auto -> $QEMU_CPU (nested AMD-V '$virt': -cpu host stalls L2 guests in early init)"
+    log "QEMU cpu=auto -> $QEMU_CPU (nested AMD-V '$virt')"
+    if [ "${ALLOW_SMP_ON_NESTED_AMD:-0}" != 1 ]; then
+      # Nested AMD-V (especially Zen1) livelocks with >1 vCPU during early boot:
+      # the TSC warps between vCPUs (clock marked unstable) and a cross-vCPU
+      # TLB-flush IPI in smp_call_function_many never completes -> all vCPUs spin
+      # 100% -> soft lockup -> hang. A single vCPU removes both the inter-vCPU TSC
+      # sync and the cross-CPU IPI. Override with ALLOW_SMP_ON_NESTED_AMD=1.
+      MASTER_CPUS=1; WORKER_CPUS=1
+      log "nested AMD-V: capping nodes to 1 vCPU (multi-vCPU soft-locks in early boot; set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
+    fi
   else
     QEMU_CPU=host
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
