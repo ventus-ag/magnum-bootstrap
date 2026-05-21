@@ -20,6 +20,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/buildinfo"
+	"github.com/ventus-ag/magnum-bootstrap/internal/carotation"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
@@ -767,13 +768,17 @@ func successfulState(cfg config.Config, req moduleapi.Request, reconcilePlan pla
 	}
 }
 
-func effectiveCARotationStateID(cfg config.Config, previousID string) string {
-	previousID = strings.TrimSpace(previousID)
-	currentID := strings.TrimSpace(cfg.Trigger.CARotationID)
-	if cfg.IsPureCARotation() && currentID != "" {
-		return currentID
+func effectiveCARotationStateID(_ config.Config, previousID string) string {
+	// The finalize marker is the authoritative completion signal: the
+	// ca-rotation module writes it only after a rotation fully finalizes. Using
+	// it here (instead of the in-flight CA_ROTATION_ID) means a rotation that
+	// fails mid-protocol is not falsely recorded as applied, so the next run
+	// re-enters and resumes it. Falling back to the previous state ID preserves
+	// earlier completions when no marker is present.
+	if marker := carotation.ReadMarker(); marker != "" {
+		return marker
 	}
-	return previousID
+	return strings.TrimSpace(previousID)
 }
 
 // formatPreviewSummaryLine builds a one-line summary from a preview change map:
