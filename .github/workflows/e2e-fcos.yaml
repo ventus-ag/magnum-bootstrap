@@ -21,6 +21,9 @@ on:
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
         default: victoria-ca-rotation
+      workers:
+        description: Number of worker nodes (0 = single-node master)
+        default: "0"
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
@@ -101,6 +104,7 @@ jobs:
           KUBE_TAG: ${{ matrix.kube_tag }}
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
+          WORKERS: ${{ github.event.inputs.workers || '0' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
 

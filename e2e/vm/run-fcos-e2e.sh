@@ -2,25 +2,30 @@
 #
 # run-fcos-e2e.sh — host orchestrator for the Fedora CoreOS reconciler e2e.
 #
-# Boots a real Fedora CoreOS VM under QEMU/KVM, drives the actual magnum_victoria
+# Boots real Fedora CoreOS VM(s) under QEMU/KVM, drives the actual ventus-ag/magnum
 # bootstrap pipeline (launcher + systemd units) against the freshly built
-# reconciler, and walks the node through create -> ca-rotate -> upgrade,
-# asserting cluster health and idempotency at each step. OpenStack-integrated
-# addons (OCCM, Cinder/Manila CSI) are intentionally OFF here — they require a
-# real cloud and are covered by run-magnum-e2e.sh.
+# reconciler, and walks the cluster through create -> ca-rotate -> upgrade,
+# asserting health and idempotency. OpenStack-integrated addons (OCCM, Cinder/
+# Manila CSI) are intentionally OFF here — see run-magnum-e2e.sh.
 #
-# Requires on the runner: qemu-system-x86_64 (KVM), qemu-img, jq, xz, curl,
-# podman (for butane), ssh/scp, go.
+# Single node (default, WORKERS=0): one VM, user-mode networking, KUBE_NODE_IP
+# 10.0.2.15, mock Magnum on 127.0.0.1 — the proven path.
 #
-# Key env knobs (all have defaults):
-#   KUBE_TAG            initial Kubernetes version           (default v1.30.5)
-#   KUBE_TAG_UPGRADE    version for the upgrade scenario     (default v1.31.4)
-#   FCOS_STREAM         Fedora CoreOS stream                 (default stable)
-#   VICTORIA_DIR        path to magnum_victoria checkout     (required)
-#   SCENARIOS           space list: create ca-rotate upgrade (default all three)
-#   VM_MEM_MB / VM_CPUS VM sizing                            (default 6144 / 4)
-#   WORKDIR             scratch dir                          (default mktemp)
-#   KEEP_VM            "1" leaves the VM running for debugging
+# Multi node (WORKERS>=1): each VM gets a second NIC on a shared QEMU socket/
+# mcast segment (no host bridge/root needed); MAC-matched static IPs form a
+# cluster network (master 192.168.77.10, workers .20+). The mock Magnum runs on
+# the master's cluster IP so workers can reach it; workers join the master's API.
+# NOTE: the inter-VM path is a first cut — validate on the runner.
+#
+# Requires: qemu-system-x86_64 (KVM), qemu-img, jq, xz, curl, butane|podman|docker,
+# ssh/scp, go.
+#
+# Env knobs (defaults):
+#   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
+#   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade)
+#   WORKERS 0          MASTER_MEM_MB 6144   MASTER_CPUS 4
+#                      WORKER_MEM_MB 2560   WORKER_CPUS 2
+#   WORKDIR (mktemp)   KEEP_VM 0
 #
 set -euo pipefail
 
@@ -31,56 +36,73 @@ KUBE_TAG_UPGRADE="${KUBE_TAG_UPGRADE:-v1.31.4}"
 FCOS_STREAM="${FCOS_STREAM:-stable}"
 VICTORIA_DIR="${VICTORIA_DIR:-}"
 SCENARIOS="${SCENARIOS:-create ca-rotate upgrade}"
-VM_MEM_MB="${VM_MEM_MB:-6144}"
-VM_CPUS="${VM_CPUS:-4}"
-SSH_PORT="${SSH_PORT:-2222}"
-NODE_IP="10.0.2.15"                # fixed QEMU user-mode guest IP
+WORKERS="${WORKERS:-0}"
+
+# Per-role sizing (VM_MEM_MB/VM_CPUS kept as backward-compatible fallbacks).
+MASTER_MEM_MB="${MASTER_MEM_MB:-${VM_MEM_MB:-6144}}"
+MASTER_CPUS="${MASTER_CPUS:-${VM_CPUS:-4}}"
+WORKER_MEM_MB="${WORKER_MEM_MB:-2560}"
+WORKER_CPUS="${WORKER_CPUS:-2}"
+
+# Cluster network (multi-node only).
+CNET="${CNET:-192.168.77}"
+MCAST="${MCAST:-230.0.0.77:34801}"
+MASTER_CIP="${CNET}.10"
+MASTER_CMAC="52:54:00:77:00:0a"
+
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
-
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/fcos-e2e.XXXXXX)}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/fcos-e2e}"
-QEMU_PID=""
+BUTANE=""
+declare -A QEMU_PIDS=()
 
 log()  { printf '\033[1;32m[host %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 err()  { printf '\033[1;31m[host %s] ERROR:\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-SSHOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
-         -o ConnectTimeout=10 -i "$WORKDIR/id_ed25519" -p "$SSH_PORT")
-gssh() { ssh "${SSHOPTS[@]}" root@127.0.0.1 "$@"; }
-gscp() { scp "${SSHOPTS[@]}" "$@"; }
+multinode() { [ "${WORKERS:-0}" -ge 1 ]; }
+
+# --- node identity helpers -------------------------------------------------
+worker_ip()   { echo "${CNET}.$((20 + $1))"; }
+worker_cmac() { printf '52:54:00:77:00:%02x' "$((20 + $1))"; }
+master_ip()   { if multinode; then echo "$MASTER_CIP"; else echo "10.0.2.15"; fi; }
+mock_host()   { if multinode; then echo "$MASTER_CIP"; else echo "127.0.0.1"; fi; }
+ssh_port()    { case "$1" in master) echo 2222 ;; *) echo "$((2300 + ${1#worker}))" ;; esac; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+resolve_butane() {
+  if command -v butane >/dev/null 2>&1; then BUTANE="native"
+  elif command -v podman >/dev/null 2>&1; then BUTANE="podman"
+  elif command -v docker >/dev/null 2>&1; then BUTANE="docker"
+  else die "need 'butane', or 'podman'/'docker' to render Ignition"; fi
+}
+
+SSHBASE=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+         -o ConnectTimeout=10 -i "$WORKDIR/id_ed25519")
+gssh() { local p="$1"; shift; ssh "${SSHBASE[@]}" -p "$p" root@127.0.0.1 "$@"; }
+gscp() { local p="$1"; shift; scp "${SSHBASE[@]}" -P "$p" "$@"; }
 
 cleanup() {
   local rc=$?
-  if [ "$rc" -ne 0 ] && [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
-    err "failure (rc=$rc) — collecting diagnostics"
-    gssh 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null' 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    err "failure (rc=$rc) — collecting master diagnostics"
+    gssh "$(ssh_port master)" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null' 2>/dev/null || true
   fi
   if [ "$KEEP_VM" = "1" ]; then
-    log "KEEP_VM=1 — leaving VM up (ssh -p $SSH_PORT -i $WORKDIR/id_ed25519 root@127.0.0.1)"
+    log "KEEP_VM=1 — leaving VMs up (master: ssh -p $(ssh_port master) -i $WORKDIR/id_ed25519 root@127.0.0.1)"
   else
-    [ -n "$QEMU_PID" ] && kill "$QEMU_PID" 2>/dev/null || true
+    for name in "${!QEMU_PIDS[@]}"; do kill "${QEMU_PIDS[$name]}" 2>/dev/null || true; done
   fi
   exit "$rc"
 }
 trap cleanup EXIT
 
-require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-
-BUTANE=""   # resolved by preflight: native butane, or podman/docker container
-
-resolve_butane() {
-  if command -v butane >/dev/null 2>&1; then BUTANE="native"; return; fi
-  if command -v podman >/dev/null 2>&1; then BUTANE="podman"; return; fi
-  if command -v docker >/dev/null 2>&1; then BUTANE="docker"; return; fi
-  die "need 'butane', or 'podman'/'docker' to render Ignition"
-}
-
+# --- setup -----------------------------------------------------------------
 preflight() {
   for t in qemu-system-x86_64 qemu-img jq xz curl ssh scp go; do require "$t"; done
   resolve_butane
-  log "butane renderer: $BUTANE"
+  log "butane renderer: $BUTANE; workers: $WORKERS"
   [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required"
   [ -n "$VICTORIA_DIR" ] || die "VICTORIA_DIR must point at a ventus-ag/magnum checkout (forked driver)"
   [ -d "$VICTORIA_DIR/magnum/drivers/common/templates/kubernetes/bootstrap" ] \
@@ -98,119 +120,176 @@ build_binaries() {
 }
 
 generate_keys() {
-  log "generating SSH key + shared mock CA + SA keypair"
+  log "generating SSH key + shared mock CA"
   ssh-keygen -t ed25519 -N '' -f "$WORKDIR/id_ed25519" -q
   "$WORKDIR/mock-magnum" -gen-ca -ca-cert "$WORKDIR/ca.crt" -ca-key "$WORKDIR/ca.key" >/dev/null
 }
 
 download_fcos() {
   local meta url xz img="$CACHE_DIR/fcos-${FCOS_STREAM}.qcow2"
-  if [ -f "$img" ]; then log "using cached FCoS image $img"; echo "$img"; return; fi
+  if [ -f "$img" ]; then echo "$img"; return; fi
   log "resolving Fedora CoreOS ${FCOS_STREAM} qcow2"
   meta="$(curl -fsSL "https://builds.coreos.fedoraproject.org/streams/${FCOS_STREAM}.json")"
   url="$(echo "$meta" | jq -r '.architectures.x86_64.artifacts.qemu.formats["qcow2.xz"].disk.location')"
   [ -n "$url" ] && [ "$url" != "null" ] || die "could not resolve FCoS qcow2 url"
   xz="$CACHE_DIR/$(basename "$url")"
-  log "downloading $url"
-  curl -fsSL "$url" -o "$xz"
-  log "decompressing image"
-  xz -dkc "$xz" > "$img.tmp" && mv "$img.tmp" "$img"
+  log "downloading $url"; curl -fsSL "$url" -o "$xz"
+  log "decompressing image"; xz -dkc "$xz" > "$img.tmp" && mv "$img.tmp" "$img"
   echo "$img"
 }
 
+# render_ignition <name> <hostname> <cluster_mac> <cluster_ip>
 render_ignition() {
-  local base="$1" pubkey
+  local name="$1" hostname="$2" cmac="$3" cip="$4" pubkey base
   pubkey="$(cat "$WORKDIR/id_ed25519.pub")"
-  log "rendering Ignition from butane"
-  sed "s|@@SSH_AUTHORIZED_KEY@@|${pubkey}|g" "$REPO_ROOT/e2e/vm/butane.yaml" > "$WORKDIR/butane.yaml"
+  base="$(download_fcos)"
+  sed -e "s|@@SSH_AUTHORIZED_KEY@@|${pubkey}|g" \
+      -e "s|@@HOSTNAME@@|${hostname}|g" \
+      -e "s|@@CLUSTER_MAC@@|${cmac}|g" \
+      -e "s|@@CLUSTER_IP@@|${cip}|g" \
+      "$REPO_ROOT/e2e/vm/butane.yaml" > "$WORKDIR/butane.${name}.yaml"
   case "$BUTANE" in
-    native) butane --pretty --strict < "$WORKDIR/butane.yaml" > "$WORKDIR/ignition.json" ;;
-    podman) podman run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.yaml" > "$WORKDIR/ignition.json" ;;
-    docker) docker run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.yaml" > "$WORKDIR/ignition.json" ;;
-    *) die "no butane renderer resolved" ;;
+    native) butane --pretty --strict < "$WORKDIR/butane.${name}.yaml" > "$WORKDIR/ignition.${name}.json" ;;
+    podman) podman run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.${name}.yaml" > "$WORKDIR/ignition.${name}.json" ;;
+    docker) docker run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.${name}.yaml" > "$WORKDIR/ignition.${name}.json" ;;
   esac
-  # Backed overlay so the cached base image stays pristine across runs.
-  qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/node.qcow2" 25G >/dev/null
+  qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/${name}.qcow2" 25G >/dev/null
 }
 
-boot_vm() {
-  log "booting FCoS VM (mem=${VM_MEM_MB}MB cpus=${VM_CPUS}, ssh on :$SSH_PORT)"
+# boot_node <name> <ssh_port> <mem_mb> <cpus> <cluster_mac|"">
+boot_node() {
+  local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5"
+  local net=(-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${port}-:22" -device virtio-net-pci,netdev=n0)
+  if [ -n "$cmac" ]; then
+    # Second NIC on a shared QEMU mcast segment = the cluster network.
+    net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
+  fi
+  log "booting $name (mem=${mem}MB cpus=${cpus} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
-    -machine accel=kvm -cpu host -smp "$VM_CPUS" -m "$VM_MEM_MB" \
-    -nographic -serial file:"$WORKDIR/console.log" -monitor none \
-    -drive if=virtio,file="$WORKDIR/node.qcow2",format=qcow2 \
-    -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.json" \
-    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$SSH_PORT"-:22 \
-    -device virtio-net-pci,netdev=n0 &
-  QEMU_PID=$!
-  log "qemu pid $QEMU_PID — waiting for SSH"
+    -machine accel=kvm -cpu host -smp "$cpus" -m "$mem" \
+    -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
+    -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
+    -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
+    "${net[@]}" &
+  QEMU_PIDS[$name]=$!
+  log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH"
   for _ in $(seq 1 120); do
-    if gssh true 2>/dev/null; then log "SSH up"; return 0; fi
-    kill -0 "$QEMU_PID" 2>/dev/null || die "qemu exited early (see $WORKDIR/console.log)"
+    if gssh "$port" true 2>/dev/null; then log "$name SSH up"; return 0; fi
+    kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null || die "$name qemu exited early (see console.${name}.log)"
     sleep 5
   done
-  die "VM SSH did not come up (see $WORKDIR/console.log)"
+  die "$name SSH did not come up (see $WORKDIR/console.${name}.log)"
 }
 
-provision_guest() {
-  log "copying artifacts into the VM"
-  gssh "mkdir -p $GUEST_E2E_DIR /opt/victoria-bootstrap"
-  gscp "$WORKDIR/bootstrap" "$WORKDIR/mock-magnum" "$WORKDIR/ca.crt" "$WORKDIR/ca.key" \
+# provision_node <name> <ssh_port> <start_mock 0|1>
+provision_node() {
+  local name="$1" port="$2" start_mock="$3"
+  log "provisioning $name"
+  gssh "$port" "mkdir -p $GUEST_E2E_DIR /opt/victoria-bootstrap"
+  gscp "$port" "$WORKDIR/bootstrap" "$WORKDIR/mock-magnum" "$WORKDIR/ca.crt" "$WORKDIR/ca.key" \
        "$REPO_ROOT/e2e/vm/guest-run.sh" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
-  gscp "$VICTORIA_DIR"/magnum/drivers/common/templates/kubernetes/bootstrap/*.sh \
+  gscp "$port" "$VICTORIA_DIR"/magnum/drivers/common/templates/kubernetes/bootstrap/*.sh \
        root@127.0.0.1:/opt/victoria-bootstrap/ >/dev/null
-  gssh "chmod +x $GUEST_E2E_DIR/guest-run.sh"
-  log "running guest setup + bootstrap install"
-  gssh "$GUEST_E2E_DIR/guest-run.sh setup"
-  gssh "$GUEST_E2E_DIR/guest-run.sh install /opt/victoria-bootstrap"
+  gssh "$port" "chmod +x $GUEST_E2E_DIR/guest-run.sh"
+  gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 $GUEST_E2E_DIR/guest-run.sh setup"
+  gssh "$port" "$GUEST_E2E_DIR/guest-run.sh install /opt/victoria-bootstrap"
 }
 
-# render_and_push <op> <kube-tag> <ca-rotation-id> -> remote heat-params path
+# render_and_push <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
 render_and_push() {
-  local op="$1" tag="$2" rot="${3:-}" name="${op}"
-  local hp="$WORKDIR/heat-params.${name}"
+  local key="$1" role="$2" op="$3" tag="$4" rot="$5" nip="$6" mip="${7:-}"
+  local idx=0; [ "$key" != master ] && idx="${key#worker}"
+  local host="$(mock_host)" port; port="$(ssh_port "$key")"
+  local hp="$WORKDIR/heat-params.${key}.${op}"
   "$WORKDIR/scenario-gen" \
-    -role master -op "$op" -node-ip "$NODE_IP" -kube-tag "$tag" \
-    -ca-key-file "$WORKDIR/ca.key" \
-    -sa-key-file "$WORKDIR/sa.pub" -sa-priv-file "$WORKDIR/sa.key" \
-    -ca-rotation-id "$rot" \
-    -reconciler-version e2e \
-    -reconciler-binary-url "file://$GUEST_E2E_DIR/bootstrap" \
+    -role "$role" -op "$op" -node-index "$idx" -node-ip "$nip" ${mip:+-master-ip "$mip"} \
+    -kube-tag "$tag" -ca-rotation-id "$rot" \
+    -ca-key-file "$WORKDIR/ca.key" -sa-key-file "$WORKDIR/sa.pub" -sa-priv-file "$WORKDIR/sa.key" \
+    -auth-url "http://${host}:9511/v3" -magnum-url "http://${host}:9511/v1" \
+    -reconciler-version e2e -reconciler-binary-url "file://$GUEST_E2E_DIR/bootstrap" \
     -o "$hp"
-  gscp "$hp" root@127.0.0.1:"$GUEST_E2E_DIR/heat-params.${name}" >/dev/null
-  echo "$GUEST_E2E_DIR/heat-params.${name}"
+  gscp "$port" "$hp" root@127.0.0.1:"$GUEST_E2E_DIR/heat-params.${op}" >/dev/null
+  echo "$GUEST_E2E_DIR/heat-params.${op}"
+}
+
+# --- scenarios -------------------------------------------------------------
+for_each_worker() {  # for_each_worker <fn>; calls fn <i>
+  local fn="$1" i=0
+  while [ "$i" -lt "$WORKERS" ]; do "$fn" "$i"; i=$((i + 1)); done
+}
+
+apply_master() {  # apply_master <op> <tag> [rot]
+  local op="$1" tag="$2" rot="${3:-}" mp; mp="$(ssh_port master)"
+  local hp; hp="$(render_and_push master master "$op" "$tag" "$rot" "$(master_ip)")"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+}
+
+apply_worker() {  # apply_worker <i> <op> <tag>
+  local i="$1" op="$2" tag="$3" wp; wp="$(ssh_port "worker$i")"
+  local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
+  gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+}
+
+assert_worker_joined() {  # <i>
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-node-ready e2e-minion-$1"
 }
 
 scenario_create() {
   log "=== SCENARIO: create ==="
-  local hp; hp="$(render_and_push create "$KUBE_TAG")"
-  gssh "$GUEST_E2E_DIR/guest-run.sh apply $hp create"
-  gssh "$GUEST_E2E_DIR/guest-run.sh assert-ready"
-  gssh "$GUEST_E2E_DIR/guest-run.sh assert-noop $hp create-idempotency"
+  apply_master create "$KUBE_TAG"
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  local hp; hp="$GUEST_E2E_DIR/heat-params.create"
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-noop $hp create-idempotency"
+  for_each_worker _create_worker
 }
+_create_worker() { apply_worker "$1" create "$KUBE_TAG"; assert_worker_joined "$1"; }
 
 scenario_ca_rotate() {
   log "=== SCENARIO: ca-rotate ==="
-  local hp; hp="$(render_and_push ca-rotate "$KUBE_TAG" "rot-$(date +%s)")"
-  gssh "$GUEST_E2E_DIR/guest-run.sh apply $hp ca-rotate"
-  gssh "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  apply_master ca-rotate "$KUBE_TAG" "rot-$(date +%s)"
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
 }
 
 scenario_upgrade() {
   log "=== SCENARIO: upgrade -> $KUBE_TAG_UPGRADE ==="
-  local hp; hp="$(render_and_push upgrade "$KUBE_TAG_UPGRADE")"
-  gssh "$GUEST_E2E_DIR/guest-run.sh apply $hp upgrade"
-  gssh "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  apply_master upgrade "$KUBE_TAG_UPGRADE"
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  for_each_worker _upgrade_worker
+}
+_upgrade_worker() { apply_worker "$1" upgrade "$KUBE_TAG_UPGRADE"; assert_worker_joined "$1"; }
+
+# --- main ------------------------------------------------------------------
+boot_all() {
+  if multinode; then
+    render_ignition master e2e-master-0 "$MASTER_CMAC" "$MASTER_CIP"
+    boot_node master "$(ssh_port master)" "$MASTER_MEM_MB" "$MASTER_CPUS" "$MASTER_CMAC"
+    local i=0
+    while [ "$i" -lt "$WORKERS" ]; do
+      render_ignition "worker$i" "e2e-minion-$i" "$(worker_cmac "$i")" "$(worker_ip "$i")"
+      boot_node "worker$i" "$(ssh_port "worker$i")" "$WORKER_MEM_MB" "$WORKER_CPUS" "$(worker_cmac "$i")"
+      i=$((i + 1))
+    done
+  else
+    # Single-node: original user-mode path, no cluster NIC.
+    render_ignition master e2e-master-0 "$MASTER_CMAC" "$MASTER_CIP"
+    boot_node master "$(ssh_port master)" "$MASTER_MEM_MB" "$MASTER_CPUS" ""
+  fi
+}
+
+provision_all() {
+  provision_node master "$(ssh_port master)" 1
+  if multinode; then
+    local i=0
+    while [ "$i" -lt "$WORKERS" ]; do provision_node "worker$i" "$(ssh_port "worker$i")" 0; i=$((i + 1)); done
+  fi
 }
 
 main() {
   preflight
   build_binaries
   generate_keys
-  local base; base="$(download_fcos)"
-  render_ignition "$base"
-  boot_vm
-  provision_guest
+  boot_all
+  provision_all
   for s in $SCENARIOS; do
     case "$s" in
       create)    scenario_create ;;

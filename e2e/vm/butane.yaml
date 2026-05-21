@@ -1,20 +1,24 @@
-# Butane config for the e2e Fedora CoreOS test node.
+# Butane config for an e2e Fedora CoreOS test node (master or worker).
 #
-# Rendered to Ignition by run-fcos-e2e.sh (via the quay.io/coreos/butane
-# container). @@SSH_AUTHORIZED_KEY@@ is replaced with the harness-generated
-# public key before rendering.
+# Rendered to Ignition per-node by run-fcos-e2e.sh, which substitutes:
+#   @@SSH_AUTHORIZED_KEY@@  harness-generated public key
+#   @@HOSTNAME@@            node hostname (e.g. e2e-master-0, e2e-minion-0)
+#   @@CLUSTER_MAC@@         MAC of the cluster NIC (multi-node only)
+#   @@CLUSTER_IP@@          static cluster IP, /24 (multi-node only)
 #
-# This is intentionally minimal: just enough to SSH in. The reconciler installs
-# everything else (containerd, kubelet, control plane) exactly as it would on a
-# real Magnum node — that is the whole point of the test.
+# Single-node runs attach no cluster NIC, so the MAC-matched NetworkManager
+# connection below simply matches nothing and is ignored — harmless. Multi-node
+# runs attach a second QEMU socket/mcast NIC with @@CLUSTER_MAC@@, which NM then
+# pins to @@CLUSTER_IP@@ to form a shared cluster network across the VMs.
+#
+# Everything else (containerd, kubelet, control plane) is installed by the
+# reconciler, exactly as on a real Magnum node.
 variant: fcos
 version: 1.5.0
 passwd:
   users:
     - name: core
-      groups:
-        - sudo
-        - wheel
+      groups: [sudo, wheel]
       ssh_authorized_keys:
         - "@@SSH_AUTHORIZED_KEY@@"
     - name: root
@@ -26,19 +30,34 @@ storage:
       mode: 0644
       overwrite: true
       contents:
-        inline: e2e-master-0
-    # Give the kubelet/inotify-heavy control plane room, matching production.
+        inline: "@@HOSTNAME@@"
     - path: /etc/sysctl.d/99-e2e.conf
       mode: 0644
       contents:
         inline: |
           fs.inotify.max_user_watches=1048576
           fs.inotify.max_user_instances=8192
-    # Permit root SSH with a key so the harness and the reconciler's
-    # ssh-to-localhost bootstrap pattern both work inside the node.
     - path: /etc/ssh/sshd_config.d/30-e2e-root.conf
       mode: 0600
       contents:
         inline: |
           PermitRootLogin prohibit-password
           PubkeyAuthentication yes
+    # Cluster network NIC (multi-node). Matched by MAC so interface naming does
+    # not matter; ignored when no NIC carries this MAC (single-node).
+    - path: /etc/NetworkManager/system-connections/cluster.nmconnection
+      mode: 0600
+      contents:
+        inline: |
+          [connection]
+          id=cluster
+          type=ethernet
+          autoconnect=true
+          [ethernet]
+          mac-address=@@CLUSTER_MAC@@
+          [ipv4]
+          method=manual
+          addresses=@@CLUSTER_IP@@/24
+          may-fail=true
+          [ipv6]
+          method=ignore

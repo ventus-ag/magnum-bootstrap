@@ -63,10 +63,19 @@ go test ./e2e/...
 FCoS VM tier (needs KVM + qemu, jq, xz, podman, go, and a magnum_victoria checkout):
 
 ```bash
-VICTORIA_DIR=/path/to/magnum_victoria ./e2e/vm/run-fcos-e2e.sh
-# knobs: KUBE_TAG, KUBE_TAG_UPGRADE, SCENARIOS="create ca-rotate upgrade",
-#        VM_MEM_MB, VM_CPUS, KEEP_VM=1 (leave the VM up for debugging)
+# single node (default)
+VICTORIA_DIR=/path/to/magnum ./e2e/vm/run-fcos-e2e.sh
+
+# multi node: 1 master + 2 workers (exercises worker join + drain/uncordon)
+VICTORIA_DIR=/path/to/magnum WORKERS=2 ./e2e/vm/run-fcos-e2e.sh
 ```
+
+Knobs: `KUBE_TAG`, `KUBE_TAG_UPGRADE`, `SCENARIOS="create ca-rotate upgrade"`,
+`WORKERS` (0=single node), per-role sizing `MASTER_MEM_MB`/`MASTER_CPUS` and
+`WORKER_MEM_MB`/`WORKER_CPUS` (`VM_MEM_MB`/`VM_CPUS` still work as fallbacks),
+`KEEP_VM=1` (leave VMs up for debugging). Multi-node uses a QEMU socket/mcast
+cluster network — see [IMPROVEMENTS.md](IMPROVEMENTS.md); it's a first cut to
+validate on the runner.
 
 Real-OpenStack tier (needs OpenStack creds + a Magnum template running the forked driver):
 

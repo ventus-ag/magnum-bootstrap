@@ -65,14 +65,15 @@ EOF
 }
 
 start_mock_magnum() {
-  log "starting mock Magnum/Keystone on 127.0.0.1:9511"
+  local listen="${MOCK_LISTEN:-127.0.0.1:9511}"
+  log "starting mock Magnum/Keystone on ${listen}"
   chmod +x "$E2E_DIR/mock-magnum"
   systemctl reset-failed mock-magnum 2>/dev/null || true
   systemd-run --unit=mock-magnum --collect \
-    "$E2E_DIR/mock-magnum" -listen 127.0.0.1:9511 \
+    "$E2E_DIR/mock-magnum" -listen "${listen}" \
     -ca-cert "$E2E_DIR/ca.crt" -ca-key "$E2E_DIR/ca.key" -v
   for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:9511/healthz >/dev/null 2>&1; then
+    if curl -fsS "http://${listen}/healthz" >/dev/null 2>&1; then
       log "mock Magnum healthy"; return 0
     fi
     sleep 1
@@ -88,7 +89,9 @@ cache_binary() {
 
 cmd_setup() {
   setup_self_ssh
-  start_mock_magnum
+  # Workers set START_MOCK=0 — only the master runs the mock Magnum, which
+  # workers reach over the cluster network at MOCK_LISTEN.
+  if [ "${START_MOCK:-1}" = "1" ]; then start_mock_magnum; fi
   cache_binary
   log "setup complete"
 }
@@ -169,6 +172,23 @@ cmd_assert_ready() {
   return 1
 }
 
+# cmd_assert_node_ready <node-name> — run on the master to confirm a specific
+# node (e.g. a joined worker) registered and reached Ready.
+cmd_assert_node_ready() {
+  local node="$1"
+  log "asserting node '${node}' is Ready"
+  for _ in $(seq 1 72); do  # up to 6 min
+    if kc get node "$node" --no-headers 2>/dev/null | grep -qw Ready; then
+      log "node Ready: $(kc get node "$node" --no-headers | tr -s ' ')"; return 0
+    fi
+    sleep 5
+  done
+  err "node '${node}' did not join/become Ready"
+  kc get nodes -o wide >&2 || true
+  kc describe node "$node" 2>/dev/null | tail -30 >&2 || true
+  return 1
+}
+
 cmd_assert_noop() {
   local hp="$1" name="$2"
   log "scenario '${name}': idempotency re-run"
@@ -186,9 +206,10 @@ main() {
   case "$sub" in
     setup)        cmd_setup ;;
     install)      cmd_install "$@" ;;
-    apply)        cmd_apply "$@" ;;
-    assert-ready) cmd_assert_ready ;;
-    assert-noop)  cmd_assert_noop "$@" ;;
+    apply)            cmd_apply "$@" ;;
+    assert-ready)     cmd_assert_ready ;;
+    assert-node-ready) cmd_assert_node_ready "$@" ;;
+    assert-noop)      cmd_assert_noop "$@" ;;
     *) err "unknown subcommand: ${sub}"; exit 2 ;;
   esac
 }
