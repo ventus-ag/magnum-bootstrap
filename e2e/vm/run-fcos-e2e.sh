@@ -50,16 +50,15 @@ MCAST="${MCAST:-230.0.0.77:34801}"
 MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
 
-# QEMU CPU/accel. QEMU_CPU=auto (default) resolves at preflight. On a nested
-# AMD-V host the FCoS guest soft-locks in early boot with >1 vCPU (TSC warps
-# between vCPUs + a cross-vCPU TLB-flush IPI never completes), so auto uses a
-# named model ($QEMU_CPU_AMD, default EPYC) AND caps to 1 vCPU/node; everywhere
-# else auto = host with the configured vCPU count. Override the model with e.g.
-# QEMU_CPU=EPYC-Milan / max / host, keep multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1,
+# QEMU CPU/accel/machine. QEMU_CPU=auto (default) resolves at preflight. On a
+# nested AMD-V host the FCoS guest soft-locks in early boot with >1 vCPU (a
+# cross-vCPU TLB-flush IPI never completes); the global 1-vCPU default removes
+# that, so auto uses plain -cpu host. Override the model with QEMU_CPU=EPYC/max/...,
+# the chipset with QEMU_MACHINE=q35, keep multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1,
 # or rule KVM out entirely (slow) with QEMU_ACCEL=tcg QEMU_CPU=qemu64.
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
-QEMU_CPU_AMD="${QEMU_CPU_AMD:-EPYC}"
+QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
@@ -114,20 +113,18 @@ resolve_qemu_cpu() {
   local virt vendor
   virt="$(systemd-detect-virt 2>/dev/null || echo none)"
   vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+  QEMU_CPU=host
   if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
-    QEMU_CPU="$QEMU_CPU_AMD"
-    log "QEMU cpu=auto -> $QEMU_CPU (nested AMD-V '$virt')"
+    log "QEMU cpu=auto -> host (nested AMD-V '$virt')"
     if [ "${ALLOW_SMP_ON_NESTED_AMD:-0}" != 1 ]; then
       # Nested AMD-V (especially Zen1) livelocks with >1 vCPU during early boot:
-      # the TSC warps between vCPUs (clock marked unstable) and a cross-vCPU
-      # TLB-flush IPI in smp_call_function_many never completes -> all vCPUs spin
-      # 100% -> soft lockup -> hang. A single vCPU removes both the inter-vCPU TSC
-      # sync and the cross-CPU IPI. Override with ALLOW_SMP_ON_NESTED_AMD=1.
+      # a cross-vCPU TLB-flush IPI in smp_call_function_many never completes ->
+      # all vCPUs spin 100% -> soft lockup -> hang. A single vCPU removes the
+      # cross-CPU IPI entirely. Override with ALLOW_SMP_ON_NESTED_AMD=1.
       MASTER_CPUS=1; WORKER_CPUS=1
       log "nested AMD-V: capping nodes to 1 vCPU (multi-vCPU soft-locks in early boot; set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
     fi
   else
-    QEMU_CPU=host
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
 }
@@ -222,9 +219,9 @@ boot_node() {
     # Second NIC on a shared QEMU mcast segment = the cluster network.
     net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
   fi
-  log "booting $name (mem=${mem}MB cpus=${cpus} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
+  log "booting $name (mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
-    -machine "accel=${QEMU_ACCEL}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
+    -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
     -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \

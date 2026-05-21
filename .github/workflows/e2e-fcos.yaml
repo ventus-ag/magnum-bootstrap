@@ -25,8 +25,11 @@ on:
         description: Number of worker nodes (0 = single-node master)
         default: "0"
       qemu_cpu:
-        description: QEMU -cpu model (auto = host, but a named EPYC model on nested AMD-V; or set max / EPYC-Milan / host)
+        description: QEMU -cpu model (auto = host w/ 1 vCPU on nested AMD-V; or set EPYC / max / host)
         default: auto
+      qemu_machine:
+        description: QEMU -machine type (blank = qemu default/i440fx; try q35 if early boot hangs)
+        default: ""
       trigger:
         description: How the reconciler is invoked (direct = systemd unit; agent = real heat-container-agent + mock Heat)
         default: direct
@@ -112,6 +115,7 @@ jobs:
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
+          QEMU_MACHINE: ${{ github.event.inputs.qemu_machine || '' }}
           TRIGGER: ${{ github.event.inputs.trigger || 'direct' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
