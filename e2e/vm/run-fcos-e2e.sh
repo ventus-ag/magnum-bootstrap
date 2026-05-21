@@ -63,6 +63,17 @@ QEMU_CPU_AMD="${QEMU_CPU_AMD:-EPYC}"
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
+
+# Trigger mode — how the reconciler is invoked on each node:
+#   direct (default) - place heat-params + run the systemd unit directly (fast).
+#   agent            - run the REAL heat-container-agent against a local mock
+#                      Heat that serves a SoftwareDeployment (the real bootstrap
+#                      scripts + ~90 inputs) and receives the HEAT_SIGNAL,
+#                      exactly like Heat. Exercises write-heat-params + the
+#                      install scripts + run-reconciler-once + the signal path.
+TRIGGER="${TRIGGER:-direct}"
+HEAT_LISTEN="${HEAT_LISTEN:-127.0.0.1:9512}"   # mock Heat bind, VM-local per node
+AGENT_IMAGE="${AGENT_IMAGE:-docker.io/openstackmagnum/heat-container-agent:victoria-stable-1}"
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/fcos-e2e.XXXXXX)}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/fcos-e2e}"
 BUTANE=""
@@ -162,6 +173,7 @@ build_binaries() {
   ( cd "$REPO_ROOT" && make build >/dev/null )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-magnum"  ./e2e/cmd/mock-magnum )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/scenario-gen" ./e2e/cmd/scenario-gen )
+  [ "$TRIGGER" = agent ] && ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-heat" ./e2e/cmd/mock-heat )
   cp "$REPO_ROOT/dist/bootstrap" "$WORKDIR/bootstrap"
 }
 
@@ -247,18 +259,26 @@ boot_node() {
   die "$name SSH did not come up (see $clog)"
 }
 
+SCRIPTS_DIR() { echo "$VICTORIA_DIR/magnum/drivers/common/templates/kubernetes/bootstrap"; }
+
 # provision_node <name> <ssh_port> <start_mock 0|1>
 provision_node() {
   local name="$1" port="$2" start_mock="$3"
-  log "provisioning $name"
+  log "provisioning $name (trigger=$TRIGGER)"
   gssh "$port" "mkdir -p $GUEST_E2E_DIR /opt/victoria-bootstrap"
-  gscp "$port" "$WORKDIR/bootstrap" "$WORKDIR/mock-magnum" "$WORKDIR/ca.crt" "$WORKDIR/ca.key" \
-       "$REPO_ROOT/e2e/vm/guest-run.sh" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
-  gscp "$port" "$VICTORIA_DIR"/magnum/drivers/common/templates/kubernetes/bootstrap/*.sh \
-       root@127.0.0.1:/opt/victoria-bootstrap/ >/dev/null
+  local files=("$WORKDIR/bootstrap" "$WORKDIR/mock-magnum" "$WORKDIR/ca.crt" "$WORKDIR/ca.key" "$REPO_ROOT/e2e/vm/guest-run.sh")
+  [ "$TRIGGER" = agent ] && files+=("$WORKDIR/mock-heat")
+  gscp "$port" "${files[@]}" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
   gssh "$port" "chmod +x $GUEST_E2E_DIR/guest-run.sh"
   gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 $GUEST_E2E_DIR/guest-run.sh setup"
-  gssh "$port" "$GUEST_E2E_DIR/guest-run.sh install /opt/victoria-bootstrap"
+  if [ "$TRIGGER" = agent ]; then
+    # The real bootstrap scripts are delivered inside the deployment metadata,
+    # not scp'd; the agent installs the launcher/units itself when it runs them.
+    gssh "$port" "HEAT_LISTEN='$HEAT_LISTEN' AGENT_IMAGE='$AGENT_IMAGE' AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh agent-setup self"
+  else
+    gscp "$port" "$(SCRIPTS_DIR)"/*.sh root@127.0.0.1:/opt/victoria-bootstrap/ >/dev/null
+    gssh "$port" "$GUEST_E2E_DIR/guest-run.sh install /opt/victoria-bootstrap"
+  fi
 }
 
 # render_and_push <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
@@ -278,6 +298,30 @@ render_and_push() {
   echo "$GUEST_E2E_DIR/heat-params.${op}"
 }
 
+# render_and_push_deploy <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
+# Generates the Heat SoftwareDeployment metadata (real bootstrap scripts as the
+# config + inputs) and scp's it in. Echoes "<remote-metadata-path> <deploy-id>".
+# A fresh id per call is required: 55-heat-config skips an already-deployed id.
+render_and_push_deploy() {
+  local key="$1" role="$2" op="$3" tag="$4" rot="$5" nip="$6" mip="${7:-}"
+  local idx=0; [ "$key" != master ] && idx="${key#worker}"
+  local host; host="$(mock_host)"; local port; port="$(ssh_port "$key")"
+  local id="${key}-${op}-$(date +%s)" action=UPDATE
+  [ "$op" = create ] && action=CREATE
+  local dep="$WORKDIR/deploy.${key}.${op}.json"
+  "$WORKDIR/scenario-gen" -emit deployment \
+    -role "$role" -op "$op" -node-index "$idx" -node-ip "$nip" ${mip:+-master-ip "$mip"} \
+    -kube-tag "$tag" -ca-rotation-id "$rot" \
+    -ca-key-file "$WORKDIR/ca.key" -sa-key-file "$WORKDIR/sa.pub" -sa-priv-file "$WORKDIR/sa.key" \
+    -auth-url "http://${host}:9511/v3" -magnum-url "http://${host}:9511/v1" \
+    -reconciler-version e2e -reconciler-binary-url "file://$GUEST_E2E_DIR/bootstrap" \
+    -scripts-dir "$(SCRIPTS_DIR)" -signal-id "http://${HEAT_LISTEN}/signal/${id}" \
+    -deploy-id "$id" -deploy-action "$action" \
+    -o "$dep"
+  gscp "$port" "$dep" root@127.0.0.1:"$GUEST_E2E_DIR/deploy.${op}.json" >/dev/null
+  echo "$GUEST_E2E_DIR/deploy.${op}.json $id"
+}
+
 # --- scenarios -------------------------------------------------------------
 for_each_worker() {  # for_each_worker <fn>; calls fn <i>
   local fn="$1" i=0
@@ -286,14 +330,24 @@ for_each_worker() {  # for_each_worker <fn>; calls fn <i>
 
 apply_master() {  # apply_master <op> <tag> [rot]
   local op="$1" tag="$2" rot="${3:-}" mp; mp="$(ssh_port master)"
-  local hp; hp="$(render_and_push master master "$op" "$tag" "$rot" "$(master_ip)")"
-  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+  if [ "$TRIGGER" = agent ]; then
+    local res; res="$(render_and_push_deploy master master "$op" "$tag" "$rot" "$(master_ip)")"
+    gssh "$mp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
+  else
+    local hp; hp="$(render_and_push master master "$op" "$tag" "$rot" "$(master_ip)")"
+    gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+  fi
 }
 
 apply_worker() {  # apply_worker <i> <op> <tag>
   local i="$1" op="$2" tag="$3" wp; wp="$(ssh_port "worker$i")"
-  local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
-  gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+  if [ "$TRIGGER" = agent ]; then
+    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
+    gssh "$wp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
+  else
+    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
+    gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
+  fi
 }
 
 assert_worker_joined() {  # <i>
@@ -301,11 +355,15 @@ assert_worker_joined() {  # <i>
 }
 
 scenario_create() {
-  log "=== SCENARIO: create ==="
+  log "=== SCENARIO: create (trigger=$TRIGGER) ==="
   apply_master create "$KUBE_TAG"
   gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
-  local hp; hp="$GUEST_E2E_DIR/heat-params.create"
-  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-noop $hp create-idempotency"
+  # Idempotency re-run only in direct mode: re-applying the same heat-params must
+  # be a no-op. Under the agent, Heat re-runs only on a NEW deployment id, so a
+  # same-id replay is skipped by 55-heat-config by design — not a meaningful test.
+  if [ "$TRIGGER" != agent ]; then
+    gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-noop $GUEST_E2E_DIR/heat-params.create create-idempotency"
+  fi
   for_each_worker _create_worker
 }
 _create_worker() { apply_worker "$1" create "$KUBE_TAG"; assert_worker_joined "$1"; }

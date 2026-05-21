@@ -20,6 +20,13 @@ E2E_DIR=/opt/e2e
 RESULT_FILE=/var/lib/magnum/reconciler-last-run.json
 ADMIN_KUBECONFIG=/etc/kubernetes/admin.conf
 
+# "agent" trigger: run the real heat-container-agent against the local mock Heat.
+HEAT_LISTEN="${HEAT_LISTEN:-127.0.0.1:9512}"
+AGENT_IMAGE="${AGENT_IMAGE:-docker.io/openstackmagnum/heat-container-agent:victoria-stable-1}"
+AGENT_STATE_DIR="${AGENT_STATE_DIR:-$E2E_DIR/heat-state}"
+AGENT_NODE="${AGENT_NODE:-self}"
+AGENT_DEPLOY_TIMEOUT="${AGENT_DEPLOY_TIMEOUT:-900}"
+
 log() { printf '\033[1;36m[guest %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 err() { printf '\033[1;31m[guest %s] ERROR:\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
@@ -201,6 +208,111 @@ cmd_assert_noop() {
   [ "$(result_status)" = "success" ] || { err "idempotency re-run not success"; return 1; }
 }
 
+# --- "agent" trigger: real heat-container-agent + local mock Heat -----------
+
+write_oscc_conf() {
+  # configure_container_agent.sh only writes this if absent, and the agent mounts
+  # the host /etc, so pre-writing it points os-collect-config at our mock Heat.
+  log "writing /etc/os-collect-config.conf (request collector -> mock Heat)"
+  cat > /etc/os-collect-config.conf <<EOF
+[DEFAULT]
+command = os-refresh-config
+polling_interval = 5
+collectors = request
+
+[request]
+metadata_url = http://${HEAT_LISTEN}/md/${AGENT_NODE}
+EOF
+  chmod 600 /etc/os-collect-config.conf
+}
+
+start_mock_heat() {
+  log "starting mock Heat on ${HEAT_LISTEN} (state ${AGENT_STATE_DIR})"
+  mkdir -p "$AGENT_STATE_DIR"
+  printf '{"deployments":[]}' > "$AGENT_STATE_DIR/${AGENT_NODE}.md.json"
+  chmod +x "$E2E_DIR/mock-heat"
+  systemctl reset-failed mock-heat 2>/dev/null || true
+  systemd-run --unit=mock-heat --collect "$E2E_DIR/mock-heat" -listen "$HEAT_LISTEN" -dir "$AGENT_STATE_DIR" -v
+  for _ in $(seq 1 30); do
+    if curl -fsS "http://${HEAT_LISTEN}/healthz" >/dev/null 2>&1; then log "mock Heat healthy"; return 0; fi
+    sleep 1
+  done
+  err "mock Heat did not become healthy"; journalctl -u mock-heat --no-pager | tail -20 >&2; return 1
+}
+
+start_heat_agent() {
+  log "starting real heat-container-agent (${AGENT_IMAGE})"
+  mkdir -p /opt/stack/os-config-refresh /var/run/heat-config /var/lib/heat-container-agent \
+           /var/run/os-collect-config /srv/magnum
+  podman rm -f heat-container-agent >/dev/null 2>&1 || true
+  podman pull "$AGENT_IMAGE"
+  # Same mounts/flags as the Magnum user_data unit: privileged + net=host so the
+  # agent's scripts reach the host via ssh root@localhost and bind-mounted paths.
+  podman run -d --name heat-container-agent --privileged --net=host \
+    --volume /srv/magnum:/srv/magnum \
+    --volume /opt/stack/os-config-refresh:/opt/stack/os-config-refresh \
+    --volume /run/systemd:/run/systemd \
+    --volume /etc/:/etc/ \
+    --volume /var/lib:/var/lib \
+    --volume /var/run:/var/run \
+    --volume /var/log:/var/log \
+    --volume /tmp:/tmp \
+    --volume /dev:/dev \
+    "$AGENT_IMAGE" /usr/bin/start-heat-container-agent >/dev/null
+  for _ in $(seq 1 30); do
+    if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx heat-container-agent; then
+      log "agent container running"; return 0
+    fi
+    sleep 1
+  done
+  err "heat-container-agent did not start"; podman logs heat-container-agent 2>&1 | tail -30 >&2; return 1
+}
+
+cmd_agent_setup() {
+  AGENT_NODE="${1:-$AGENT_NODE}"
+  write_oscc_conf
+  start_mock_heat
+  start_heat_agent
+  log "agent-setup complete (node=${AGENT_NODE}, mock Heat ${HEAT_LISTEN})"
+}
+
+# cmd_heat_deploy <metadata.json> <deploy-id> <name> [node] — publish a new
+# SoftwareDeployment for the agent to pick up, then wait for its HEAT_SIGNAL and
+# assert success exactly as Heat would (reconcile_status=success, no error_output).
+cmd_heat_deploy() {
+  local md="$1" id="$2" name="$3" node="${4:-$AGENT_NODE}"
+  local sig="$AGENT_STATE_DIR/${id}.signal.json"
+  log "scenario '${name}': publishing deployment id=${id} (node=${node})"
+  rm -f "$sig"
+  install -m 600 "$md" "$AGENT_STATE_DIR/${node}.md.json.tmp"
+  mv "$AGENT_STATE_DIR/${node}.md.json.tmp" "$AGENT_STATE_DIR/${node}.md.json"
+  log "scenario '${name}': waiting up to ${AGENT_DEPLOY_TIMEOUT}s for the agent to run + signal"
+  local waited=0
+  while [ "$waited" -lt "$AGENT_DEPLOY_TIMEOUT" ]; do
+    [ -s "$sig" ] && break
+    sleep 5; waited=$((waited + 5))
+    [ $((waited % 60)) -eq 0 ] && log "  ...still waiting (${waited}s)"
+  done
+  if [ ! -s "$sig" ]; then
+    err "scenario '${name}': no Heat signal after ${AGENT_DEPLOY_TIMEOUT}s"
+    podman logs heat-container-agent 2>&1 | tail -50 >&2 || true
+    return 1
+  fi
+  local status code failure
+  status="$(sed -n 's/.*"reconcile_status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$sig" | head -1)"
+  code="$(sed -n 's/.*"deploy_status_code"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' "$sig" | head -1)"
+  failure="$(sed -n 's/.*"reconcile_failure"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$sig" | head -1)"
+  log "scenario '${name}': signal status='${status}' deploy_status_code='${code:-?}' failure='${failure}'"
+  if [ "$status" = "success" ] && [ -z "$failure" ]; then
+    log "scenario '${name}': Heat deployment succeeded ✅"
+    return 0
+  fi
+  err "scenario '${name}': Heat deployment did not succeed"
+  echo '--- signal ---' >&2; cat "$sig" >&2; echo >&2
+  echo '--- last 80 reconcile log lines ---' >&2; tail -80 /var/log/magnum-reconcile.log 2>/dev/null >&2 || true
+  return 1
+}
+
 main() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -210,6 +322,8 @@ main() {
     assert-ready)     cmd_assert_ready ;;
     assert-node-ready) cmd_assert_node_ready "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
+    agent-setup)      cmd_agent_setup "$@" ;;
+    heat-deploy)      cmd_heat_deploy "$@" ;;
     *) err "unknown subcommand: ${sub}"; exit 2 ;;
   esac
 }

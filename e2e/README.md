@@ -77,6 +77,37 @@ Knobs: `KUBE_TAG`, `KUBE_TAG_UPGRADE`, `SCENARIOS="create ca-rotate upgrade"`,
 cluster network — see [IMPROVEMENTS.md](IMPROVEMENTS.md); it's a first cut to
 validate on the runner.
 
+### Trigger mode: `direct` vs `agent`
+
+`TRIGGER` controls *how* the reconciler is invoked on each node:
+
+- **`direct`** (default) — the harness places `heat-params` and runs the
+  `magnum-reconcile.service` systemd unit. Fast; exercises the runtime path.
+- **`agent`** — runs the **real `heat-container-agent`** (the same
+  `openstackmagnum/heat-container-agent` image Magnum uses) against a tiny
+  **mock Heat** (`e2e/cmd/mock-heat`). The agent fetches a real
+  `OS::Heat::SoftwareDeployment` via `os-collect-config`'s `request` collector,
+  whose `config` is the **four real bootstrap scripts** from the cloned
+  `ventus-ag/magnum` repo (`write-heat-params*.sh` → `install-reconciler-*.sh`
+  → `run-reconciler-once.sh`) and whose `inputs` are the ~90 Heat params; it then
+  POSTs the `HEAT_SIGNAL` back. This is the highest-fidelity path — it exercises
+  `write-heat-params*.sh`, the install scripts, `run-reconciler-once.sh`, and the
+  Heat success/`error_output` signal contract, end to end.
+
+```bash
+TRIGGER=agent VICTORIA_DIR=/path/to/magnum ./e2e/vm/run-fcos-e2e.sh
+# knobs: AGENT_IMAGE (default openstackmagnum/heat-container-agent:victoria-stable-1),
+#        HEAT_LISTEN (VM-local mock Heat, default 127.0.0.1:9512),
+#        AGENT_DEPLOY_TIMEOUT (per-deployment wait, default 900s)
+```
+
+mock Heat contains **no bootstrap logic** — it only serves the deployment
+metadata and records the signal (it's the Heat metadata/`HEAT_SIGNAL`
+transport). The scripts, the agent, mock Magnum's CSR signing, and the
+reconciler binary are all real. Note: the idempotency re-run is `direct`-only —
+Heat re-runs only on a *new* deployment id, and `55-heat-config` skips an
+already-deployed id, so a same-id replay isn't a meaningful agent test.
+
 Real-OpenStack tier (needs OpenStack creds + a Magnum template running the forked driver):
 
 ```bash

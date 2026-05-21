@@ -140,8 +140,30 @@ func b(v bool) string {
 	return "false"
 }
 
+// KV is one ordered key/value pair, shared by the rendered heat-params file and
+// the Heat SoftwareDeployment input_values.
+type KV struct {
+	Name  string
+	Value string
+}
+
 // HeatParams renders the heat-params file content for this scenario.
 func (c Config) HeatParams() string {
+	var sb strings.Builder
+	for _, kv := range c.pairs() {
+		fmt.Fprintf(&sb, "%s=%q\n", kv.Name, kv.Value)
+	}
+	return sb.String()
+}
+
+// Inputs returns the ordered Heat SoftwareDeployment input_values for this
+// scenario — the same keys/values write-heat-params*.sh consumes from the
+// environment. The heat-container-agent path feeds these as env vars so the
+// agent renders an equivalent /etc/sysconfig/heat-params, exactly like Heat.
+func (c Config) Inputs() []KV { return c.pairs() }
+
+// pairs builds the ordered key/value set behind both HeatParams and Inputs.
+func (c Config) pairs() []KV {
 	c = c.withDefaults()
 
 	isUpgrade := c.Operation == OpUpgrade
@@ -156,8 +178,8 @@ func (c Config) HeatParams() string {
 		volumeDriver = "cinder"
 	}
 
-	var sb strings.Builder
-	put := func(k, v string) { fmt.Fprintf(&sb, "%s=%q\n", k, v) }
+	var kvs []KV
+	put := func(k, v string) { kvs = append(kvs, KV{Name: k, Value: v}) }
 
 	// Common fields (present for both roles).
 	put("ARCH", c.Arch)
@@ -260,7 +282,7 @@ func (c Config) HeatParams() string {
 	put("RECONCILER_BINARY_URL_SHA256", c.ReconcilerBinaryURLSHA256)
 	put("RECONCILER_LOCK_TIMEOUT_SECONDS", "900")
 
-	return sb.String()
+	return kvs
 }
 
 // leadNodeRole mirrors write-heat-params-master.sh: the control-plane node role

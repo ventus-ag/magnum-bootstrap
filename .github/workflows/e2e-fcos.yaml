@@ -27,6 +27,9 @@ on:
       qemu_cpu:
         description: QEMU -cpu model (auto = host, but a named EPYC model on nested AMD-V; or set max / EPYC-Milan / host)
         default: auto
+      trigger:
+        description: How the reconciler is invoked (direct = systemd unit; agent = real heat-container-agent + mock Heat)
+        default: direct
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
@@ -109,6 +112,7 @@ jobs:
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
+          TRIGGER: ${{ github.event.inputs.trigger || 'direct' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
 
