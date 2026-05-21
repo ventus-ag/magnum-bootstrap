@@ -50,12 +50,15 @@ MCAST="${MCAST:-230.0.0.77:34801}"
 MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
 
-# QEMU CPU/accel. On a nested runner (FCoS is an L2 guest) `-cpu host` can make
-# the guest kernel panic during early init; override e.g. QEMU_CPU=max or a named
-# model (Nehalem, Cascadelake-Server), or QEMU_ACCEL=tcg QEMU_CPU=qemu64 to rule
-# KVM out entirely (slow). `-cpu host` is only valid with accel=kvm.
+# QEMU CPU/accel. QEMU_CPU=auto (default) resolves the model at preflight:
+# on a nested AMD-V host, `-cpu host` makes the FCoS guest stall in early init
+# (nested SVM L2 guests are fragile), so auto switches to a named model
+# ($QEMU_CPU_AMD, default EPYC) which boots reliably; everywhere else auto = host.
+# Override explicitly with e.g. QEMU_CPU=EPYC-Milan / max / Nehalem, or
+# QEMU_ACCEL=tcg QEMU_CPU=qemu64 to rule KVM out entirely (slow).
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
-QEMU_CPU="${QEMU_CPU:-host}"
+QEMU_CPU="${QEMU_CPU:-auto}"
+QEMU_CPU_AMD="${QEMU_CPU_AMD:-EPYC}"
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
@@ -85,6 +88,29 @@ resolve_butane() {
   else die "need 'butane', or 'podman'/'docker' to render Ignition"; fi
 }
 
+# resolve_qemu_cpu — turn QEMU_CPU=auto into a concrete -cpu model. The fragile
+# case is a nested AMD-V host: there, `-cpu host` passes through SVM features that
+# don't virtualize at the L2 level and the guest kernel stalls in do_initcalls.
+# A named EPYC model avoids that. Explicit QEMU_CPU values are left untouched.
+resolve_qemu_cpu() {
+  [ "$QEMU_CPU" = auto ] || { log "QEMU accel=$QEMU_ACCEL cpu=$QEMU_CPU (explicit)"; return; }
+  if [ "$QEMU_ACCEL" != kvm ]; then
+    QEMU_CPU=qemu64
+    log "QEMU cpu=auto -> qemu64 (accel=$QEMU_ACCEL, no KVM)"
+    return
+  fi
+  local virt vendor
+  virt="$(systemd-detect-virt 2>/dev/null || echo none)"
+  vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+  if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
+    QEMU_CPU="$QEMU_CPU_AMD"
+    log "QEMU cpu=auto -> $QEMU_CPU (nested AMD-V '$virt': -cpu host stalls L2 guests in early init)"
+  else
+    QEMU_CPU=host
+    log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
+  fi
+}
+
 SSHBASE=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
          -o ConnectTimeout=10 -i "$WORKDIR/id_ed25519")
 gssh() { local p="$1"; shift; ssh "${SSHBASE[@]}" -p "$p" root@127.0.0.1 "$@"; }
@@ -109,8 +135,11 @@ trap cleanup EXIT
 preflight() {
   for t in qemu-system-x86_64 qemu-img jq xz curl ssh scp go make; do require "$t"; done
   resolve_butane
+  resolve_qemu_cpu
   log "butane renderer: $BUTANE; workers: $WORKERS"
-  [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required"
+  if [ "$QEMU_ACCEL" = kvm ]; then
+    [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required (or set QEMU_ACCEL=tcg)"
+  fi
   [ -n "$VICTORIA_DIR" ] || die "VICTORIA_DIR must point at a ventus-ag/magnum checkout (forked driver)"
   [ -d "$VICTORIA_DIR/magnum/drivers/common/templates/kubernetes/bootstrap" ] \
     || die "VICTORIA_DIR does not look like a ventus-ag/magnum checkout (missing magnum/drivers/.../bootstrap)"

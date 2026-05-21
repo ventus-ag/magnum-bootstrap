@@ -25,8 +25,8 @@ on:
         description: Number of worker nodes (0 = single-node master)
         default: "0"
       qemu_cpu:
-        description: QEMU -cpu model (host; use 'max' or a named model if the guest panics under nested KVM)
-        default: host
+        description: QEMU -cpu model (auto = host, but a named EPYC model on nested AMD-V; or set max / EPYC-Milan / host)
+        default: auto
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
@@ -108,7 +108,7 @@ jobs:
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
-          QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'host' }}
+          QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
 
@@ -122,3 +122,16 @@ jobs:
             ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/heat-params.*
             ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/ignition.*.json
           if-no-files-found: ignore
+
+      - name: Clean up VMs and workdir
+        if: always()
+        run: |
+          # Safety net for cancelled/killed jobs where run-fcos-e2e.sh's own EXIT
+          # trap may not have run. Kill QEMU VMs scoped to THIS job's workdir (so
+          # concurrent jobs/agents on the host are untouched), then drop the large
+          # qcow2 overlays. Runs after the diagnostics upload above.
+          WD="${{ runner.temp }}/fcos-e2e-${{ matrix.name }}"
+          pkill -f "$WD" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "$WD" 2>/dev/null || true
+          rm -rf "$WD" || true

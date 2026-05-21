@@ -96,3 +96,23 @@ jobs:
           KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster || '0' }}
           WORKDIR: ${{ runner.temp }}/magnum-e2e-${{ matrix.name }}
         run: ./e2e/openstack/run-magnum-e2e.sh
+
+      - name: Tear down cluster + workdir
+        if: always()
+        env:
+          OS_CLOUD: e2e
+        run: |
+          # Safety net for cancelled/killed jobs where run-magnum-e2e.sh's own EXIT
+          # trap may not have deleted the cluster — these are REAL, billed cloud
+          # resources. Delete this job's cluster by its deterministic name if it
+          # still exists (best-effort; no-ops if auth/cluster is absent).
+          CN="recon-e2e-${{ matrix.name }}-${{ github.run_id }}"
+          if [ "${{ github.event.inputs.keep_cluster || '0' }}" = "1" ]; then
+            echo "keep_cluster=1 — leaving $CN in place"
+          elif openstack coe cluster show "$CN" >/dev/null 2>&1; then
+            echo "deleting leftover cluster $CN"
+            openstack coe cluster delete "$CN" || true
+          else
+            echo "no leftover cluster $CN"
+          fi
+          rm -rf "${{ runner.temp }}/magnum-e2e-${{ matrix.name }}" || true
