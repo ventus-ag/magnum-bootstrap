@@ -1,0 +1,98 @@
+name: e2e-openstack
+
+# Real-OpenStack end-to-end on the self-hosted `ventus` runner. Drives a real
+# Magnum cluster (forked magnum_victoria driver) through
+# create -> smoke -> upgrade -> resize -> ca-rotate -> delete, including the
+# cloud-integrated checks the mock tier cannot do (OCCM LoadBalancer + Cinder
+# CSI PVC). Manual + nightly; gated behind OpenStack credential secrets.
+#
+# Required secrets / vars:
+#   secrets.OS_CLOUDS_YAML    contents of a clouds.yaml (defines the 'e2e' cloud)
+#   vars.MAGNUM_CLUSTER_TEMPLATE   existing cluster template name/id
+#   vars.MAGNUM_KEYPAIR            nova keypair name
+# Optional:
+#   vars.RECONCILER_BINARY_URL     pin the node binary under test (label override)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kube_tag:
+        description: Initial Kubernetes version
+        default: v1.30.5
+      kube_tag_upgrade:
+        description: Upgrade target version
+        default: v1.31.4
+      keep_cluster:
+        description: Leave the cluster running (1 to keep)
+        default: "0"
+  schedule:
+    - cron: "0 3 * * *" # nightly 03:00 UTC
+  pull_request:
+    # Opt-in per PR with the 'e2e-openstack' label. This provisions REAL cloud
+    # resources (clusters, LBs, volumes) and costs money — keep it rare.
+    types: [labeled, synchronize, reopened]
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-openstack-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e-openstack')
+    runs-on: self-hosted
+    outputs:
+      latest: ${{ steps.k.outputs.latest }}
+    steps:
+      - id: k
+        run: echo "latest=$(curl -fsSL https://dl.k8s.io/release/stable.txt)" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    needs: resolve
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pinned
+            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
+            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+          - name: latest
+            kube_tag: v1.31.4
+            kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh --no-vm --openstack
+
+      - name: Write clouds.yaml
+        run: |
+          mkdir -p ~/.config/openstack
+          printf '%s' "${{ secrets.OS_CLOUDS_YAML }}" > ~/.config/openstack/clouds.yaml
+          chmod 600 ~/.config/openstack/clouds.yaml
+
+      - name: Runner preflight
+        env:
+          OS_CLOUD: e2e
+        run: ./e2e/vm/runner-preflight.sh --openstack
+
+      - name: Run OpenStack Magnum e2e (${{ matrix.name }})
+        env:
+          OS_CLOUD: e2e
+          CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
+          KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
+          CLUSTER_NAME: recon-e2e-${{ matrix.name }}-${{ github.run_id }}
+          KUBE_TAG: ${{ matrix.kube_tag }}
+          KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
+          RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
+          KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster || '0' }}
+          WORKDIR: ${{ runner.temp }}/magnum-e2e-${{ matrix.name }}
+        run: ./e2e/openstack/run-magnum-e2e.sh

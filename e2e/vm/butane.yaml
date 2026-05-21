@@ -1,0 +1,44 @@
+# Butane config for the e2e Fedora CoreOS test node.
+#
+# Rendered to Ignition by run-fcos-e2e.sh (via the quay.io/coreos/butane
+# container). @@SSH_AUTHORIZED_KEY@@ is replaced with the harness-generated
+# public key before rendering.
+#
+# This is intentionally minimal: just enough to SSH in. The reconciler installs
+# everything else (containerd, kubelet, control plane) exactly as it would on a
+# real Magnum node — that is the whole point of the test.
+variant: fcos
+version: 1.5.0
+passwd:
+  users:
+    - name: core
+      groups:
+        - sudo
+        - wheel
+      ssh_authorized_keys:
+        - "@@SSH_AUTHORIZED_KEY@@"
+    - name: root
+      ssh_authorized_keys:
+        - "@@SSH_AUTHORIZED_KEY@@"
+storage:
+  files:
+    - path: /etc/hostname
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: e2e-master-0
+    # Give the kubelet/inotify-heavy control plane room, matching production.
+    - path: /etc/sysctl.d/99-e2e.conf
+      mode: 0644
+      contents:
+        inline: |
+          fs.inotify.max_user_watches=1048576
+          fs.inotify.max_user_instances=8192
+    # Permit root SSH with a key so the harness and the reconciler's
+    # ssh-to-localhost bootstrap pattern both work inside the node.
+    - path: /etc/ssh/sshd_config.d/30-e2e-root.conf
+      mode: 0600
+      contents:
+        inline: |
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
