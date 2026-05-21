@@ -23,7 +23,7 @@
 # Env knobs (defaults):
 #   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade)
-#   WORKERS 0          MASTER_MEM_MB 6144   MASTER_CPUS 4
+#   WORKERS 0          MASTER_MEM_MB 2048   MASTER_CPUS 1
 #                      WORKER_MEM_MB 2560   WORKER_CPUS 2
 #   WORKDIR (mktemp)   KEEP_VM 0
 #
@@ -39,8 +39,8 @@ SCENARIOS="${SCENARIOS:-create ca-rotate upgrade}"
 WORKERS="${WORKERS:-0}"
 
 # Per-role sizing (VM_MEM_MB/VM_CPUS kept as backward-compatible fallbacks).
-MASTER_MEM_MB="${MASTER_MEM_MB:-${VM_MEM_MB:-6144}}"
-MASTER_CPUS="${MASTER_CPUS:-${VM_CPUS:-4}}"
+MASTER_MEM_MB="${MASTER_MEM_MB:-${VM_MEM_MB:-2048}}"
+MASTER_CPUS="${MASTER_CPUS:-${VM_CPUS:-1}}"
 WORKER_MEM_MB="${WORKER_MEM_MB:-2560}"
 WORKER_CPUS="${WORKER_CPUS:-2}"
 
