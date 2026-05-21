@@ -24,6 +24,9 @@ on:
       workers:
         description: Number of worker nodes (0 = single-node master)
         default: "0"
+      qemu_cpu:
+        description: QEMU -cpu model (host; use 'max' or a named model if the guest panics under nested KVM)
+        default: host
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
@@ -105,6 +108,7 @@ jobs:
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
+          QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'host' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
 

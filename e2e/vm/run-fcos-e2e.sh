@@ -50,6 +50,13 @@ MCAST="${MCAST:-230.0.0.77:34801}"
 MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
 
+# QEMU CPU/accel. On a nested runner (FCoS is an L2 guest) `-cpu host` can make
+# the guest kernel panic during early init; override e.g. QEMU_CPU=max or a named
+# model (Nehalem, Cascadelake-Server), or QEMU_ACCEL=tcg QEMU_CPU=qemu64 to rule
+# KVM out entirely (slow). `-cpu host` is only valid with accel=kvm.
+QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
+QEMU_CPU="${QEMU_CPU:-host}"
+
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/fcos-e2e.XXXXXX)}"
@@ -164,9 +171,9 @@ boot_node() {
     # Second NIC on a shared QEMU mcast segment = the cluster network.
     net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
   fi
-  log "booting $name (mem=${mem}MB cpus=${cpus} ssh=:$port${cmac:+ cluster-mac=$cmac})"
+  log "booting $name (mem=${mem}MB cpus=${cpus} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
-    -machine accel=kvm -cpu host -smp "$cpus" -m "$mem" \
+    -machine "accel=${QEMU_ACCEL}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
     -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
@@ -180,6 +187,13 @@ boot_node() {
       err "$name qemu exited early after ${waited}s — last 40 console lines:"
       tail -n 40 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
       die "$name qemu exited early (see $clog)"
+    fi
+    # A kernel panic (e.g. early init crash under nested KVM) never recovers —
+    # surface the reason and abort instead of polling for the full timeout.
+    if grep -qiE 'Kernel panic|BUG: unable to handle|Oops:|general protection fault' "$clog" 2>/dev/null; then
+      err "$name kernel panicked during boot after ${waited}s (SSH will never come up) — last 120 console lines:"
+      tail -n 120 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
+      die "$name kernel panic — try QEMU_CPU=max (or QEMU_ACCEL=tcg QEMU_CPU=qemu64); full console: $clog"
     fi
     # Heartbeat every ~30s with a console tail so a stuck boot/Ignition is visible.
     if [ $((attempt % 6)) -eq 0 ]; then
