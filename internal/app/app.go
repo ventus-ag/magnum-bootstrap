@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
 	"github.com/spf13/cobra"
@@ -32,7 +33,13 @@ type runFlags struct {
 	debug          bool
 	backendURL     string
 	heatParamsFile string
+	timeout        time.Duration
 }
+
+// defaultRunTimeout caps a single reconcile invocation. Picked to be longer
+// than any legitimate node-level run (slow Helm rollouts, drain, etc.) while
+// still bounding hangs caused by an unresponsive Kubernetes API.
+const defaultRunTimeout = time.Hour
 
 // Main is the top-level entry point. It builds the Cobra command tree, attaches
 // stdout/stderr, and returns the process exit code.
@@ -84,6 +91,7 @@ func addRunFlags(cmd *cobra.Command, f *runFlags, refreshDefault bool) {
 	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
 	cmd.Flags().StringVar(&f.backendURL, "backend-url", "", "override Pulumi backend URL (default: $MAGNUM_PULUMI_BACKEND_URL or file:///var/lib/magnum/pulumi)")
 	cmd.Flags().StringVar(&f.heatParamsFile, "heat-params-file", "", "override heat-params file path (default: $MAGNUM_RECONCILE_HEAT_PARAMS_FILE or /etc/sysconfig/heat-params)")
+	cmd.Flags().DurationVar(&f.timeout, "timeout", defaultRunTimeout, "overall timeout for the reconcile invocation (0 disables)")
 }
 
 func newPreviewCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.Command {
@@ -270,6 +278,12 @@ func printLastResult(stdout, stderr io.Writer) int {
 }
 
 func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer) int {
+	if f.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, f.timeout)
+		defer cancel()
+	}
+
 	runtimePaths := paths.LoadFromEnv()
 	if f.backendURL != "" {
 		runtimePaths.PulumiBackend = f.backendURL
@@ -293,8 +307,8 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	}
 	defer logger.Close()
 
-	logger.Infof("starting reconcile mode=%s diff=%t allowPartial=%t refresh=%t heatParamsFile=%s resultFile=%s logFile=%s",
-		mode, f.diff, f.allowPartial, f.refresh, runtimePaths.HeatParamsFile, runtimePaths.ResultFile, runtimePaths.LogFile)
+	logger.Infof("starting reconcile mode=%s diff=%t allowPartial=%t refresh=%t heatParamsFile=%s resultFile=%s logFile=%s timeout=%s",
+		mode, f.diff, f.allowPartial, f.refresh, runtimePaths.HeatParamsFile, runtimePaths.ResultFile, runtimePaths.LogFile, formatTimeout(f.timeout))
 
 	cfg, err := config.Load(runtimePaths.HeatParamsFile)
 	if err != nil {
@@ -362,6 +376,20 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	safeCloseEngineEvents(eventCh)
 	<-done // wait for event stream to drain
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr == context.DeadlineExceeded {
+			timeoutMsg := fmt.Sprintf("reconcile exceeded timeout %s: %v", formatTimeout(f.timeout), err)
+			err = fmt.Errorf("%s", timeoutMsg)
+			if runResult.Step == "" {
+				runResult.Step = mode + "-timeout"
+			}
+			if runResult.Summary == "" {
+				runResult.Summary = timeoutMsg
+				runResult.Reason = timeoutMsg
+			}
+			if runResult.ErrorCode == "" {
+				runResult.ErrorCode = "timeout"
+			}
+		}
 		_ = journal.MarkFailed(runtimePaths.RunStateFile, mode, err.Error())
 		if runResult.Step == "" {
 			runResult.Step = mode
@@ -410,6 +438,13 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	renderer.PrintResult(runResult)
 	logger.Infof("reconcile completed summary=%s", runResult.Summary)
 	return 0
+}
+
+func formatTimeout(d time.Duration) string {
+	if d <= 0 {
+		return "disabled"
+	}
+	return d.String()
 }
 
 func safeCloseEngineEvents(ch chan events.EngineEvent) {
