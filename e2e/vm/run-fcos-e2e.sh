@@ -188,12 +188,13 @@ boot_node() {
       tail -n 40 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
       die "$name qemu exited early (see $clog)"
     fi
-    # A kernel panic (e.g. early init crash under nested KVM) never recovers —
-    # surface the reason and abort instead of polling for the full timeout.
-    if grep -qiE 'Kernel panic|BUG: unable to handle|Oops:|general protection fault' "$clog" 2>/dev/null; then
-      err "$name kernel panicked during boot after ${waited}s (SSH will never come up) — last 120 console lines:"
-      tail -n 120 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
-      die "$name kernel panic — try QEMU_CPU=max (or QEMU_ACCEL=tcg QEMU_CPU=qemu64); full console: $clog"
+    # A fatal guest condition (panic, GPF, or — common under nested KVM — an RCU
+    # stall / soft lockup / hung task during early init) never recovers. Surface
+    # the reason and abort instead of polling for the full timeout.
+    if grep -qiE 'Kernel panic|BUG:|Oops:|general protection fault|detected stall|soft lockup|hung task|Unable to mount root|not syncing' "$clog" 2>/dev/null; then
+      err "$name fatal guest condition during boot after ${waited}s (SSH will never come up) — last 150 console lines:"
+      tail -n 150 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
+      die "$name guest boot crash — try QEMU_CPU=max (or QEMU_ACCEL=tcg QEMU_CPU=qemu64); full console: $clog"
     fi
     # Heartbeat every ~30s with a console tail so a stuck boot/Ignition is visible.
     if [ $((attempt % 6)) -eq 0 ]; then
