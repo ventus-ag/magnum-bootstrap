@@ -51,14 +51,16 @@ MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
 
 # QEMU CPU/accel/machine. QEMU_CPU=auto (default) resolves at preflight. On a
-# nested AMD-V host the FCoS guest soft-locks in early boot with >1 vCPU (a
-# cross-vCPU TLB-flush IPI never completes); the global 1-vCPU default removes
-# that, so auto uses plain -cpu host. Override the model with QEMU_CPU=EPYC/max/...,
-# the chipset with QEMU_MACHINE=q35, keep multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1,
-# or rule KVM out entirely (slow) with QEMU_ACCEL=tcg QEMU_CPU=qemu64.
+# nested AMD-V host LAPIC interrupt delivery to the L2 guest is unreliable, which
+# both soft-locks multi-vCPU boots and freezes single-vCPU boots; auto uses
+# `-cpu host,-x2apic` (legacy xAPIC) + 1 vCPU to work around it. Override the
+# model with QEMU_CPU=host/EPYC/max/..., the chipset with QEMU_MACHINE=q35, keep
+# multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1, or rule KVM out entirely (slow) with
+# QEMU_ACCEL=tcg QEMU_CPU=qemu64. SSH_WAIT_TRIES extends the boot wait (x5s).
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
+SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-120}"   # boot wait = tries x 5s (default 600s)
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
@@ -115,14 +117,17 @@ resolve_qemu_cpu() {
   vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
   QEMU_CPU=host
   if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
-    log "QEMU cpu=auto -> host (nested AMD-V '$virt')"
+    # Nested AMD-V (esp. Zen1) breaks LAPIC interrupt delivery for the L2 guest:
+    # with >1 vCPU a cross-vCPU TLB-flush IPI in smp_call_function never completes
+    # (soft lockup at ~28s), and with 1 vCPU the timer interrupt that should wake
+    # the halted vCPU is lost (boot freezes mid-initramfs, clock frozen). Forcing
+    # legacy xAPIC (-x2apic) routes interrupts through the emulated path; 1 vCPU
+    # also avoids the IPI case. Override the whole model with QEMU_CPU=...
+    QEMU_CPU="host,-x2apic"
+    log "QEMU cpu=auto -> host,-x2apic (nested AMD-V '$virt': legacy xAPIC for reliable interrupt delivery)"
     if [ "${ALLOW_SMP_ON_NESTED_AMD:-0}" != 1 ]; then
-      # Nested AMD-V (especially Zen1) livelocks with >1 vCPU during early boot:
-      # a cross-vCPU TLB-flush IPI in smp_call_function_many never completes ->
-      # all vCPUs spin 100% -> soft lockup -> hang. A single vCPU removes the
-      # cross-CPU IPI entirely. Override with ALLOW_SMP_ON_NESTED_AMD=1.
       MASTER_CPUS=1; WORKER_CPUS=1
-      log "nested AMD-V: capping nodes to 1 vCPU (multi-vCPU soft-locks in early boot; set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
+      log "nested AMD-V: capping nodes to 1 vCPU (set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
     fi
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
@@ -229,7 +234,7 @@ boot_node() {
   QEMU_PIDS[$name]=$!
   local clog="$WORKDIR/console.${name}.log" waited=0
   log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH on 127.0.0.1:$port (console: $clog)"
-  for attempt in $(seq 1 120); do
+  for attempt in $(seq 1 "$SSH_WAIT_TRIES"); do
     if gssh "$port" true 2>/dev/null; then log "$name SSH up after ${waited}s"; return 0; fi
     if ! kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null; then
       err "$name qemu exited early after ${waited}s — last 40 console lines:"
