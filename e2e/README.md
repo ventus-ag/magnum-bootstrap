@@ -81,10 +81,11 @@ validate on the runner.
 
 On a nested KVM host (the runner is itself a VM) — especially **nested AMD-V on
 Zen1** — the L2 guest's LAPIC interrupt delivery and clock are unreliable. `auto`
-already forces legacy xAPIC + 1 vCPU (`-cpu host,-x2apic`), but a boot can still
-freeze *silently* (no panic) in the **dracut initramfs**: the vCPU halts in an
-idle wait and the timer interrupt that should wake it is lost. Three layers
-address this, all auto-enabled when nested AMD-V is detected:
+already forces legacy xAPIC + 1 vCPU (`-cpu host,-x2apic`) and userspace irqchip
+(`kernel-irqchip=off`), but a boot can still freeze *silently* (no panic) in the
+**dracut initramfs**: the vCPU halts in an idle wait and the timer interrupt that
+should wake it is lost. Three layers address this, all auto-enabled when nested
+AMD-V is detected:
 
 - `INJECT_KARGS=1` / `FIRSTBOOT_KARGS` — bakes `idle=poll nox2apic no-kvmclock
   tsc=reliable pci=nomsi` into the image's BLS boot entry (via `qemu-nbd`)

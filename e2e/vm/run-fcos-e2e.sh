@@ -60,7 +60,7 @@ MASTER_CMAC="52:54:00:77:00:0a"
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
-QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=split on nested AMD
+QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=off on nested AMD
 SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (900s)
 
 # Nested-virt boots can hang at a RANDOM early-init point with no panic — the
@@ -163,9 +163,9 @@ resolve_qemu_cpu() {
     [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=1; log "nested AMD-V: enabling $BOOT_RETRIES boot retry for silent early-boot hangs (override with BOOT_RETRIES)"; }
     # The freeze is in the initramfs (pre-Ignition); bake idle=poll onto firstboot.
     [ -z "$INJECT_KARGS" ] && { INJECT_KARGS=1; log "nested AMD-V: will inject first-boot kargs '$FIRSTBOOT_KARGS' into the image (override with INJECT_KARGS=0)"; }
-    # Move IOAPIC/PIC to QEMU userspace so INTx (pci=nomsi) doesn't ride the broken
-    # in-kernel path. Last-ditch; final LAPIC delivery is still in-kernel.
-    [ -z "$QEMU_IRQCHIP" ] && { QEMU_IRQCHIP=split; log "nested AMD-V: using kernel-irqchip=split (override with QEMU_IRQCHIP=on)"; }
+    # Move the interrupt controllers to QEMU userspace. kernel-irqchip=split still
+    # leaves LAPIC delivery in KVM, which is the broken leg on this nested path.
+    [ -z "$QEMU_IRQCHIP" ] && { QEMU_IRQCHIP=off; log "nested AMD-V: using kernel-irqchip=off (override with QEMU_IRQCHIP=on or split)"; }
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
