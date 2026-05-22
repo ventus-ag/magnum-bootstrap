@@ -78,7 +78,12 @@ BOOT_STALL_SECS="${BOOT_STALL_SECS:-120}" # console-idle seconds that mark a sil
 # Auto-on for nested AMD; needs passwordless sudo + nbd, best-effort (warns+boots
 # unmodified on failure). Set INJECT_KARGS=0 to disable.
 INJECT_KARGS="${INJECT_KARGS:-}"
-FIRSTBOOT_KARGS="${FIRSTBOOT_KARGS:-idle=poll nox2apic no-kvmclock tsc=reliable}"
+# idle=poll: vCPU never halts (no lost timer-wake). nox2apic: legacy xAPIC.
+# no-kvmclock+tsc=reliable: stable TSC with 1 vCPU. pci=nomsi: force all PCI
+# devices onto legacy INTx (IOAPIC) instead of MSI-X — on broken nested-AMD the
+# virtio block/net completion IRQ is often delivered via INTx when MSI-X is lost
+# (the boot otherwise stalls in dracut "Expecting device …/by-label/boot").
+FIRSTBOOT_KARGS="${FIRSTBOOT_KARGS:-idle=poll nox2apic no-kvmclock tsc=reliable pci=nomsi}"
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
@@ -147,8 +152,8 @@ resolve_qemu_cpu() {
       MASTER_CPUS=1; WORKER_CPUS=1
       log "nested AMD-V: capping nodes to 1 vCPU (set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
     fi
-    # Early-boot freezes here are non-deterministic; retry on a fresh overlay.
-    [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=4; log "nested AMD-V: enabling $BOOT_RETRIES boot retries for silent early-boot hangs (override with BOOT_RETRIES)"; }
+    # Early-boot freezes here are non-deterministic; retry once on a fresh overlay.
+    [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=1; log "nested AMD-V: enabling $BOOT_RETRIES boot retry for silent early-boot hangs (override with BOOT_RETRIES)"; }
     # The freeze is in the initramfs (pre-Ignition); bake idle=poll onto firstboot.
     [ -z "$INJECT_KARGS" ] && { INJECT_KARGS=1; log "nested AMD-V: will inject first-boot kargs '$FIRSTBOOT_KARGS' into the image (override with INJECT_KARGS=0)"; }
   else

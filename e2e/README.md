@@ -87,15 +87,17 @@ idle wait and the timer interrupt that should wake it is lost. Three layers
 address this, all auto-enabled when nested AMD-V is detected:
 
 - `INJECT_KARGS=1` / `FIRSTBOOT_KARGS` — bakes `idle=poll nox2apic no-kvmclock
-  tsc=reliable` into the image's BLS boot entry (via `qemu-nbd`) **before** the
-  first boot. `idle=poll` keeps the vCPU from ever halting, so the lost-wakeup
-  can't freeze it. This is needed because the freeze is *in the initramfs*, before
-  Ignition — so butane `kernel_arguments` (which apply only after firstboot) are
-  too late. Best-effort: needs passwordless sudo + the `nbd` module; on failure it
-  warns and boots unmodified.
-- `BOOT_RETRIES` — extra boot attempts (auto: **4** on nested AMD, 0 otherwise).
-  Early freezes are non-deterministic, so a stalled VM is killed and retried on a
-  fresh overlay (kargs re-injected each time).
+  tsc=reliable pci=nomsi` into the image's BLS boot entry (via `qemu-nbd`)
+  **before** the first boot. `idle=poll` keeps the vCPU from ever halting (no lost
+  timer-wake); `pci=nomsi` forces devices onto legacy INTx interrupts (delivered
+  when MSI-X is lost — else the boot stalls in dracut waiting for the disk). This
+  is needed because the freeze is *in the initramfs*, before Ignition — so butane
+  `kernel_arguments` (which apply only after firstboot) are too late. Best-effort:
+  needs passwordless sudo + the `nbd` module; on failure it warns and boots
+  unmodified.
+- `BOOT_RETRIES` — extra boot attempts (auto: **1** on nested AMD, 0 otherwise).
+  Early freezes are non-deterministic, so a stalled VM is killed and retried once
+  on a fresh overlay (kargs re-injected each time).
 - `BOOT_STALL_SECS` — console-idle seconds that flag a silent hang (default 120).
   Steady output (even slow TCG) keeps resetting the timer, so it only fires on a
   true freeze, not a slow boot.

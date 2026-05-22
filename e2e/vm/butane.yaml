@@ -63,9 +63,11 @@ storage:
           method=ignore
 # Nested AMD-V (Zen1) workaround kernel args. On this host the L2 guest's LAPIC
 # interrupt delivery and kvm-clock are unreliable: the vCPU halts and is never
-# woken (boot freezes, clock frozen). idle=poll keeps the vCPU running so it
-# always takes the next tick; nox2apic uses the emulated legacy xAPIC;
-# no-kvmclock + tsc=reliable fall back to a TSC that is stable with one vCPU.
+# woken (boot freezes, clock frozen), and device IRQs get lost. idle=poll keeps
+# the vCPU running so it always takes the next tick; nox2apic uses the emulated
+# legacy xAPIC; no-kvmclock + tsc=reliable fall back to a TSC that is stable with
+# one vCPU; pci=nomsi forces devices onto legacy INTx (IOAPIC) interrupts, which
+# are delivered when MSI-X is not (else the boot stalls waiting for the disk).
 # Harmless on healthy hosts (idle=poll just busy-waits). Applied by Ignition on
 # first boot (one extra reboot). Drop these once on a runner with sound nested
 # virt (Zen2+/Intel/bare-metal).
@@ -75,3 +77,4 @@ kernel_arguments:
     - nox2apic
     - no-kvmclock
     - tsc=reliable
+    - pci=nomsi
