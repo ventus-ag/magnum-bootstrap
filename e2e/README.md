@@ -82,19 +82,28 @@ validate on the runner.
 On a nested KVM host (the runner is itself a VM) — especially **nested AMD-V on
 Zen1** — the L2 guest's LAPIC interrupt delivery and clock are unreliable. `auto`
 already forces legacy xAPIC + 1 vCPU (`-cpu host,-x2apic`), but a boot can still
-freeze *silently* (no panic) at a random early-init point. Because that is
-**non-deterministic**, the next boot usually succeeds, so `boot_node` kills a
-stalled VM and retries on a fresh overlay:
+freeze *silently* (no panic) in the **dracut initramfs**: the vCPU halts in an
+idle wait and the timer interrupt that should wake it is lost. Three layers
+address this, all auto-enabled when nested AMD-V is detected:
 
+- `INJECT_KARGS=1` / `FIRSTBOOT_KARGS` — bakes `idle=poll nox2apic no-kvmclock
+  tsc=reliable` into the image's BLS boot entry (via `qemu-nbd`) **before** the
+  first boot. `idle=poll` keeps the vCPU from ever halting, so the lost-wakeup
+  can't freeze it. This is needed because the freeze is *in the initramfs*, before
+  Ignition — so butane `kernel_arguments` (which apply only after firstboot) are
+  too late. Best-effort: needs passwordless sudo + the `nbd` module; on failure it
+  warns and boots unmodified.
 - `BOOT_RETRIES` — extra boot attempts (auto: **4** on nested AMD, 0 otherwise).
+  Early freezes are non-deterministic, so a stalled VM is killed and retried on a
+  fresh overlay (kargs re-injected each time).
 - `BOOT_STALL_SECS` — console-idle seconds that flag a silent hang (default 120).
   Steady output (even slow TCG) keeps resetting the timer, so it only fires on a
   true freeze, not a slow boot.
 
-If boots *still* don't succeed within the retries, the host's nested virt is the
-limit: fall back to `QEMU_ACCEL=tcg QEMU_CPU=qemu64` (pure emulation — reliable
-but slow), or move the tier to a runner with sound nested virt (Zen2+/Intel or
-bare-metal/`--device /dev/kvm`).
+If boots *still* don't succeed, the host's nested virt is the limit: fall back to
+`QEMU_ACCEL=tcg QEMU_CPU=qemu64` (pure emulation — reliable but slow; bypasses
+nested interrupt delivery entirely), or move the tier to a runner with sound
+nested virt (Zen2+/Intel or bare-metal/`--device /dev/kvm`).
 
 ### Trigger mode: `direct` vs `agent`
 

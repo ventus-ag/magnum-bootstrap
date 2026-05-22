@@ -24,8 +24,11 @@ on:
       workers:
         description: Number of worker nodes (0 = single-node master)
         default: "0"
+      qemu_accel:
+        description: QEMU accelerator (kvm = fast/needs nested virt; tcg = pure emulation, reliable but slow)
+        default: kvm
       qemu_cpu:
-        description: QEMU -cpu model (auto = host w/ 1 vCPU on nested AMD-V; or set EPYC / max / host)
+        description: QEMU -cpu model (auto = host w/ 1 vCPU on nested AMD-V; or set EPYC / max / host / qemu64 for tcg)
         default: auto
       qemu_machine:
         description: QEMU -machine type (blank = qemu default/i440fx; try q35 if early boot hangs)
@@ -120,6 +123,7 @@ jobs:
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
+          QEMU_ACCEL: ${{ github.event.inputs.qemu_accel || 'kvm' }}
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
           QEMU_MACHINE: ${{ github.event.inputs.qemu_machine || '' }}
           TRIGGER: ${{ github.event.inputs.trigger || 'direct' }}

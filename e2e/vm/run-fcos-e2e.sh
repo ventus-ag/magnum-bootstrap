@@ -70,6 +70,16 @@ SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (
 BOOT_RETRIES="${BOOT_RETRIES:-}"          # extra boot attempts (auto: 4 on nested AMD, 0 otherwise)
 BOOT_STALL_SECS="${BOOT_STALL_SECS:-120}" # console-idle seconds that mark a silent boot hang
 
+# First-boot kernel args. The nested-virt freeze happens in the dracut INITRAMFS,
+# before Ignition runs — so Ignition's kernel_arguments (butane) are too late for
+# it. INJECT_KARGS bakes FIRSTBOOT_KARGS straight into the image's BLS boot entry
+# via qemu-nbd before QEMU starts, so the very first boot already has idle=poll
+# (vCPU never halts -> the lost timer-wake that freezes the L2 guest can't occur).
+# Auto-on for nested AMD; needs passwordless sudo + nbd, best-effort (warns+boots
+# unmodified on failure). Set INJECT_KARGS=0 to disable.
+INJECT_KARGS="${INJECT_KARGS:-}"
+FIRSTBOOT_KARGS="${FIRSTBOOT_KARGS:-idle=poll nox2apic no-kvmclock tsc=reliable}"
+
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
 
@@ -139,6 +149,8 @@ resolve_qemu_cpu() {
     fi
     # Early-boot freezes here are non-deterministic; retry on a fresh overlay.
     [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=4; log "nested AMD-V: enabling $BOOT_RETRIES boot retries for silent early-boot hangs (override with BOOT_RETRIES)"; }
+    # The freeze is in the initramfs (pre-Ignition); bake idle=poll onto firstboot.
+    [ -z "$INJECT_KARGS" ] && { INJECT_KARGS=1; log "nested AMD-V: will inject first-boot kargs '$FIRSTBOOT_KARGS' into the image (override with INJECT_KARGS=0)"; }
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
@@ -170,7 +182,8 @@ preflight() {
   resolve_butane
   resolve_qemu_cpu
   BOOT_RETRIES="${BOOT_RETRIES:-0}"   # default 0 (single attempt) unless nested AMD raised it
-  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s)"
+  INJECT_KARGS="${INJECT_KARGS:-0}"   # default off unless nested AMD turned it on
+  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s); inject-kargs: $INJECT_KARGS"
   if [ "$QEMU_ACCEL" = kvm ]; then
     [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required (or set QEMU_ACCEL=tcg)"
   fi
@@ -224,15 +237,60 @@ render_ignition() {
     podman) podman run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.${name}.yaml" > "$WORKDIR/ignition.${name}.json" ;;
     docker) docker run --rm -i quay.io/coreos/butane:release --pretty --strict < "$WORKDIR/butane.${name}.yaml" > "$WORKDIR/ignition.${name}.json" ;;
   esac
-  qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/${name}.qcow2" 25G >/dev/null
+  create_overlay "$name"
 }
 
-# recreate_overlay <name> — fresh qcow2 overlay + clean console log for a retry.
-recreate_overlay() {
+# create_overlay <name> — fresh qcow2 overlay on the cached base, with first-boot
+# kernel args injected when INJECT_KARGS=1 (nested-virt workaround).
+create_overlay() {
   local name="$1" base; base="$(download_fcos)"
   rm -f "$WORKDIR/${name}.qcow2"
-  : > "$WORKDIR/console.${name}.log"
   qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/${name}.qcow2" 25G >/dev/null
+  [ "$INJECT_KARGS" = 1 ] && inject_firstboot_kargs "$WORKDIR/${name}.qcow2"
+  return 0
+}
+
+# recreate_overlay <name> — fresh overlay (kargs re-injected) + clean console.
+recreate_overlay() {
+  local name="$1"
+  : > "$WORKDIR/console.${name}.log"
+  create_overlay "$name"
+}
+
+# inject_firstboot_kargs <overlay.qcow2> — append FIRSTBOOT_KARGS to the image's
+# BLS boot entry so the FIRST boot's initramfs already carries them (Ignition's
+# kernel_arguments only apply *after* firstboot, but the nested-virt freeze is in
+# the initramfs *before* Ignition). Writes land in the overlay (copy-on-write), so
+# the cached base stays clean and every retry re-injects. Best-effort: needs
+# passwordless sudo + nbd; on any failure it warns and the VM boots unmodified
+# (the retry loop and butane kargs still apply).
+inject_firstboot_kargs() {
+  local img="$1" nbd="" mnt part done=0 n
+  if ! sudo -n true 2>/dev/null; then
+    log "inject-kargs: no passwordless sudo — booting $(basename "$img") unmodified"; return 0
+  fi
+  sudo modprobe nbd max_part=8 2>/dev/null || { log "inject-kargs: modprobe nbd failed — skipping"; return 0; }
+  for n in 0 1 2 3 4 5 6 7; do [ -e "/sys/block/nbd$n/pid" ] || { nbd="/dev/nbd$n"; break; }; done
+  [ -n "$nbd" ] || { log "inject-kargs: no free nbd device — skipping"; return 0; }
+  sudo qemu-nbd --connect="$nbd" -f qcow2 "$img" 2>/dev/null || { log "inject-kargs: qemu-nbd connect failed — skipping"; return 0; }
+  sudo partprobe "$nbd" 2>/dev/null || true; sleep 1
+  mnt="$(mktemp -d)"
+  # FCoS x86_64 layout: p3 = ext4 'boot' (BLS entries live here); try it first.
+  for part in "${nbd}p3" "${nbd}p2" "${nbd}p4" "${nbd}p1"; do
+    [ -e "$part" ] || continue
+    sudo mount "$part" "$mnt" 2>/dev/null || continue
+    if sudo test -d "$mnt/loader/entries"; then
+      sudo bash -c "shopt -s nullglob; for f in '$mnt'/loader/entries/*.conf; do sed -i 's#^\\(options .*\\)#\\1 $FIRSTBOOT_KARGS#' \"\$f\"; done"
+      log "inject-kargs: added '$FIRSTBOOT_KARGS' to BLS entries on $(basename "$part") of $(basename "$img")"
+      done=1
+    fi
+    sudo umount "$mnt" 2>/dev/null || true
+    [ "$done" = 1 ] && break
+  done
+  rmdir "$mnt" 2>/dev/null || true
+  sudo qemu-nbd --disconnect "$nbd" >/dev/null 2>&1 || true
+  [ "$done" = 1 ] || log "inject-kargs: could not locate the BLS boot entry — booting $(basename "$img") unmodified"
+  return 0
 }
 
 # boot_node <name> <ssh_port> <mem_mb> <cpus> <cluster_mac|"">
