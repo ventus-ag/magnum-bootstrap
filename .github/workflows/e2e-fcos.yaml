@@ -33,6 +33,12 @@ on:
       trigger:
         description: How the reconciler is invoked (direct = systemd unit; agent = real heat-container-agent + mock Heat)
         default: direct
+      boot_retries:
+        description: Extra VM boot attempts on a silent boot hang (blank = auto; 4 on nested AMD)
+        default: ""
+      boot_stall:
+        description: Console-idle seconds that flag a silent boot hang and trigger a retry
+        default: "120"
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
@@ -117,6 +123,8 @@ jobs:
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
           QEMU_MACHINE: ${{ github.event.inputs.qemu_machine || '' }}
           TRIGGER: ${{ github.event.inputs.trigger || 'direct' }}
+          BOOT_RETRIES: ${{ github.event.inputs.boot_retries || '' }}
+          BOOT_STALL_SECS: ${{ github.event.inputs.boot_stall || '120' }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: ./e2e/vm/run-fcos-e2e.sh
 

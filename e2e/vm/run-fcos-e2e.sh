@@ -56,11 +56,19 @@ MASTER_CMAC="52:54:00:77:00:0a"
 # `-cpu host,-x2apic` (legacy xAPIC) + 1 vCPU to work around it. Override the
 # model with QEMU_CPU=host/EPYC/max/..., the chipset with QEMU_MACHINE=q35, keep
 # multi-vCPU with ALLOW_SMP_ON_NESTED_AMD=1, or rule KVM out entirely (slow) with
-# QEMU_ACCEL=tcg QEMU_CPU=qemu64. SSH_WAIT_TRIES extends the boot wait (x5s).
+# QEMU_ACCEL=tcg QEMU_CPU=qemu64. SSH_WAIT_TRIES extends the per-boot wait (x5s).
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
-SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # boot wait = tries x 5s (900s; nested AMD does an extra karg reboot)
+SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (900s)
+
+# Nested-virt boots can hang at a RANDOM early-init point with no panic — the
+# console just stops. That is non-deterministic, so a fresh reboot usually clears
+# it. boot_node retries on a clean overlay: BOOT_RETRIES extra attempts, each
+# abandoned early once the console is idle BOOT_STALL_SECS with SSH still down (so
+# a silent freeze costs ~BOOT_STALL_SECS, not the full SSH_WAIT_TRIES window).
+BOOT_RETRIES="${BOOT_RETRIES:-}"          # extra boot attempts (auto: 4 on nested AMD, 0 otherwise)
+BOOT_STALL_SECS="${BOOT_STALL_SECS:-120}" # console-idle seconds that mark a silent boot hang
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
@@ -129,6 +137,8 @@ resolve_qemu_cpu() {
       MASTER_CPUS=1; WORKER_CPUS=1
       log "nested AMD-V: capping nodes to 1 vCPU (set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
     fi
+    # Early-boot freezes here are non-deterministic; retry on a fresh overlay.
+    [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=4; log "nested AMD-V: enabling $BOOT_RETRIES boot retries for silent early-boot hangs (override with BOOT_RETRIES)"; }
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
@@ -159,7 +169,8 @@ preflight() {
   for t in qemu-system-x86_64 qemu-img jq xz curl ssh scp go make; do require "$t"; done
   resolve_butane
   resolve_qemu_cpu
-  log "butane renderer: $BUTANE; workers: $WORKERS"
+  BOOT_RETRIES="${BOOT_RETRIES:-0}"   # default 0 (single attempt) unless nested AMD raised it
+  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s)"
   if [ "$QEMU_ACCEL" = kvm ]; then
     [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required (or set QEMU_ACCEL=tcg)"
   fi
@@ -216,15 +227,52 @@ render_ignition() {
   qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/${name}.qcow2" 25G >/dev/null
 }
 
+# recreate_overlay <name> — fresh qcow2 overlay + clean console log for a retry.
+recreate_overlay() {
+  local name="$1" base; base="$(download_fcos)"
+  rm -f "$WORKDIR/${name}.qcow2"
+  : > "$WORKDIR/console.${name}.log"
+  qemu-img create -f qcow2 -b "$base" -F qcow2 "$WORKDIR/${name}.qcow2" 25G >/dev/null
+}
+
 # boot_node <name> <ssh_port> <mem_mb> <cpus> <cluster_mac|"">
+# Boots with bounded retries. A nested-virt boot can freeze silently at a random
+# early-init point; the next boot usually succeeds, so a stalled VM is killed and
+# retried on a clean overlay rather than failing the whole run.
 boot_node() {
   local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5"
+  local total=$((BOOT_RETRIES + 1)) n pid
+  for n in $(seq 1 "$total"); do
+    if [ "$n" -gt 1 ]; then
+      log "$name boot attempt $n/$total — previous boot hung; recreating overlay"
+      recreate_overlay "$name"
+    fi
+    if boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" "$n" "$total"; then
+      return 0
+    fi
+    pid="${QEMU_PIDS[$name]:-}"
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true; sleep 2; kill -9 "$pid" 2>/dev/null || true
+      unset 'QEMU_PIDS[$name]'
+    fi
+  done
+  err "$name failed to boot after $total attempt(s) — last 80 console lines:"
+  tail -n 80 "$WORKDIR/console.${name}.log" 2>/dev/null | sed 's/^/    | /' >&2 || true
+  die "$name SSH never came up ($total attempts; nested-virt boot hang). Try QEMU_ACCEL=tcg QEMU_CPU=qemu64 (slow but reliable), raise BOOT_RETRIES, or use a runner with sound nested virt. console: $WORKDIR/console.${name}.log"
+}
+
+# boot_node_once <name> <port> <mem> <cpus> <cmac> <attempt> <total>
+# Boots one VM and waits for SSH. Returns 0 when SSH is up; returns 1 if the boot
+# crashes, exits, or stalls (console idle BOOT_STALL_SECS with no SSH) so the
+# caller can retry on a fresh overlay.
+boot_node_once() {
+  local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5" n="$6" total="$7"
   local net=(-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${port}-:22" -device virtio-net-pci,netdev=n0)
   if [ -n "$cmac" ]; then
     # Second NIC on a shared QEMU mcast segment = the cluster network.
     net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
   fi
-  log "booting $name (mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
+  log "booting $name (attempt $n/$total mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
     -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
@@ -232,33 +280,44 @@ boot_node() {
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
     "${net[@]}" &
   QEMU_PIDS[$name]=$!
-  local clog="$WORKDIR/console.${name}.log" waited=0
+  local clog="$WORKDIR/console.${name}.log" waited=0 last_size=-1 last_change
+  last_change="$(date +%s)"
   log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH on 127.0.0.1:$port (console: $clog)"
   for attempt in $(seq 1 "$SSH_WAIT_TRIES"); do
-    if gssh "$port" true 2>/dev/null; then log "$name SSH up after ${waited}s"; return 0; fi
+    if gssh "$port" true 2>/dev/null; then log "$name SSH up after ${waited}s (attempt $n/$total)"; return 0; fi
     if ! kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null; then
-      err "$name qemu exited early after ${waited}s — last 40 console lines:"
+      err "$name qemu exited early after ${waited}s (attempt $n/$total) — last 40 console lines:"
       tail -n 40 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
-      die "$name qemu exited early (see $clog)"
+      return 1
     fi
     # A fatal guest condition (panic, GPF, or — common under nested KVM — an RCU
-    # stall / soft lockup / hung task during early init) never recovers. Surface
-    # the reason and abort instead of polling for the full timeout.
+    # stall / soft lockup / hung task during early init) never recovers.
     if grep -qiE 'Kernel panic|BUG:|Oops:|general protection fault|detected stall|soft lockup|hung task|Unable to mount root|not syncing' "$clog" 2>/dev/null; then
-      err "$name fatal guest condition during boot after ${waited}s (SSH will never come up) — last 150 console lines:"
+      err "$name fatal guest condition during boot after ${waited}s (attempt $n/$total) — last 150 console lines:"
       tail -n 150 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
-      die "$name guest boot crash — try QEMU_CPU=max (or QEMU_ACCEL=tcg QEMU_CPU=qemu64); full console: $clog"
+      return 1
+    fi
+    # Silent freeze: a nested-virt hang emits no panic — the console simply stops
+    # growing. If it hasn't advanced in BOOT_STALL_SECS and SSH is still down,
+    # treat the boot as hung so boot_node retries on a fresh overlay. Steady (even
+    # slow, e.g. TCG) output keeps resetting last_change, so this never false-fires.
+    local now sz; now="$(date +%s)"; sz="$(stat -c %s "$clog" 2>/dev/null || echo 0)"
+    if [ "$sz" != "$last_size" ]; then last_size="$sz"; last_change="$now"; fi
+    if [ $((now - last_change)) -ge "$BOOT_STALL_SECS" ]; then
+      err "$name console idle ${BOOT_STALL_SECS}s with no SSH (silent nested-virt boot hang) after ${waited}s (attempt $n/$total) — last 80 console lines:"
+      tail -n 80 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
+      return 1
     fi
     # Heartbeat every ~30s with a console tail so a stuck boot/Ignition is visible.
     if [ $((attempt % 6)) -eq 0 ]; then
-      log "$name still waiting for SSH (${waited}s elapsed) — console tail:"
+      log "$name still waiting for SSH (${waited}s elapsed, console ${sz}B, idle $((now - last_change))s) — console tail:"
       tail -n 8 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (console log empty — qemu may not have started serial output yet)" >&2
     fi
     sleep 5; waited=$((waited + 5))
   done
-  err "$name SSH did not come up after ${waited}s — last 60 console lines:"
+  err "$name SSH did not come up after ${waited}s (attempt $n/$total) — last 60 console lines:"
   tail -n 60 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
-  die "$name SSH did not come up (see $clog)"
+  return 1
 }
 
 SCRIPTS_DIR() { echo "$VICTORIA_DIR/magnum/drivers/common/templates/kubernetes/bootstrap"; }

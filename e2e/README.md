@@ -77,6 +77,25 @@ Knobs: `KUBE_TAG`, `KUBE_TAG_UPGRADE`, `SCENARIOS="create ca-rotate upgrade"`,
 cluster network — see [IMPROVEMENTS.md](IMPROVEMENTS.md); it's a first cut to
 validate on the runner.
 
+### Nested-virt boot reliability
+
+On a nested KVM host (the runner is itself a VM) — especially **nested AMD-V on
+Zen1** — the L2 guest's LAPIC interrupt delivery and clock are unreliable. `auto`
+already forces legacy xAPIC + 1 vCPU (`-cpu host,-x2apic`), but a boot can still
+freeze *silently* (no panic) at a random early-init point. Because that is
+**non-deterministic**, the next boot usually succeeds, so `boot_node` kills a
+stalled VM and retries on a fresh overlay:
+
+- `BOOT_RETRIES` — extra boot attempts (auto: **4** on nested AMD, 0 otherwise).
+- `BOOT_STALL_SECS` — console-idle seconds that flag a silent hang (default 120).
+  Steady output (even slow TCG) keeps resetting the timer, so it only fires on a
+  true freeze, not a slow boot.
+
+If boots *still* don't succeed within the retries, the host's nested virt is the
+limit: fall back to `QEMU_ACCEL=tcg QEMU_CPU=qemu64` (pure emulation — reliable
+but slow), or move the tier to a runner with sound nested virt (Zen2+/Intel or
+bare-metal/`--device /dev/kvm`).
+
 ### Trigger mode: `direct` vs `agent`
 
 `TRIGGER` controls *how* the reconciler is invoked on each node:
