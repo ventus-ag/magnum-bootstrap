@@ -61,20 +61,8 @@ storage:
           may-fail=true
           [ipv6]
           method=ignore
-# Nested AMD-V (Zen1) workaround kernel args. On this host the L2 guest's LAPIC
-# interrupt delivery and kvm-clock are unreliable: the vCPU halts and is never
-# woken (boot freezes, clock frozen), and device IRQs get lost. idle=poll keeps
-# the vCPU running so it always takes the next tick; nox2apic uses the emulated
-# legacy xAPIC; no-kvmclock + tsc=reliable fall back to a TSC that is stable with
-# one vCPU; pci=nomsi forces devices onto legacy INTx (IOAPIC) interrupts, which
-# are delivered when MSI-X is not (else the boot stalls waiting for the disk).
-# Harmless on healthy hosts (idle=poll just busy-waits). Applied by Ignition on
-# first boot (one extra reboot). Drop these once on a runner with sound nested
-# virt (Zen2+/Intel/bare-metal).
-kernel_arguments:
-  should_exist:
-    - idle=poll
-    - nox2apic
-    - no-kvmclock
-    - tsc=reliable
-    - pci=nomsi
+# NOTE: no kernel_arguments here — this config mirrors the real Magnum
+# `fcct-config.yaml`, which carries none. The nested AMD-V (Zen1) workaround kargs
+# (idle=poll/nox2apic/no-kvmclock/tsc=reliable/pci=nomsi) are injected by the
+# harness (run-fcos-e2e.sh INJECT_KARGS) straight into the image's BLS entry on
+# nested AMD only, so a clean/Nova-faithful boot (e.g. QEMU_CPU=host) has none.
