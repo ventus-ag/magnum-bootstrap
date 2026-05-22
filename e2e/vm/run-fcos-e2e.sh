@@ -60,6 +60,7 @@ MASTER_CMAC="52:54:00:77:00:0a"
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
+QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=split on nested AMD
 SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (900s)
 
 # Nested-virt boots can hang at a RANDOM early-init point with no panic — the
@@ -156,6 +157,9 @@ resolve_qemu_cpu() {
     [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=1; log "nested AMD-V: enabling $BOOT_RETRIES boot retry for silent early-boot hangs (override with BOOT_RETRIES)"; }
     # The freeze is in the initramfs (pre-Ignition); bake idle=poll onto firstboot.
     [ -z "$INJECT_KARGS" ] && { INJECT_KARGS=1; log "nested AMD-V: will inject first-boot kargs '$FIRSTBOOT_KARGS' into the image (override with INJECT_KARGS=0)"; }
+    # Move IOAPIC/PIC to QEMU userspace so INTx (pci=nomsi) doesn't ride the broken
+    # in-kernel path. Last-ditch; final LAPIC delivery is still in-kernel.
+    [ -z "$QEMU_IRQCHIP" ] && { QEMU_IRQCHIP=split; log "nested AMD-V: using kernel-irqchip=split (override with QEMU_IRQCHIP=on)"; }
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
@@ -188,7 +192,7 @@ preflight() {
   resolve_qemu_cpu
   BOOT_RETRIES="${BOOT_RETRIES:-0}"   # default 0 (single attempt) unless nested AMD raised it
   INJECT_KARGS="${INJECT_KARGS:-0}"   # default off unless nested AMD turned it on
-  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s); inject-kargs: $INJECT_KARGS"
+  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s); inject-kargs: $INJECT_KARGS; irqchip: ${QEMU_IRQCHIP:-default}"
   if [ "$QEMU_ACCEL" = kvm ]; then
     [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required (or set QEMU_ACCEL=tcg)"
   fi
@@ -298,6 +302,19 @@ inject_firstboot_kargs() {
   return 0
 }
 
+# boot_progress <console-log> — how far the boot got, so a failed SSH wait can be
+# classified as a real hang vs an alive-but-unreachable guest (network/Ignition).
+boot_progress() {
+  local clog="$1"
+  if grep -qiE 'multi-user\.target|Startup finished|[a-z0-9-]+ login:|Server listening on .* port 22|sshd\[' "$clog" 2>/dev/null; then
+    echo reached-multiuser
+  elif grep -qiE 'Reached target .*[Bb]asic|switch.?root|Ignition|systemd\[1\]: Started' "$clog" 2>/dev/null; then
+    echo in-initramfs
+  else
+    echo early-boot
+  fi
+}
+
 # boot_node <name> <ssh_port> <mem_mb> <cpus> <cluster_mac|"">
 # Boots with bounded retries. A nested-virt boot can freeze silently at a random
 # early-init point; the next boot usually succeeds, so a stalled VM is killed and
@@ -335,9 +352,9 @@ boot_node_once() {
     # Second NIC on a shared QEMU mcast segment = the cluster network.
     net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
   fi
-  log "booting $name (attempt $n/$total mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
+  log "booting $name (attempt $n/$total mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} irqchip=${QEMU_IRQCHIP:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
-    -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
+    -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}${QEMU_IRQCHIP:+,kernel-irqchip=${QEMU_IRQCHIP}}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
     -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
@@ -367,7 +384,11 @@ boot_node_once() {
     local now sz; now="$(date +%s)"; sz="$(stat -c %s "$clog" 2>/dev/null || echo 0)"
     if [ "$sz" != "$last_size" ]; then last_size="$sz"; last_change="$now"; fi
     if [ $((now - last_change)) -ge "$BOOT_STALL_SECS" ]; then
-      err "$name console idle ${BOOT_STALL_SECS}s with no SSH (silent nested-virt boot hang) after ${waited}s (attempt $n/$total) — last 80 console lines:"
+      if [ "$(boot_progress "$clog")" = reached-multiuser ]; then
+        err "$name console idle ${BOOT_STALL_SECS}s but the guest REACHED MULTI-USER (attempt $n/$total) — this is NOT a boot hang: SSH is unreachable. Check user-mode net/hostfwd (DHCP on :2222) or Ignition ssh-key/sshd config. Last 80 console lines:"
+      else
+        err "$name console idle ${BOOT_STALL_SECS}s, still in early boot (silent nested-virt boot hang) after ${waited}s (attempt $n/$total) — last 80 console lines:"
+      fi
       tail -n 80 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
       return 1
     fi
@@ -378,7 +399,11 @@ boot_node_once() {
     fi
     sleep 5; waited=$((waited + 5))
   done
-  err "$name SSH did not come up after ${waited}s (attempt $n/$total) — last 60 console lines:"
+  if [ "$(boot_progress "$clog")" = reached-multiuser ]; then
+    err "$name SSH did not come up after ${waited}s but the guest REACHED MULTI-USER (attempt $n/$total) — NOT a boot hang: SSH unreachable. Check user-mode net/hostfwd (DHCP on :2222) or Ignition ssh-key/sshd config. Last 60 console lines:"
+  else
+    err "$name SSH did not come up after ${waited}s, still in early boot (likely a boot hang) (attempt $n/$total) — last 60 console lines:"
+  fi
   tail -n 60 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
   return 1
 }

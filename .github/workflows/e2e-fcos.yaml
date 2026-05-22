@@ -33,6 +33,9 @@ on:
       qemu_machine:
         description: QEMU -machine type (blank = qemu default/i440fx; try q35 if early boot hangs)
         default: ""
+      qemu_irqchip:
+        description: QEMU kernel-irqchip (blank = auto/split on nested AMD; set 'on' to force in-kernel)
+        default: ""
       trigger:
         description: How the reconciler is invoked (direct = systemd unit; agent = real heat-container-agent + mock Heat)
         default: direct
@@ -126,6 +129,7 @@ jobs:
           QEMU_ACCEL: ${{ github.event.inputs.qemu_accel || 'kvm' }}
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
           QEMU_MACHINE: ${{ github.event.inputs.qemu_machine || '' }}
+          QEMU_IRQCHIP: ${{ github.event.inputs.qemu_irqchip || '' }}
           TRIGGER: ${{ github.event.inputs.trigger || 'direct' }}
           BOOT_RETRIES: ${{ github.event.inputs.boot_retries || '' }}
           BOOT_STALL_SECS: ${{ github.event.inputs.boot_stall || '120' }}
