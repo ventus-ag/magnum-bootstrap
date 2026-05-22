@@ -68,8 +68,14 @@ SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (
 # it. boot_node retries on a clean overlay: BOOT_RETRIES extra attempts, each
 # abandoned early once the console is idle BOOT_STALL_SECS with SSH still down (so
 # a silent freeze costs ~BOOT_STALL_SECS, not the full SSH_WAIT_TRIES window).
-BOOT_RETRIES="${BOOT_RETRIES:-}"          # extra boot attempts (auto: 4 on nested AMD, 0 otherwise)
+BOOT_RETRIES="${BOOT_RETRIES:-}"          # extra boot attempts (auto: 1 on nested AMD, 0 otherwise)
 BOOT_STALL_SECS="${BOOT_STALL_SECS:-120}" # console-idle seconds that mark a silent boot hang
+
+# When KVM keeps hanging in early boot (broken nested interrupt delivery that no
+# karg/QEMU flag can fix), fall back to pure-emulation TCG — it has no nested
+# interrupt virtualization, so it boots where KVM freezes. Slow; good hosts never
+# reach it (KVM wins on attempt 1). Set 0 to fail instead of falling back.
+TCG_FALLBACK="${TCG_FALLBACK:-1}"
 
 # First-boot kernel args. The nested-virt freeze happens in the dracut INITRAMFS,
 # before Ignition runs — so Ignition's kernel_arguments (butane) are too late for
@@ -336,9 +342,28 @@ boot_node() {
       unset 'QEMU_PIDS[$name]'
     fi
   done
-  err "$name failed to boot after $total attempt(s) — last 80 console lines:"
+  # KVM exhausted. If the failures were early-boot HANGS (not an alive-but-
+  # unreachable guest, which TCG can't fix), fall back to pure-emulation TCG: it
+  # has no nested interrupt virtualization, so it boots where KVM's lost device/
+  # timer IRQs freeze the L2 guest. Much slower; good hosts never reach here (KVM
+  # wins on attempt 1). Globals are updated so workers boot the same way.
+  if [ "$QEMU_ACCEL" = kvm ] && [ "${TCG_FALLBACK:-1}" = 1 ] \
+     && [ "$(boot_progress "$WORKDIR/console.${name}.log")" != reached-multiuser ]; then
+    log "$name: KVM hung in early boot $total attempt(s) — falling back to TCG (software emulation; reliable but slow). Disable with TCG_FALLBACK=0."
+    QEMU_ACCEL=tcg; QEMU_CPU=qemu64; QEMU_IRQCHIP=""
+    SSH_WAIT_TRIES=$(( SSH_WAIT_TRIES > 360 ? SSH_WAIT_TRIES : 360 ))   # TCG boots slowly
+    BOOT_STALL_SECS=$(( BOOT_STALL_SECS > 300 ? BOOT_STALL_SECS : 300 ))
+    recreate_overlay "$name"
+    if boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" 1 1; then return 0; fi
+    pid="${QEMU_PIDS[$name]:-}"
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true; sleep 2; kill -9 "$pid" 2>/dev/null || true
+      unset 'QEMU_PIDS[$name]'
+    fi
+  fi
+  err "$name failed to boot after $total KVM attempt(s)$([ "$QEMU_ACCEL" = tcg ] && echo ' + TCG fallback') — last 80 console lines:"
   tail -n 80 "$WORKDIR/console.${name}.log" 2>/dev/null | sed 's/^/    | /' >&2 || true
-  die "$name SSH never came up ($total attempts; nested-virt boot hang). Try QEMU_ACCEL=tcg QEMU_CPU=qemu64 (slow but reliable), raise BOOT_RETRIES, or use a runner with sound nested virt. console: $WORKDIR/console.${name}.log"
+  die "$name SSH never came up. If even the TCG fallback failed, use a runner with sound nested virt (Zen2+/Intel or bare-metal/--device /dev/kvm). console: $WORKDIR/console.${name}.log"
 }
 
 # boot_node_once <name> <port> <mem> <cpus> <cmac> <attempt> <total>

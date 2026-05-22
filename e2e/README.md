@@ -102,10 +102,19 @@ address this, all auto-enabled when nested AMD-V is detected:
   Steady output (even slow TCG) keeps resetting the timer, so it only fires on a
   true freeze, not a slow boot.
 
-If boots *still* don't succeed, the host's nested virt is the limit: fall back to
-`QEMU_ACCEL=tcg QEMU_CPU=qemu64` (pure emulation — reliable but slow; bypasses
-nested interrupt delivery entirely), or move the tier to a runner with sound
-nested virt (Zen2+/Intel or bare-metal/`--device /dev/kvm`).
+- `TCG_FALLBACK=1` (default) — if KVM still hangs in early boot after the retries
+  (broken nested interrupt *delivery* that no karg/QEMU flag can fix), the harness
+  automatically re-boots the node under **pure-emulation TCG** (`qemu64`, longer
+  timeouts). TCG has no nested interrupt virtualization at all, so it boots where
+  KVM's lost device/timer IRQs freeze it — much slower, but reliable. Good hosts
+  never reach it (KVM wins on the first attempt). Set `TCG_FALLBACK=0` to fail
+  instead. Failures that *reached multi-user* (an alive-but-unreachable guest —
+  network/Ignition, which TCG can't fix) do **not** trigger the fallback.
+
+If even the TCG fallback fails, the host is the limit: move the tier to a runner
+with sound nested virt (Zen2+/Intel or bare-metal/`--device /dev/kvm`). Note the
+full k8s e2e under TCG is slow — fine to prove the logic, but a real runner is the
+proper home for this tier.
 
 ### Trigger mode: `direct` vs `agent`
 
