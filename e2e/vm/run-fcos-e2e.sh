@@ -60,7 +60,7 @@ MASTER_CMAC="52:54:00:77:00:0a"
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
-SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-120}"   # boot wait = tries x 5s (default 600s)
+SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # boot wait = tries x 5s (900s; nested AMD does an extra karg reboot)
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
