@@ -127,10 +127,23 @@ run_reconcile() {
   for attempt in $(seq 1 "$attempts"); do
     rm -f "$RESULT_FILE"
     systemctl reset-failed magnum-reconcile.service 2>/dev/null || true
-    log "reconcile attempt ${attempt}/${attempts}"
-    if systemctl start --wait magnum-reconcile.service; then rc=0; break; fi
-    rc=$?
-    [ "$attempt" -lt "$attempts" ] && { err "attempt ${attempt} failed (rc=$rc), retrying"; sleep 15; }
+    log "reconcile attempt ${attempt}/${attempts} — streaming /var/log/magnum-reconcile.log"
+    # Stream the reconciler log live to our stdout (-> host harness -> CI) so the
+    # whole run is visible in CI, not just a tail on failure. -F survives the
+    # launcher creating/trimming the file; -n0 emits only new lines. Wrapped in a
+    # subshell so we can kill the tail+sed children after the unit finishes.
+    touch /var/log/magnum-reconcile.log 2>/dev/null || true
+    ( stdbuf -oL tail -n0 -F /var/log/magnum-reconcile.log 2>/dev/null | sed -u 's/^/    | /' ) &
+    local tail_pid=$!
+    if systemctl start --wait magnum-reconcile.service; then rc=0; else rc=$?; fi
+    sleep 1; pkill -P "$tail_pid" 2>/dev/null || true; kill "$tail_pid" 2>/dev/null || true
+    [ "$rc" = 0 ] && break
+    err "attempt ${attempt} failed (rc=$rc)"
+    # journald captures what the log file may not (panics, stderr, the unit exit
+    # code), so dump it too — this is the real cause when the unit fails to start.
+    echo "    --- journalctl -u magnum-reconcile.service (last 40) ---" >&2
+    journalctl -u magnum-reconcile.service -n 40 --no-pager 2>/dev/null | sed 's/^/    | /' >&2 || true
+    [ "$attempt" -lt "$attempts" ] && { err "retrying in 15s"; sleep 15; }
   done
   return "$rc"
 }

@@ -25,6 +25,16 @@ passwd:
       ssh_authorized_keys:
         - "@@SSH_AUTHORIZED_KEY@@"
 storage:
+  links:
+    # Compat path for the system CA bundle. Real Magnum FCoS nodes have
+    # /etc/pki/tls/certs/ca-bundle.crt (the reconciler's kube-os-config copies it
+    # into the OpenStack cloud-provider ca-file). A bare FCoS image ships only the
+    # extracted bundle, so recreate the standard Fedora symlink here to match a
+    # production node — otherwise kube-os-config fails with
+    # "open /etc/pki/tls/certs/ca-bundle.crt: no such file or directory".
+    - path: /etc/pki/tls/certs/ca-bundle.crt
+      target: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+      overwrite: true
   files:
     - path: /etc/hostname
       mode: 0644
