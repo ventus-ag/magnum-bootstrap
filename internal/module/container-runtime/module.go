@@ -161,8 +161,25 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
 		}
 		changes = append(changes, dl.Changes...)
+		// On Fedora CoreOS /usr/local and /opt are symlinks into /var
+		// (/usr/local -> ../var/usrlocal, /opt -> ../var/opt). Ensure the symlink
+		// targets exist before extracting so tar writes THROUGH the symlinks into
+		// their targets instead of replacing them: replacing the /usr/local symlink
+		// with a real directory fails with EXDEV ("Invalid cross-device link") on a
+		// composefs FCoS image where /usr is a read-only overlay. --keep-directory-
+		// symlink only preserves a symlink whose target already exists; a dangling
+		// symlink is replaced regardless, so the targets must be created first. This
+		// makes the install version-independent (composefs or not), with no node
+		// pre-provisioning required.
+		usrLocalTarget, err := (hostresource.DirectorySpec{Path: "/var/usrlocal", Mode: 0o755}).Apply(executor)
+		if err != nil {
+			return nil, false, fmt.Errorf("ensure containerd extract target /var/usrlocal: %w", err)
+		}
+		changes = append(changes, usrLocalTarget.Changes...)
+
 		if useV2Layout {
-			// containerd 2.x: tarball has bin/ directory, extract to /usr/local.
+			// containerd 2.x: tarball has a bin/ directory; extract to /usr/local
+			// (resolves through the symlink into /var/usrlocal).
 			if err := executor.Run("tar", "xzf", localPath,
 				"-C", "/usr/local",
 				"--no-same-owner", "--touch", "--no-same-permissions",
@@ -170,9 +187,18 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 			}
 		} else {
-			// containerd 1.x cri-containerd-cni bundle: extract to /.
+			// containerd 1.x cri-containerd-cni bundle: extract to /. The bundle
+			// carries bare "usr/local/" and "opt/" directory members, so
+			// --keep-directory-symlink is required to extract through the FCoS
+			// symlinks rather than replace them.
+			optTarget, err := (hostresource.DirectorySpec{Path: "/var/opt", Mode: 0o755}).Apply(executor)
+			if err != nil {
+				return nil, false, fmt.Errorf("ensure containerd extract target /var/opt: %w", err)
+			}
+			changes = append(changes, optTarget.Changes...)
 			if err := executor.Run("tar", "xzf", localPath,
 				"-C", "/",
+				"--keep-directory-symlink",
 				"--no-same-owner", "--touch", "--no-same-permissions",
 				"--exclude=etc/cni/net.d",
 				"--exclude=etc/containerd/config.toml",
