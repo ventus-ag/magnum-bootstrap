@@ -345,3 +345,116 @@ Unsafe state (never entered): new leaf while any peer trusts only old CA.
 4. Coordination is through the Kubernetes API; an outage pauses (never
    corrupts) the rotation.
 5. Final completion is recorded only after old trust is safely removed.
+
+## Operational hardening (repeated-operation robustness)
+
+Background: a long sequence of operations (rotate × N, upgrade, rotate …) could
+make a node slow enough to blow a per-phase health wait. The node then failed to
+report its phase, the cluster barrier never advanced, Heat hit `update_timeout`,
+and — critically — *every later operation also timed out*, because a wedged run
+kept squatting the reconcile flock and the periodic timer kept re-running the
+stuck rotation. The cluster itself stayed functional (a stuck barrier is a safe
+dual-trust pause); the failure was that Heat could never make progress again.
+The following make the protocol survive any master count (1 → 2 → 3 → 4+) and
+keep a single timeout from becoming a permanent wedge.
+
+1. **Restart Lease is taken for any master count, not just `> 1`.** Deciding
+   whether to serialize from `NUMBER_OF_MASTERS` is fragile — a stale/zero value
+   on a real multi-master cluster would let every apiserver restart at once and
+   break quorum. The Lease is now always acquired on masters; on a genuine
+   single-master cluster it is uncontended (acquire/release are effectively
+   instant), so it is free there and correct everywhere else. (`runPhase`)
+
+2. **Heat-driven run timeout.** `RECONCILER_RUN_TIMEOUT_SECONDS` (heat-param,
+   default 4800s) is exported to the binary as
+   `MAGNUM_RECONCILE_RUN_TIMEOUT_SECONDS` and used as the `--timeout` default. It
+   is kept a safe margin below Heat's stack `update_timeout` (default 90 min) so
+   the reconciler self-cancels, reports a clean failure, and releases its flock
+   *before* Heat gives up — instead of running on (oneshot units have no start
+   timeout by default) and squatting the lock. All barrier/lease/health waits
+   already honour `ctx`, so this bounds the whole protocol to the Heat window
+   automatically. The reconciler also now traps SIGTERM/SIGINT and cancels its
+   context, so a systemd stop unwinds gracefully.
+
+3. **systemd backstop + no periodic restart loop.** `magnum-reconcile.service`
+   gains `TimeoutStartSec=5100` / `TimeoutStopSec=120` / `KillMode=mixed` so a
+   run that ignores its own context is still reaped and frees the lock.
+   `magnum-reconcile-periodic.service` drops `Restart=on-failure`: a failed
+   periodic run no longer immediately re-grabs the lock for a stuck rotation
+   (the timer re-fires on schedule), so it can never starve a Heat-triggered
+   `run-once`.
+
+4. **Workload rollout is content-gated.** `patchWorkloads` keys its annotation on
+   the SHA-256 fingerprint of the *new CA*, not the rotation id. A genuine CA
+   change rolls workloads exactly once; a resume / periodic re-finalize / repeat
+   that produces the same CA is a `kubectl patch` no-op and rolls nothing. This
+   removes the cluster-wide pod churn that previously accompanied *every*
+   rotation and dragged health waits toward their ceilings.
+
+5. **Pulumi local-backend history is pruned.** The DIY file backend writes a
+   history snapshot on every up/refresh and never prunes it, so each successive
+   operation paid a rising checkpoint cost. After a successful `up` the reconciler
+   trims `.pulumi/history/<stack>/` to the newest 20 versions (never touching the
+   live checkpoint).
+
+Net effect: each operation starts from a bounded, low-churn baseline; a node that
+still cannot converge pauses the rotation safely (as designed) *without* wedging
+Heat or the lock, so retries — and the next operation — make progress instead of
+failing identically forever.
+
+## Barrier robustness (any cluster size, 1 → N masters)
+
+The trust model above is the textbook-safe rotation (bundle-everywhere → leaf
+swap → drop-old, the same shape kubeadm and cert-manager use) and is left
+unchanged. The *coordination* layer that drives the barriers, however, had three
+weaknesses that made large or churning clusters fragile. All three are fixed in
+the coordinator (`internal/carotation/coord.go`); none change the trust model.
+
+1. **The run deadline is the single wait budget.** The barrier wait and the
+   restart-lock acquisition previously used fixed caps (20 min / 30 min) that
+   could fire *well inside* Heat's window — killing a rotation that was still
+   converging, especially with several masters whose control-plane restarts run
+   serially under the Lease and therefore add up. Both waits now derive their
+   deadline from the run context (the Heat-driven `RECONCILER_RUN_TIMEOUT_SECONDS`)
+   minus a short reserve (`barrierReserve`, 90 s) left for a clean failure
+   report. The whole protocol now uses the entire Heat window as one budget and
+   fails only when Heat itself is about to — so adding masters costs wall-clock,
+   not a false timeout. The fixed caps remain only as a fallback when the context
+   has no deadline (manual runs, tests). (`runDeadline`)
+
+2. **Barriers wait only on participants.** `AllNodesReached` previously required
+   *every* Node object in the cluster to report. A node created *after* the
+   rotation started (autoscaler scale-up, a resize add) is minted by Magnum with
+   the **new** CA and runs `create` — for which the rotation module is a no-op —
+   so it never annotates and would block the barrier until timeout. The
+   coordinator now snapshots the set of node names present when the rotation is
+   first established into the ConfigMap (`participants`), and the barriers wait
+   only on that set. The snapshot is exactly the nodes that hold the old CA — i.e.
+   exactly the nodes that must rotate — so this is both deadlock-proof against
+   later-joined nodes and trust-safe. A participant that has since *left* the
+   cluster (deleted and replaced) is likewise skipped, since its replacement
+   carries the new CA. When no snapshot is recorded (an older ConfigMap, or a
+   manually created one) the barrier falls back to "all current nodes", matching
+   the previous behaviour. (`keyParticipants`, `EnsureRotation`, `AllNodesReached`)
+
+3. **Pending nodes are classified, not just named.** While a barrier waits it now
+   logs each outstanding node with a readiness hint
+   (`node-2(NotReady 4m12s)`), so an operator can immediately tell a slow node
+   from a dead one without SSHing in — the difference between "wait" and
+   "intervene". (`notReadyHint`, `formatPending`)
+
+### Still operator-owned
+
+A genuinely dead node that is *not* replaced still halts the rotation at a safe
+dual-trust phase (this is correct: finalizing while it still presents an old leaf
+would break every peer once it returns). With the changes above the rotation now
+*uses the full Heat window* before giving up and *says which node* is the
+holdout; recovery is unchanged — replace the node (its replacement gets the new
+CA and drops out of the participant set) or step the cluster by hand with
+`MAGNUM_CA_ROTATION_PHASE`.
+
+Heat's stack `update_timeout` (a global `cluster_heat.update_timeout`, not
+per-cluster) bounds everything; `RECONCILER_RUN_TIMEOUT_SECONDS` is held a margin
+below it. On very large master counts (serial restarts dominate wall-clock),
+raise both together — they are the one knob that scales the protocol to cluster
+size.

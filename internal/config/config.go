@@ -76,7 +76,7 @@ type SharedConfig struct {
 	NoProxy                   string `json:"noProxy"`
 
 	// Container runtime
-	CgroupDriver string `json:"cgroupDriver"`
+	CgroupDriver         string `json:"cgroupDriver"`
 	UsePodman            bool   `json:"usePodman"`
 	ContainerInfraPrefix string `json:"containerInfraPrefix"`
 
@@ -169,8 +169,8 @@ type MasterConfig struct {
 	NumberOfMasters       int    `json:"numberOfMasters"`
 	KubeAPIPublicAddress  string `json:"kubeApiPublicAddress"`
 	KubeAPIPrivateAddress string `json:"kubeApiPrivateAddress"`
-	EtcdDiscoveryURL string `json:"etcdDiscoveryUrl"`
-	MasterHostname   string `json:"masterHostname"`
+	EtcdDiscoveryURL      string `json:"etcdDiscoveryUrl"`
+	MasterHostname        string `json:"masterHostname"`
 	EtcdLBVIP             string `json:"etcdLbVip"`
 	EtcdVolume            string `json:"etcdVolume"`
 	EtcdVolumeSize        int    `json:"etcdVolumeSize"`

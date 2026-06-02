@@ -14,6 +14,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The forked driver supplies the real write-heat-params*.sh that the
+      # heat-params contract guard (e2e/scenario) checks the renderer against.
+      # Best-effort: on fork PRs the PAT is absent and the checkout is skipped,
+      # so the guard self-skips rather than failing (same-repo PRs enforce it).
+      - name: Checkout forked driver (for the heat-params contract guard)
+        id: driver
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
+          ref: ${{ vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          path: magnum
+          token: ${{ secrets.RW_PAT_TOKEN }}
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -25,10 +39,38 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
       - name: Test
-        run: go test -short ./...
+        run: |
+          # Enforce the heat-params contract guard when the driver checkout
+          # succeeded; otherwise the guard self-skips (see contract_test.go).
+          driver="$GITHUB_WORKSPACE/magnum"
+          if [ -d "$driver/magnum/drivers/common/templates/kubernetes/bootstrap" ]; then
+            export MAGNUM_VICTORIA_DIR="$driver"
+            echo "heat-params contract guard ENFORCED against $driver"
+          else
+            echo "::warning::driver checkout unavailable — heat-params contract guard will skip"
+          fi
+          go test -short ./...
 
       - name: Build release binaries
         run: |
           make build VERSION=ci REPOSITORY=${{ github.repository }}
           ls -lh dist/
+
+  lint-shell:
+    name: Shellcheck e2e scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Shellcheck
+        # -S error only: fail on real bugs, not pre-existing style warnings, so
+        # the gate is green on introduction. Tighten to -S warning later.
+        run: shellcheck -S error $(git ls-files 'e2e/**/*.sh')

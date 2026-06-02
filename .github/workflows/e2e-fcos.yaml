@@ -48,9 +48,12 @@ on:
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
   pull_request:
-    # Opt-in per PR: add the 'e2e' label. Heavy (boots a real VM) and runs on a
-    # self-hosted KVM runner, so it must not run on every push or on forks.
-    types: [labeled, synchronize, reopened]
+    # Runs on EVERY PR to main/master (open + each push) so changes are verified
+    # before merge. Heavy (boots a real FCoS VM on the self-hosted KVM runner);
+    # the concurrency group below cancels superseded runs so pushes don't pile
+    # up, and a single runner agent executes the matrix serially. Fork PRs lack
+    # the self-hosted runner + secrets and are not the intended path.
+    types: [opened, synchronize, reopened]
     branches: [main, master]
 
 permissions:
@@ -63,11 +66,7 @@ concurrency:
 
 jobs:
   resolve:
-    # On PRs, only run when the 'e2e' label is present (also gates the e2e job
-    # below via needs:). Always runs for dispatch / schedule.
-    if: >-
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'e2e')
+    # Runs for every PR (open/push), plus dispatch and schedule.
     runs-on: self-hosted
     outputs:
       latest: ${{ steps.k.outputs.latest }}

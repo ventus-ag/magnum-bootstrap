@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,10 +37,36 @@ type runFlags struct {
 	timeout        time.Duration
 }
 
-// defaultRunTimeout caps a single reconcile invocation. Picked to be longer
-// than any legitimate node-level run (slow Helm rollouts, drain, etc.) while
-// still bounding hangs caused by an unresponsive Kubernetes API.
+// defaultRunTimeout caps a single reconcile invocation when nothing else is
+// configured. Picked to be longer than any legitimate node-level run (slow Helm
+// rollouts, drain, etc.) while still bounding hangs caused by an unresponsive
+// Kubernetes API.
 const defaultRunTimeout = time.Hour
+
+// runTimeoutEnv lets Heat drive the reconcile timeout. The launcher exports it
+// from the RECONCILER_RUN_TIMEOUT_SECONDS heat-param. It MUST be set a safe
+// margin below Heat's stack update_timeout so the reconciler self-cancels,
+// reports a clean failure, and releases its flock BEFORE Heat gives up. If the
+// reconciler instead runs to Heat's deadline, Heat marks the deployment failed
+// while the process keeps running (oneshot units have no start timeout by
+// default) — squatting the lock so every subsequent Heat-triggered run blocks
+// on it and times out too. A Heat-aligned deadline is what keeps a single
+// timeout from becoming a permanently-wedged cluster.
+const runTimeoutEnv = "MAGNUM_RECONCILE_RUN_TIMEOUT_SECONDS"
+
+// resolveDefaultRunTimeout reads runTimeoutEnv (seconds) and falls back to
+// defaultRunTimeout. A value of 0 disables the timeout (matches --timeout=0).
+func resolveDefaultRunTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv(runTimeoutEnv))
+	if v == "" {
+		return defaultRunTimeout
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return defaultRunTimeout
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // Main is the top-level entry point. It builds the Cobra command tree, attaches
 // stdout/stderr, and returns the process exit code.
@@ -91,7 +118,7 @@ func addRunFlags(cmd *cobra.Command, f *runFlags, refreshDefault bool) {
 	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
 	cmd.Flags().StringVar(&f.backendURL, "backend-url", "", "override Pulumi backend URL (default: $MAGNUM_PULUMI_BACKEND_URL or file:///var/lib/magnum/pulumi)")
 	cmd.Flags().StringVar(&f.heatParamsFile, "heat-params-file", "", "override heat-params file path (default: $MAGNUM_RECONCILE_HEAT_PARAMS_FILE or /etc/sysconfig/heat-params)")
-	cmd.Flags().DurationVar(&f.timeout, "timeout", defaultRunTimeout, "overall timeout for the reconcile invocation (0 disables)")
+	cmd.Flags().DurationVar(&f.timeout, "timeout", resolveDefaultRunTimeout(), "overall timeout for the reconcile invocation (0 disables; default from "+runTimeoutEnv+" or 1h)")
 }
 
 func newPreviewCmd(ctx context.Context, code *int, stdout, stderr io.Writer) *cobra.Command {

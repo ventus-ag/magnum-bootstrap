@@ -55,7 +55,7 @@ func Load(path string) (Config, error) {
 			HTTPSProxy:                raw["HTTPS_PROXY"],
 			NoProxy:                   raw["NO_PROXY"],
 
-			CgroupDriver: raw["CGROUP_DRIVER"],
+			CgroupDriver:         raw["CGROUP_DRIVER"],
 			UsePodman:            parseBool(raw["USE_PODMAN"]),
 			ContainerInfraPrefix: raw["CONTAINER_INFRA_PREFIX"],
 
@@ -109,14 +109,14 @@ func Load(path string) (Config, error) {
 
 			AutoScalingEnabled: parseBool(raw["AUTO_SCALING_ENABLED"]),
 			MinNodeCount:       parseInt(raw["MIN_NODE_COUNT"]),
-			MaxNodeCount:         parseInt(raw["MAX_NODE_COUNT"]),
+			MaxNodeCount:       parseInt(raw["MAX_NODE_COUNT"]),
 
 			VolumeDriver:     raw["VOLUME_DRIVER"],
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
 			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
 
-			GPUOperatorEnabled:     parseBool(raw["GPU_OPERATOR_ENABLED"]),
-			OSAutoUpgradeEnabled:   parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
+			GPUOperatorEnabled:   parseBool(raw["GPU_OPERATOR_ENABLED"]),
+			OSAutoUpgradeEnabled: parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
 
 			PostInstallManifestURL: raw["POST_INSTALL_MANIFEST_URL"],
 			MasterIndex:            parseInt(raw["MASTER_INDEX"]),
@@ -133,8 +133,8 @@ func Load(path string) (Config, error) {
 			NumberOfMasters:       parseInt(raw["NUMBER_OF_MASTERS"]),
 			KubeAPIPublicAddress:  raw["KUBE_API_PUBLIC_ADDRESS"],
 			KubeAPIPrivateAddress: raw["KUBE_API_PRIVATE_ADDRESS"],
-			EtcdDiscoveryURL: raw["ETCD_DISCOVERY_URL"],
-			MasterHostname:   raw["MASTER_HOSTNAME"],
+			EtcdDiscoveryURL:      raw["ETCD_DISCOVERY_URL"],
+			MasterHostname:        raw["MASTER_HOSTNAME"],
 			EtcdLBVIP:             raw["ETCD_LB_VIP"],
 			EtcdVolume:            raw["ETCD_VOLUME"],
 			EtcdVolumeSize:        parseInt(raw["ETCD_VOLUME_SIZE"]),

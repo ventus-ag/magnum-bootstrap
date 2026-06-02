@@ -80,6 +80,15 @@ type Config struct {
 	ReconcilerBinaryURL       string
 	ReconcilerBinaryURLSHA256 string
 
+	// NumberOfMasters is written as NUMBER_OF_MASTERS (default 1). Multi-master
+	// scenarios set this so the reconciler serializes control-plane restarts.
+	NumberOfMasters int
+
+	// RunTimeoutSeconds -> RECONCILER_RUN_TIMEOUT_SECONDS (default 4800). The
+	// launcher sources heat-params, so this is the Heat-driven reconcile budget
+	// the binary self-cancels within; e2e must carry it to exercise that path.
+	RunTimeoutSeconds int
+
 	// Optional overrides (sensible defaults applied when empty).
 	Arch               string // default amd64
 	FlannelNetworkCIDR string // default 10.100.0.0/16
@@ -126,6 +135,12 @@ func (c Config) withDefaults() Config {
 	}
 	if d.KubeAPIPort == 0 {
 		d.KubeAPIPort = 6443
+	}
+	if d.NumberOfMasters == 0 {
+		d.NumberOfMasters = 1
+	}
+	if d.RunTimeoutSeconds == 0 {
+		d.RunTimeoutSeconds = 4800
 	}
 	if d.APIIP == "" {
 		d.APIIP = d.NodeIP
@@ -259,7 +274,10 @@ func (c Config) pairs() []KV {
 
 	switch c.Role {
 	case RoleMaster:
-		put("NUMBER_OF_MASTERS", "1")
+		put("NUMBER_OF_MASTERS", fmt.Sprint(c.NumberOfMasters))
+		// MASTER_INDEX: the binary reads it (config.heatparams), but note the real
+		// driver does NOT currently write it (a magnum_victoria gap tracked in the
+		// contract guard's scenarioExtras). We emit the correct value here.
 		put("MASTER_INDEX", fmt.Sprint(c.NodeIndex))
 		put("KUBE_API_PRIVATE_ADDRESS", c.APIIP)
 		put("KUBE_API_PUBLIC_ADDRESS", c.APIIP)
@@ -268,12 +286,28 @@ func (c Config) pairs() []KV {
 		put("ETCD_VOLUME", "")
 		put("ETCD_VOLUME_SIZE", "0")
 		put("LEAD_NODE_ROLE_NAME", leadNodeRole(c.KubeTag))
+		// Master-only fields the real write-heat-params-master.sh emits. Cloud /
+		// autoscaler / image fields are empty on the self-contained tier (no real
+		// OpenStack); SELINUX_MODE/TIMESTAMP_UPGRADE are node metadata.
+		put("SELINUX_MODE", "")
+		put("TIMESTAMP_UPGRADE", "")
+		put("CLUSTER_NETWORK_NAME", "")
+		put("CLUSTER_SUBNET", "")
+		put("EXTERNAL_NETWORK_ID", "")
+		put("KUBE_IMAGE_DIGEST", "")
+		put("MIN_NODE_COUNT", "")
+		put("MAX_NODE_COUNT", "")
 	case RoleWorker:
 		put("KUBE_MASTER_IP", c.MasterIP)
 		put("ETCD_SERVER_IP", c.MasterIP)
 		put("REGISTRY_ENABLED", "false")
 		put("REGISTRY_PORT", "5000")
 		put("REGISTRY_INSECURE", "true")
+		// Worker-only registry/swift fields the real write-heat-params.sh emits
+		// (empty/unused while the in-cluster registry is disabled).
+		put("SWIFT_REGION", "")
+		put("REGISTRY_CONTAINER", "")
+		put("REGISTRY_CHUNKSIZE", "")
 	}
 
 	// Reconciler binary delivery (consumed by the launcher, not the binary).
@@ -281,6 +315,7 @@ func (c Config) pairs() []KV {
 	put("RECONCILER_BINARY_URL", c.ReconcilerBinaryURL)
 	put("RECONCILER_BINARY_URL_SHA256", c.ReconcilerBinaryURLSHA256)
 	put("RECONCILER_LOCK_TIMEOUT_SECONDS", "900")
+	put("RECONCILER_RUN_TIMEOUT_SECONDS", fmt.Sprint(c.RunTimeoutSeconds))
 
 	return kvs
 }

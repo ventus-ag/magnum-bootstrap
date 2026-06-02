@@ -201,11 +201,37 @@ cmd_assert_noop() {
   log "scenario '${name}': idempotency re-run"
   install -m 600 "$hp" /etc/sysconfig/heat-params
   run_reconcile || { err "idempotency re-run failed"; return 1; }
-  # A converged node should report success with no host changes. We surface the
-  # summary; strict 'zero changes' parsing is left to the reconciler result.
   local summary; summary="$(grep -o '"summary":"[^"]*"' "$RESULT_FILE" | head -1 | cut -d'"' -f4 || true)"
   log "scenario '${name}': re-run summary = ${summary:-<none>}"
   [ "$(result_status)" = "success" ] || { err "idempotency re-run not success"; return 1; }
+  # Strict idempotency: a converged node must report ZERO host changes. The
+  # result's "changed" array is omitempty, so its presence means real changes
+  # happened on a re-apply of identical input — a drift/idempotency bug.
+  if grep -q '"changed":\[' "$RESULT_FILE" 2>/dev/null; then
+    err "scenario '${name}': idempotency re-run reported host changes (expected none):"
+    grep -o '"changed":\[[^]]*\]' "$RESULT_FILE" >&2 || true
+    return 1
+  fi
+  log "scenario '${name}': zero host changes ✅"
+}
+
+# cmd_cert_hashes — print content fingerprints of the live CA + API server leaf
+# so the host harness can assert a CA rotation actually replaced them. Uses
+# sha256sum (always present) rather than openssl so it has no extra dependency.
+cmd_cert_hashes() {
+  local cdir=/etc/kubernetes/certs ca server
+  ca="$(sha256sum "$cdir/ca.crt" 2>/dev/null | awk '{print $1}')"
+  server="$(sha256sum "$cdir/server.crt" 2>/dev/null | awk '{print $1}')"
+  echo "ca=${ca:-none} server=${server:-none}"
+}
+
+# cmd_kubelet_version [node] — print a node's reported kubelet version (defaults
+# to the first node) so the host can assert an upgrade actually took effect.
+cmd_kubelet_version() {
+  local node="${1:-}"
+  [ -n "$node" ] || node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "$node" ] || { echo none; return; }
+  kc get node "$node" -o jsonpath='{.status.nodeInfo.kubeletVersion}' 2>/dev/null || echo none
 }
 
 # --- "agent" trigger: real heat-container-agent + local mock Heat -----------
@@ -322,6 +348,8 @@ main() {
     assert-ready)     cmd_assert_ready ;;
     assert-node-ready) cmd_assert_node_ready "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
+    cert-hashes)      cmd_cert_hashes ;;
+    kubelet-version)  cmd_kubelet_version "$@" ;;
     agent-setup)      cmd_agent_setup "$@" ;;
     heat-deploy)      cmd_heat_deploy "$@" ;;
     *) err "unknown subcommand: ${sub}"; exit 2 ;;

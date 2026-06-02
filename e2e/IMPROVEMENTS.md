@@ -8,15 +8,16 @@ high-signal assertions). Effort: S/M/L.
 | Item | Why | Effort | Status |
 |------|-----|--------|--------|
 | **Multi-node (1 master + N workers)** with per-role VM sizing (`MASTER_MEM_MB/CPUS`, `WORKER_MEM_MB/CPUS`) | Unlocks what single-node can't: **worker join, real resize, drain/uncordon during upgrade, etcd**. Fits an 8/32 host (master 4 GB + workers 2 GB). | M | in progress (first cut; needs on-runner validation) |
-| **Assert outcomes, not just success** | After upgrade assert `node.status.kubeletVersion` actually changed; after ca-rotate assert the API cert **serial/notBefore changed**; idempotency = parse result JSON for **zero changes**, not just status. | S | todo |
-| **CI lint gate** | `shellcheck` on `e2e/**/*.sh`, `gofmt -l`/`go vet` for e2e in `ci.yaml`; make the fast e2e unit tests a **required** PR check. | S | todo |
+| **Assert outcomes, not just success** | After upgrade assert `node.status.kubeletVersion` actually changed; after ca-rotate assert the API cert **serial/notBefore changed**; idempotency = parse result JSON for **zero changes**, not just status. | S | **done** — ca-rotate asserts leaf-cert content change, upgrade asserts kubelet version change, idempotency asserts no `changed[]` in result JSON |
+| **CI lint gate** | `shellcheck` on `e2e/**/*.sh`, `gofmt -l`/`go vet` for e2e in `ci.yaml`; make the fast e2e unit tests a **required** PR check. | S | **done** — `ci.yaml` adds gofmt + `shellcheck` job; FCoS tier now runs on every PR |
+| **heat-params contract guard** | Parse the real `write-heat-params*.sh` and assert the renderer emits every key, so it can't silently drift. | S | **done** — `e2e/scenario/contract_test.go` (enforced in CI via the driver checkout) |
 
 ## P1 — fidelity + reliability
 
 | Item | Why | Effort |
 |------|-----|--------|
 | **Drift / periodic self-heal** | Tamper a file / stop a service → `run-periodic` → assert convergence. Exercises the timer path + RestartTracker. | S |
-| **heat-params contract guard** | Test that `scenario-gen` keys match the driver's `write-heat-params*.sh` keys so our renderer can't silently drift; optionally one full-fidelity run using the driver's own scripts. | S |
+| ~~heat-params contract guard~~ | **Done** (moved to P0). Renderer-vs-driver key check lives in `contract_test.go`; the full-fidelity run is the existing `TRIGGER=agent` path. | — |
 | **Real workload smoke** | nginx + ClusterIP Service + DNS lookup on the FCoS tier; `sonobuoy --mode quick` on the OpenStack tier. | M |
 | **Boot from the real Magnum Ignition** (`fcct-config.yaml`) | Node base (SELinux, sysctls, flannel link) matches production. | M |
 | **Local image/chart cache or pull-through mirror** | Cuts bring-up time, removes upstream (googleapis/ghcr/helm) flakiness. | M |

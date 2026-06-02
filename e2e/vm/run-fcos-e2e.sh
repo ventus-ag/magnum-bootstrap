@@ -94,6 +94,7 @@ FIRSTBOOT_KARGS="${FIRSTBOOT_KARGS:-idle=poll nox2apic no-kvmclock tsc=reliable 
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
+ROT_SEQ=0   # monotonic counter so repeated ca-rotate scenarios get unique ids
 
 # Trigger mode — how the reconciler is invoked on each node:
 #   direct (default) - place heat-params + run the systemd unit directly (fast).
@@ -542,16 +543,42 @@ scenario_create() {
 }
 _create_worker() { apply_worker "$1" create "$KUBE_TAG"; assert_worker_joined "$1"; }
 
+# scenario_ca_rotate — drive one CA rotation and assert it did real work, not
+# just exit 0: the API server leaf cert content must change (the reconciler
+# re-keys + re-signs every leaf). Repeatable: each call gets a unique rotation
+# id, so SCENARIOS="create ca-rotate ca-rotate ca-rotate upgrade ca-rotate"
+# reproduces the repeated-operation sequence that exposed the wedge bug.
+# NOTE: the mock serves a single CA, so ca.crt content may be unchanged across a
+# rotation (the new CA == old CA); the leaf re-key is the definitive signal. A
+# true CA-material change is the real-OpenStack tier's job (IMPROVEMENTS.md P2).
 scenario_ca_rotate() {
-  log "=== SCENARIO: ca-rotate ==="
-  apply_master ca-rotate "$KUBE_TAG" "rot-$(date +%s)"
-  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  ROT_SEQ=$((ROT_SEQ + 1))
+  local rot="rot-$(date +%s)-${ROT_SEQ}" mp before after sb sa
+  mp="$(ssh_port master)"
+  log "=== SCENARIO: ca-rotate (id=$rot) ==="
+  before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
+  apply_master ca-rotate "$KUBE_TAG" "$rot"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
+  sb="${before##*server=}"; sa="${after##*server=}"
+  log "ca-rotate cert fingerprints: before[$before] after[$after]"
+  { [ "$sb" != "$sa" ] && [ "$sa" != none ]; } \
+    || die "ca-rotate did not replace the API server leaf cert (server hash unchanged: ${sa:-none})"
+  log "ca-rotate replaced the API server leaf cert ✅"
 }
 
 scenario_upgrade() {
   log "=== SCENARIO: upgrade -> $KUBE_TAG_UPGRADE ==="
+  local mp before after; mp="$(ssh_port master)"
+  before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh kubelet-version")"
   apply_master upgrade "$KUBE_TAG_UPGRADE"
-  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh kubelet-version e2e-master-0")"
+  log "upgrade kubelet version: before[$before] after[$after] (want ~$KUBE_TAG_UPGRADE)"
+  case "$after" in
+    *"${KUBE_TAG_UPGRADE#v}"*) log "kubelet upgraded to $after ✅" ;;
+    *) die "upgrade did not take effect (kubelet before=$before after=$after, want $KUBE_TAG_UPGRADE)" ;;
+  esac
   for_each_worker _upgrade_worker
 }
 _upgrade_worker() { apply_worker "$1" upgrade "$KUBE_TAG_UPGRADE"; assert_worker_joined "$1"; }

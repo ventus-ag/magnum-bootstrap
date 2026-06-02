@@ -3,6 +3,7 @@ package carotation
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,17 @@ const (
 
 	keyRotationID   = "rotationId"
 	keyDesiredPhase = "desiredPhase"
+	// keyParticipants holds the space-separated names of the nodes that exist
+	// when a rotation begins. Only these nodes must report at each barrier:
+	// nodes created later are minted by Magnum with the NEW CA and run `create`
+	// (the rotation module is a no-op for them), so they never annotate and must
+	// not block the barrier.
+	keyParticipants = "participants"
+
+	// barrierReserve is held back from the run deadline so that, after a barrier
+	// or lock wait gives up, the node still has time to write its result and exit
+	// cleanly before Heat (and the systemd backstop) kill it.
+	barrierReserve = 90 * time.Second
 )
 
 // Coordinator wraps a Kubernetes client used to coordinate the rotation. The
@@ -86,7 +98,10 @@ func (c *Coordinator) ReportStatus(ctx context.Context, nodeName string, phase P
 }
 
 // EnsureRotation makes sure the desired-phase ConfigMap exists and is scoped to
-// rotationID, starting at prepare. Masters call this before the first barrier.
+// rotationID, starting at prepare. It also snapshots the current set of cluster
+// nodes as the rotation's participant list, so the barriers wait only on nodes
+// that actually carry the old CA (see keyParticipants). Masters call this before
+// the first barrier.
 func (c *Coordinator) EnsureRotation(ctx context.Context, rotationID string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cms := c.clientset.CoreV1().ConfigMaps(CoordNamespace)
@@ -94,7 +109,7 @@ func (c *Coordinator) EnsureRotation(ctx context.Context, rotationID string) err
 		if apierrors.IsNotFound(err) {
 			_, err = cms.Create(ctx, &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: CoordNamespace},
-				Data:       map[string]string{keyRotationID: rotationID, keyDesiredPhase: string(PhasePrepare)},
+				Data:       c.freshRotationData(ctx, rotationID),
 			}, metav1.CreateOptions{})
 			return err
 		}
@@ -102,13 +117,56 @@ func (c *Coordinator) EnsureRotation(ctx context.Context, rotationID string) err
 			return err
 		}
 		if cm.Data[keyRotationID] == rotationID {
-			return nil // already scoped to this rotation
+			return nil // already scoped to this rotation (participants already set)
 		}
 		// Stale ConfigMap from an earlier rotation — reset to this rotation.
-		cm.Data = map[string]string{keyRotationID: rotationID, keyDesiredPhase: string(PhasePrepare)}
+		cm.Data = c.freshRotationData(ctx, rotationID)
 		_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
 		return err
 	})
+}
+
+// freshRotationData builds the ConfigMap payload for a brand-new rotation:
+// rotation id, the starting phase, and a snapshot of current node names as the
+// participant set. A failure to list nodes yields an empty participant list,
+// which makes the barrier fall back to "all current nodes" — safe, just less
+// precise.
+func (c *Coordinator) freshRotationData(ctx context.Context, rotationID string) map[string]string {
+	return map[string]string{
+		keyRotationID:   rotationID,
+		keyDesiredPhase: string(PhasePrepare),
+		keyParticipants: strings.Join(c.currentNodeNames(ctx), " "),
+	}
+}
+
+// currentNodeNames lists the names of all nodes not currently terminating. The
+// result is sorted for a stable, diff-friendly ConfigMap value.
+func (c *Coordinator) currentNodeNames(ctx context.Context) []string {
+	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if n.DeletionTimestamp != nil {
+			continue
+		}
+		names = append(names, n.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// readParticipants returns the snapshotted participant node names for
+// rotationID, or nil when none are recorded (missing/stale ConfigMap, or an
+// older rotation that predates participant tracking).
+func (c *Coordinator) readParticipants(ctx context.Context, rotationID string) []string {
+	cm, err := c.clientset.CoreV1().ConfigMaps(CoordNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err != nil || cm.Data[keyRotationID] != rotationID {
+		return nil
+	}
+	return strings.Fields(cm.Data[keyParticipants])
 }
 
 // EnsureNodeReadRBAC grants the system:nodes group read access to the single
@@ -194,8 +252,7 @@ func (c *Coordinator) AdvanceDesiredPhase(ctx context.Context, rotationID string
 			cm.Data = map[string]string{}
 		}
 		if cm.Data[keyRotationID] != rotationID {
-			cm.Data[keyRotationID] = rotationID
-			cm.Data[keyDesiredPhase] = string(PhasePrepare)
+			cm.Data = c.freshRotationData(ctx, rotationID)
 		}
 		if Phase(cm.Data[keyDesiredPhase]).AtLeast(to) {
 			return nil
@@ -206,26 +263,77 @@ func (c *Coordinator) AdvanceDesiredPhase(ctx context.Context, rotationID string
 	})
 }
 
-// AllNodesReached reports whether every node currently in the cluster has
-// reported reaching at least `phase` for rotationID. It returns the list of
-// nodes still pending so callers can log progress.
+// AllNodesReached reports whether every participating node has reported reaching
+// at least `phase` for rotationID. Participants are the nodes snapshotted when
+// the rotation began (see keyParticipants); when no snapshot is recorded it
+// falls back to "all nodes currently in the cluster". Nodes that are terminating
+// or that have since left the cluster never block the barrier. The returned
+// pending list annotates each waited-on node with its readiness so a slow node
+// is visibly distinguished from a dead one.
 func (c *Coordinator) AllNodesReached(ctx context.Context, rotationID string, phase Phase) (bool, []string, error) {
 	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false, nil, err
 	}
-	var pending []string
+	byName := make(map[string]*corev1.Node, len(nodes.Items))
+	var allCurrent []string
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
-		if n.DeletionTimestamp != nil {
-			continue // node is terminating; don't block the barrier on it
+		byName[n.Name] = n
+		if n.DeletionTimestamp == nil {
+			allCurrent = append(allCurrent, n.Name)
+		}
+	}
+
+	participants := c.readParticipants(ctx, rotationID)
+	if len(participants) == 0 {
+		participants = allCurrent
+	}
+
+	var pending []string
+	for _, name := range participants {
+		n, ok := byName[name]
+		if !ok || n.DeletionTimestamp != nil {
+			continue // participant has left the cluster (deleted/replaced) — its
+			// replacement is minted with the new CA, so it cannot block.
 		}
 		reached, _ := parseNodeStatus(n.Annotations[NodeAnnotation], rotationID)
 		if !reached.AtLeast(phase) {
-			pending = append(pending, n.Name)
+			pending = append(pending, formatPending(name, n))
 		}
 	}
 	return len(pending) == 0, pending, nil
+}
+
+// formatPending renders a pending node for logging, appending a readiness hint
+// (e.g. "node-2(NotReady 4m12s)") when the node is not Ready so operators can
+// tell a slow node from a dead one.
+func formatPending(name string, n *corev1.Node) string {
+	if hint := notReadyHint(n); hint != "" {
+		return name + "(" + hint + ")"
+	}
+	return name
+}
+
+// notReadyHint returns a short description when the node's Ready condition is
+// not True, including how long it has been in that state; it returns "" for a
+// Ready node or one with no reported conditions.
+func notReadyHint(n *corev1.Node) string {
+	for i := range n.Status.Conditions {
+		cond := n.Status.Conditions[i]
+		if cond.Type != corev1.NodeReady {
+			continue
+		}
+		if cond.Status == corev1.ConditionTrue {
+			return ""
+		}
+		hint := "NotReady"
+		if !cond.LastTransitionTime.IsZero() {
+			hint += " " + time.Since(cond.LastTransitionTime.Time).Round(time.Second).String()
+		}
+		return hint
+	}
+	return ""
 }
 
 // parseNodeStatus splits a "<phase>@<rotationId>" annotation. It returns an
@@ -239,6 +347,22 @@ func parseNodeStatus(value, rotationID string) (Phase, bool) {
 		return "", false
 	}
 	return Phase(value[:at]), true
+}
+
+// runDeadline returns the time at which a wait (barrier or restart lock) should
+// give up. When the context carries a deadline — the Heat-driven run timeout —
+// that single budget governs: the wait runs until barrierReserve before the run
+// deadline, leaving just enough time to report failure and exit cleanly before
+// Heat (and the systemd backstop) intervene. This deliberately ignores the
+// fixed fallback timeout when a run deadline exists, so a legitimately slow but
+// still-converging cluster (e.g. many masters restarting serially) is not cut
+// off by an arbitrary cap well inside the Heat window. The fixed fallback is
+// used only when the context has no deadline (manual runs, tests).
+func runDeadline(ctx context.Context, fallback time.Duration) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		return dl.Add(-barrierReserve)
+	}
+	return time.Now().Add(fallback)
 }
 
 // BarrierOptions tunes a barrier wait.
@@ -272,7 +396,7 @@ func (c *Coordinator) Barrier(ctx context.Context, rotationID string, completed 
 		return nil
 	}
 	opts = opts.withDefaults()
-	deadline := time.Now().Add(opts.Timeout)
+	deadline := runDeadline(ctx, opts.Timeout)
 	for {
 		desired, err := c.ReadDesiredPhase(ctx, rotationID)
 		if err == nil && desired.AtLeast(next) {
@@ -341,7 +465,7 @@ func (o LockOptions) withDefaults() LockOptions {
 // DurationSeconds so a crashed holder cannot wedge the cluster.
 func (c *Coordinator) AcquireRestartLock(ctx context.Context, holder string, opts LockOptions) (func(), error) {
 	opts = opts.withDefaults()
-	deadline := time.Now().Add(opts.Timeout)
+	deadline := runDeadline(ctx, opts.Timeout)
 	for {
 		acquired, err := c.tryAcquireLease(ctx, holder, opts.DurationSeconds)
 		if err == nil && acquired {

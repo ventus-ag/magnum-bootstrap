@@ -382,6 +382,10 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		clusterhelm.PromoteManagedReleases()
 		clusterhelm.ClearAllForceUpdateMarkers()
 		pulumiSummaryText = formatUpdateSummaryLine(upRes.Summary.ResourceChanges)
+		// Bound the local backend's ever-growing update-history directory so
+		// each successive operation does not pay a rising checkpoint/history
+		// cost (best-effort; never fails the reconcile).
+		pruneStackHistory(runtimePaths.PulumiStateDir, req.Logger)
 
 	default:
 		return result.Result{}, state.State{}, fmt.Errorf("unknown reconcile mode: %s", mode)

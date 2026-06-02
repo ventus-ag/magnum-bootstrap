@@ -2,8 +2,10 @@ package carotation
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -250,10 +252,16 @@ func (r *runner) runPhase(ctx context.Context, phase coord.Phase, c *coord.Coord
 		}
 	}
 
-	// Restart services to load the new material, serialized cluster-wide for
-	// multi-master control planes so quorum and API availability are preserved.
+	// Restart services to load the new material, serialized cluster-wide via the
+	// restart Lease so quorum and API availability are preserved. The Lease is
+	// taken for ANY master count, not just >1: trusting NUMBER_OF_MASTERS to
+	// decide whether to serialize is fragile (a stale/zero/incorrect value on a
+	// real multi-master cluster would let every apiserver restart at once and
+	// break quorum). On a genuine single-master cluster the Lease is
+	// uncontended — acquire and release are effectively instant — so it is a
+	// no-op cost there while making 2/3/4+ master clusters safe by construction.
 	restart := func() error { return r.restartAndWait() }
-	if c != nil && r.isMaster && r.masterCount() > 1 {
+	if c != nil && r.isMaster {
 		release, err := c.AcquireRestartLock(ctx, r.nodeName, coord.LockOptions{
 			Logf: func(f string, a ...any) { logf(r.req, f, a...) },
 		})
@@ -298,13 +306,6 @@ func (r *runner) reportWithRetry(ctx context.Context, c *coord.Coordinator, phas
 		}
 	}
 	return fmt.Errorf("ca-rotation: report %s status: %w", phase, err)
-}
-
-func (r *runner) masterCount() int {
-	if r.cfg.Master != nil && r.cfg.Master.NumberOfMasters > 0 {
-		return r.cfg.Master.NumberOfMasters
-	}
-	return 1
 }
 
 func (r *runner) stateFor(phase coord.Phase) coord.State {
@@ -835,7 +836,16 @@ users:
 func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, []string) {
 	var changes []host.Change
 	var warnings []string
-	annotation := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"magnum.openstack.org/ca-rotation":"%s"}}}}}`, rotationID)
+	// Key the rollout annotation on the new CA's content fingerprint, NOT the
+	// rotation id. The roll exists so pods re-read the new trust anchor; if a
+	// rotation re-runs (resume, periodic, or a repeat that mints the same CA)
+	// the fingerprint is unchanged, the `kubectl patch` is a true no-op, and no
+	// rollout is triggered. Only a genuine CA change rolls workloads, exactly
+	// once. This stops every CA-rotate operation from churning the whole
+	// cluster, which is what dragged control-plane health waits toward their
+	// ceilings across repeated operations.
+	stamp := caRolloutStamp(rotationID)
+	annotation := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"magnum.openstack.org/ca-rotation":"%s"}}}}}`, stamp)
 
 	for _, kind := range []string{"deployment", "daemonset"} {
 		var out string
@@ -872,6 +882,21 @@ func patchWorkloads(executor *host.Executor, rotationID string) ([]host.Change, 
 		changes = append(changes, host.Change{Action: host.ActionUpdate, Summary: fmt.Sprintf("patch %ss with ca-rotation annotation", kind)})
 	}
 	return changes, warnings
+}
+
+// caRolloutStamp returns a stable identifier for the trust anchor installed by
+// this rotation: the SHA-256 fingerprint of the new CA certificate. Workloads
+// are re-rolled only when this value changes, so re-running the same rotation
+// (or one that produced an identical CA) does not churn the cluster. If the new
+// CA cannot be read it falls back to the rotation id, preserving the previous
+// always-roll behaviour rather than silently skipping a needed rollout.
+func caRolloutStamp(rotationID string) string {
+	data, err := os.ReadFile(filepath.Join(coord.NewDir(rotationID), "ca.crt"))
+	if err != nil || len(data) == 0 {
+		return rotationID
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:16])
 }
 
 // --- small helpers ---------------------------------------------------------

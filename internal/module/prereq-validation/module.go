@@ -65,7 +65,7 @@ func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (mo
 	if !config.IsCgroupV2() {
 		if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 35) {
 			return moduleapi.Result{}, fmt.Errorf(
-				"cgroup v1 detected but Kubernetes >= 1.35 requires cgroup v2; "+
+				"cgroup v1 detected but Kubernetes >= 1.35 requires cgroup v2; " +
 					"kubelet will refuse to start on this node")
 		}
 		if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 33) {
@@ -78,7 +78,7 @@ func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (mo
 	// Docker runtime is not CRI-compliant for K8s >= 1.34.
 	if cfg.Shared.ContainerRuntime == "docker" && kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 34) {
 		return moduleapi.Result{}, fmt.Errorf(
-			"container runtime \"docker\" is not supported for Kubernetes >= 1.34; "+
+			"container runtime \"docker\" is not supported for Kubernetes >= 1.34; " +
 				"use \"containerd\" or another CRI-compliant runtime")
 	}
 

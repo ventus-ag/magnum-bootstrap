@@ -70,6 +70,13 @@ VICTORIA_DIR=/path/to/magnum ./e2e/vm/run-fcos-e2e.sh
 VICTORIA_DIR=/path/to/magnum WORKERS=2 ./e2e/vm/run-fcos-e2e.sh
 ```
 
+`SCENARIOS` is an ordered, repeatable list — `ca-rotate` may appear many times
+(each gets a unique rotation id), so
+`SCENARIOS="create ca-rotate ca-rotate ca-rotate upgrade ca-rotate"` reproduces
+the repeated-operation sequence that exposed the wedge bug. `ca-rotate` asserts
+the API server leaf cert content actually changed; `upgrade` asserts the kubelet
+version changed; `create` asserts idempotency = **zero** host changes on re-run.
+
 Knobs: `KUBE_TAG`, `KUBE_TAG_UPGRADE`, `SCENARIOS="create ca-rotate upgrade"`,
 `WORKERS` (0=single node), per-role sizing `MASTER_MEM_MB`/`MASTER_CPUS` and
 `WORKER_MEM_MB`/`WORKER_CPUS` (`VM_MEM_MB`/`VM_CPUS` still work as fallbacks),
@@ -208,19 +215,23 @@ Both workflows target a `self-hosted` runner, run nightly + on demand,
 and include a **`latest`** matrix entry that resolves the newest stable
 Kubernetes (`dl.k8s.io/release/stable.txt`) to catch upstream/chart drift early.
 
-**On pull requests** the heavy tiers are **opt-in via a label** (they boot real
-VMs / provision real cloud, so they must not run on every push):
+**On pull requests** (to `main`/`master`):
 
-- Add the **`e2e`** label to a PR → `e2e-fcos` runs (re-runs on each push while
-  the label is present; a `concurrency` group cancels superseded runs).
-- Add the **`e2e-openstack`** label → `e2e-openstack` runs (rare — real, paid
-  cloud resources).
+- **`ci.yaml` (fast tier) — every PR, required.** Build, `go vet`, `gofmt`,
+  `go test -short ./...` (covers `e2e/scenario` incl. the **heat-params contract
+  guard**, and `e2e/cmd/mock-magnum`/`mock-heat`), plus `shellcheck` on the e2e
+  scripts. The contract guard checks out the forked driver and asserts the
+  renderer emits every `write-heat-params*.sh` key; on fork PRs (no PAT) it
+  self-skips.
+- **`e2e-fcos` — every PR** (open + each push). Boots a real FCoS VM on the
+  self-hosted KVM runner and walks create → ca-rotate → upgrade with outcome
+  assertions. A `concurrency` group cancels superseded runs; the matrix runs
+  serially on one agent. No label needed.
+- **`e2e-openstack` — opt-in via the `e2e-openstack` label.** Provisions real,
+  **billed** cloud resources (clusters, LBs, volumes), so it stays label-gated.
 
-The **fast** e2e checks need no label: the existing `ci.yaml` runs
-`go test -short ./...` on every PR, which covers `e2e/scenario` (fixtures trigger
-the right op) and `e2e/cmd/mock-magnum` (mock fidelity). Note the self-hosted
-runner means fork PRs won't get secrets and shouldn't auto-run; same-repo
-(trusted) PRs are the intended path.
+The self-hosted runner means fork PRs won't get secrets and shouldn't auto-run;
+same-repo (trusted) PRs are the intended path.
 
 **The workflows self-provision** — a `Provision runner` step runs
 `runner-setup.sh` (idempotent: a no-op once the host is set up) so a fresh runner

@@ -14,6 +14,15 @@ import (
 // tests can redirect it away from /var/lib.
 var baseDir = "/var/lib/magnum/ca-rotation"
 
+// SetBaseDir overrides the staging/state root and returns a function that
+// restores the previous value. Intended for tests that need staging under a
+// temporary directory.
+func SetBaseDir(dir string) func() {
+	prev := baseDir
+	baseDir = dir
+	return func() { baseDir = prev }
+}
+
 // MarkerPath records the last fully finalized rotation ID. It is the
 // authoritative completion signal: written only after finalize succeeds, and
 // read by both the module (to skip a completed rotation) and the reconciler (to
