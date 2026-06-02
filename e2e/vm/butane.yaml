@@ -25,6 +25,19 @@ passwd:
       ssh_authorized_keys:
         - "@@SSH_AUTHORIZED_KEY@@"
 storage:
+  directories:
+    # Pre-create the symlink targets for /usr/local and /opt so the reconciler's
+    # containerd 1.x install (`tar xzf cri-containerd-cni... -C /`) extracts into
+    # existing directories. On Fedora CoreOS /usr/local -> /var/usrlocal and
+    # /opt -> /var/opt are symlinks; the cri bundle carries usr/local/{bin,sbin}/
+    # and opt/containerd/cluster/. A real Magnum node already has these dirs, so
+    # GNU tar just writes files into them. On a bare FCoS image they are absent,
+    # so tar tries to replace the directory symlinks and fails with
+    # "Cannot mkdir: Invalid cross-device link" (EXDEV) across /usr<->/var.
+    # Creating the targets here makes the test node match a production node.
+    - path: /var/usrlocal/bin
+    - path: /var/usrlocal/sbin
+    - path: /var/opt/containerd/cluster
   links:
     # Compat path for the system CA bundle. Real Magnum FCoS nodes have
     # /etc/pki/tls/certs/ca-bundle.crt (the reconciler's kube-os-config copies it
