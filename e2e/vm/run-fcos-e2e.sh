@@ -148,14 +148,36 @@ resolve_qemu_cpu() {
   vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
   QEMU_CPU=host
   if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
-    # Nested AMD-V (esp. Zen1) breaks LAPIC interrupt delivery for the L2 guest:
-    # with >1 vCPU a cross-vCPU TLB-flush IPI in smp_call_function never completes
-    # (soft lockup at ~28s), and with 1 vCPU the timer interrupt that should wake
-    # the halted vCPU is lost (boot freezes mid-initramfs, clock frozen). Forcing
-    # legacy xAPIC (-x2apic) routes interrupts through the emulated path; 1 vCPU
-    # also avoids the IPI case. Override the whole model with QEMU_CPU=...
+    # Nested AMD-V (esp. Zen1) breaks LAPIC interrupt delivery to the L2 guest.
+    # In practice the full workaround set (legacy xAPIC + idle=poll + pci=nomsi +
+    # kernel-irqchip=split + 1 vCPU) STILL freezes the boot right after
+    # basic.target on these hosts: KVM is simply not viable here. So default
+    # nested AMD-V straight to pure-emulation TCG — the path that actually boots —
+    # instead of burning ~minutes per run on guaranteed-doomed KVM attempts before
+    # the stall detector falls back anyway. Opt back into KVM (with the xAPIC
+    # workarounds + TCG fallback) via ALLOW_KVM_ON_NESTED_AMD=1, or move the tier
+    # to a sound-virt runner (Zen2+/Intel or bare-metal/--device /dev/kvm).
+    if [ "${ALLOW_KVM_ON_NESTED_AMD:-0}" != 1 ]; then
+      QEMU_ACCEL=tcg; QEMU_CPU=qemu64; QEMU_IRQCHIP=""
+      SSH_WAIT_TRIES=$(( SSH_WAIT_TRIES > 360 ? SSH_WAIT_TRIES : 360 ))   # TCG boots slowly
+      BOOT_STALL_SECS=$(( BOOT_STALL_SECS > 300 ? BOOT_STALL_SECS : 300 ))
+      # The 1-vCPU cap below is a KVM nested-IPI workaround — irrelevant to TCG.
+      # MTTCG runs each vCPU on its own host thread, so give the emulated guest
+      # more cores (and the master more RAM) to cut the otherwise-painful k8s
+      # bring-up time. Only bumps script-default sizing; explicit values win.
+      local ncpu; ncpu="$(nproc 2>/dev/null || echo 4)"
+      local tcg_cpus=$(( ncpu >= 6 ? 4 : (ncpu >= 4 ? 2 : 1) ))
+      [ "${MASTER_CPUS:-1}" = 1 ] && MASTER_CPUS="$tcg_cpus"
+      [ "${WORKER_CPUS:-1}" = 1 ] && WORKER_CPUS=$(( tcg_cpus >= 2 ? 2 : 1 ))
+      [ "${MASTER_MEM_MB:-2048}" = 2048 ] && MASTER_MEM_MB=4096
+      log "nested AMD-V '$virt': KVM interrupt delivery is unreliable here (boot freezes after basic.target even with xAPIC/idle=poll/irqchip=split) — using pure-emulation TCG (reliable but SLOW). Bumped to MTTCG ${MASTER_CPUS}c/${MASTER_MEM_MB}MB master, ${WORKER_CPUS}c workers (host ${ncpu} cores). Force KVM with ALLOW_KVM_ON_NESTED_AMD=1; better: use a sound-virt runner."
+      return
+    fi
+    # ALLOW_KVM_ON_NESTED_AMD=1: attempt KVM with the legacy-xAPIC workarounds.
+    # The TCG fallback in boot_node still catches a hang if KVM loses interrupts.
+    # 1 vCPU also avoids the >1-vCPU cross-vCPU TLB-flush IPI soft-lockup (~28s).
     QEMU_CPU="host,-x2apic"
-    log "QEMU cpu=auto -> host,-x2apic (nested AMD-V '$virt': legacy xAPIC for reliable interrupt delivery)"
+    log "QEMU cpu=auto -> host,-x2apic (nested AMD-V '$virt': ALLOW_KVM_ON_NESTED_AMD=1, legacy xAPIC; TCG fallback still applies)"
     if [ "${ALLOW_SMP_ON_NESTED_AMD:-0}" != 1 ]; then
       MASTER_CPUS=1; WORKER_CPUS=1
       log "nested AMD-V: capping nodes to 1 vCPU (set ALLOW_SMP_ON_NESTED_AMD=1 to keep the configured count)"
@@ -204,7 +226,11 @@ preflight() {
   resolve_qemu_cpu
   BOOT_RETRIES="${BOOT_RETRIES:-0}"   # default 0 (single attempt) unless nested AMD raised it
   INJECT_KARGS="${INJECT_KARGS:-0}"   # default off unless nested AMD turned it on
-  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s); inject-kargs: $INJECT_KARGS; irqchip: ${QEMU_IRQCHIP:-default}"
+  # In-guest waits (node Ready, core pods, agent deployment) are sized for KVM.
+  # Pure-emulation TCG is multiples slower, so scale the guest-side timeouts to
+  # avoid false-timeouts mid-scenario. Override with WAIT_SCALE.
+  WAIT_SCALE="${WAIT_SCALE:-$([ "$QEMU_ACCEL" = tcg ] && echo 3 || echo 1)}"
+  log "butane renderer: $BUTANE; workers: $WORKERS; boot retries: $BOOT_RETRIES (stall=${BOOT_STALL_SECS}s); inject-kargs: $INJECT_KARGS; irqchip: ${QEMU_IRQCHIP:-default}; accel: ${QEMU_ACCEL}; wait-scale: ${WAIT_SCALE}x"
   if [ "$QEMU_ACCEL" = kvm ]; then
     [ -e /dev/kvm ] || die "/dev/kvm not present — KVM acceleration is required (or set QEMU_ACCEL=tcg)"
   fi
@@ -458,7 +484,7 @@ provision_node() {
   [ "$TRIGGER" = agent ] && files+=("$WORKDIR/mock-heat")
   gscp "$port" "${files[@]}" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
   gssh "$port" "chmod +x $GUEST_E2E_DIR/guest-run.sh"
-  gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 $GUEST_E2E_DIR/guest-run.sh setup"
+  gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 WAIT_SCALE=${WAIT_SCALE:-1} $GUEST_E2E_DIR/guest-run.sh setup"
   if [ "$TRIGGER" = agent ]; then
     # The real bootstrap scripts are delivered inside the deployment metadata,
     # not scp'd; the agent installs the launcher/units itself when it runs them.

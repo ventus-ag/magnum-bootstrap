@@ -87,12 +87,27 @@ validate on the runner.
 ### Nested-virt boot reliability
 
 On a nested KVM host (the runner is itself a VM) — especially **nested AMD-V on
-Zen1** — the L2 guest's LAPIC interrupt delivery and clock are unreliable. `auto`
-already forces legacy xAPIC + 1 vCPU (`-cpu host,-x2apic`) and userspace irqchip
-(`kernel-irqchip=off`), but a boot can still freeze *silently* (no panic) in the
-**dracut initramfs**: the vCPU halts in an idle wait and the timer interrupt that
-should wake it is lost. Three layers address this, all auto-enabled when nested
-AMD-V is detected:
+Zen1** — the L2 guest's LAPIC interrupt delivery and clock are unreliable.
+
+**Default: nested AMD-V uses pure-emulation TCG.** In practice KVM on these hosts
+freezes the boot right after `basic.target` *even with the full workaround set*
+(legacy xAPIC `-cpu host,-x2apic`, `idle=poll`, `pci=nomsi`,
+`kernel-irqchip=split`, 1 vCPU). Rather than burn minutes per run on
+guaranteed-doomed KVM attempts before falling back, `auto` now switches nested
+AMD-V straight to TCG (reliable but slow). Opt back into KVM — with all the xAPIC
+workarounds below plus the TCG fallback — via `ALLOW_KVM_ON_NESTED_AMD=1`. The
+proper fix is a sound-virt runner (Zen2+/Intel or bare-metal/`--device
+/dev/kvm`), where KVM is used normally.
+
+> Note: `kernel-irqchip=off` (full userspace APIC) is **rejected by KVM** on x86
+> ("KVM does not support userspace APIC") — it needs an in-kernel LAPIC — so the
+> workaround uses `split` (userspace IOAPIC, in-kernel LAPIC); any `off`+KVM is
+> auto-coerced to `split`.
+
+When `ALLOW_KVM_ON_NESTED_AMD=1` forces KVM, a boot can still freeze *silently*
+(no panic) in the **dracut initramfs**: the vCPU halts in an idle wait and the
+timer interrupt that should wake it is lost. Three layers address this, all
+auto-enabled when nested AMD-V is detected:
 
 - `INJECT_KARGS=1` / `FIRSTBOOT_KARGS` — bakes `idle=poll nox2apic no-kvmclock
   tsc=reliable pci=nomsi` into the image's BLS boot entry (via `qemu-nbd`)
@@ -166,10 +181,77 @@ export KEYPAIR=...
 #        KEEP_CLUSTER=1, SKIP_CA_ROTATE=1, RECONCILER_BINARY_URL=...
 ```
 
+## Runner virtualization: KVM vs TCG
+
+The FCoS-VM tier boots a real VM. **How fast (and whether at all) depends on the
+runner's nested-virt support.** The harness auto-detects and picks an accelerator
+— you usually set nothing — but here's what it does and how to configure it.
+
+### Decision the harness makes (`resolve_qemu_cpu`)
+
+| Runner | Accelerator | Notes |
+|--------|-------------|-------|
+| Bare metal / Intel / sound nested virt | **KVM** | fast; `-cpu host` |
+| **Nested AMD-V without usable AVIC** | **TCG** (auto) | reliable but slow; see below |
+| Anything with `QEMU_ACCEL=tcg` | TCG | forced emulation |
+
+**Why nested AMD-V falls back to TCG.** On AMD, correct interrupt delivery to a
+nested (L2) guest needs **AVIC** (hardware virtual APIC). AVIC is **mutually
+exclusive with nested** on current kernels (and a cloud L1 usually isn't given
+AVIC by its L0 host), so `kvm_amd` runs with `avic=N`. Without AVIC the L2's APIC
+is software-emulated through the broken nested path and the boot **freezes right
+after `basic.target`** — no `-cpu`/`-x2apic`/`idle=poll`/`pci=nomsi`/`irqchip`
+combination fixes a missing virtual APIC. So the harness skips the doomed KVM
+attempts and goes straight to pure-emulation **TCG**, which has no nested
+interrupt virtualization and therefore boots reliably (just slowly).
+
+Check a runner in one line:
+
+```bash
+cat /sys/module/kvm_amd/parameters/avic    # 'N' on AMD => nested KVM won't work => TCG
+systemd-detect-virt                        # non-'none' => this host is itself a guest (nested)
+```
+
+### TCG runs are slow — and that's expected
+
+Full Kubernetes bring-up under software emulation takes **multiples longer**
+(tens of minutes per scenario). The harness compensates automatically:
+
+- **MTTCG sizing**: TCG isn't capped to 1 vCPU (that cap is a KVM-only nested
+  workaround). On nested AMD it bumps the master to **4 vCPU / 4 GB** and workers
+  to 2 vCPU (scaled to host cores), since MTTCG runs each vCPU on its own host
+  thread.
+- **`WAIT_SCALE`**: in-guest waits (node Ready, core pods, agent deploy) are
+  multiplied (×3 under TCG) so a slow run doesn't false-timeout mid-scenario.
+
+### Configuration knobs
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `QEMU_ACCEL` | `kvm` (auto→tcg on nested AMD) | force `tcg` or `kvm` |
+| `ALLOW_KVM_ON_NESTED_AMD` | `0` | try KVM on nested AMD anyway (xAPIC workarounds + TCG fallback) — only if your host has working AVIC+nested |
+| `ALLOW_SMP_ON_NESTED_AMD` | `0` | keep configured vCPU count on a forced-KVM nested-AMD run |
+| `WAIT_SCALE` | `3` on TCG, else `1` | multiply in-guest wait timeouts |
+| `MASTER_CPUS`/`MASTER_MEM_MB`, `WORKER_CPUS`/`WORKER_MEM_MB` | TCG: 4/4096, 2/2048 | explicit per-role sizing (override the auto bump) |
+| `TCG_FALLBACK` | `1` | when forcing KVM, fall back to TCG if it hangs |
+
+### For fast e2e
+
+Use a runner with real nested virt: **Intel VT-x** nested, **AMD with
+AVIC+nested**, or **bare metal** (`--device /dev/kvm` if the runner is a
+container). There the harness uses KVM automatically and a full run is minutes,
+not tens of minutes.
+
+> The current `ventus`/`magnum-actions01` runner (185.x) is a nested **AMD EPYC**
+> L1 guest with `avic=N` — confirmed KVM-incapable for L2, so it runs **TCG**
+> (slow but green). It's fine for correctness/PR gating; move to a sound-virt
+> runner if turnaround time matters.
+
 ## Preparing the self-hosted runner
 
-The FCoS-VM tier needs **nested KVM** plus qemu/jq/xz/podman; the OpenStack tier
-needs the `openstack` CLI + kubectl.
+The FCoS-VM tier needs **nested KVM** (fast) **or** falls back to TCG (slow but
+works anywhere) plus qemu/jq/xz/podman; the OpenStack tier needs the `openstack`
+CLI + kubectl.
 
 **Curl install (one shot — clones both repos + provisions):** the repos are
 private, so pass a PAT:

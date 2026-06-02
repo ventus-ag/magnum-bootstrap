@@ -25,10 +25,16 @@ HEAT_LISTEN="${HEAT_LISTEN:-127.0.0.1:9512}"
 AGENT_IMAGE="${AGENT_IMAGE:-docker.io/openstackmagnum/heat-container-agent:victoria-stable-1}"
 AGENT_STATE_DIR="${AGENT_STATE_DIR:-$E2E_DIR/heat-state}"
 AGENT_NODE="${AGENT_NODE:-self}"
-AGENT_DEPLOY_TIMEOUT="${AGENT_DEPLOY_TIMEOUT:-900}"
+AGENT_DEPLOY_TIMEOUT="${AGENT_DEPLOY_TIMEOUT:-}"   # empty = auto (900s * wait-scale)
 
 log() { printf '\033[1;36m[guest %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 err() { printf '\033[1;31m[guest %s] ERROR:\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# wscale — wait multiplier persisted by cmd_setup (3x under pure-emulation TCG,
+# 1x under KVM). In-guest wait loops multiply their iteration count by it so a
+# slow TCG run does not false-timeout. scaled <n> returns n*scale (min n).
+wscale() { local s; s="$(cat "$E2E_DIR/wait-scale" 2>/dev/null || echo 1)"; case "$s" in ''|*[!0-9]*) echo 1 ;; *) echo "$s" ;; esac; }
+scaled() { echo $(( $1 * $(wscale) )); }
 
 kubectl_bin() {
   for k in /usr/local/bin/kubectl /srv/magnum/bin/kubectl kubectl; do
@@ -95,12 +101,15 @@ cache_binary() {
 }
 
 cmd_setup() {
+  # Persist the wait multiplier so every later guest-run invocation (assert-*,
+  # heat-deploy) scales its timeouts identically.
+  echo "${WAIT_SCALE:-1}" > "$E2E_DIR/wait-scale"
   setup_self_ssh
   # Workers set START_MOCK=0 — only the master runs the mock Magnum, which
   # workers reach over the cluster network at MOCK_LISTEN.
   if [ "${START_MOCK:-1}" = "1" ]; then start_mock_magnum; fi
   cache_binary
-  log "setup complete"
+  log "setup complete (wait-scale=$(wscale)x)"
 }
 
 cmd_install() {
@@ -155,7 +164,7 @@ cmd_assert_ready() {
   log "asserting single-node cluster readiness"
   local node; node="$(kc get nodes -o name 2>/dev/null | head -1 || true)"
   if [ -z "$node" ]; then err "no nodes registered"; kc get nodes || true; return 1; fi
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 "$(scaled 60)"); do
     if kc get nodes --no-headers 2>/dev/null | grep -qw Ready; then
       log "node Ready: $(kc get nodes --no-headers | tr -s ' ')"
       break
@@ -165,7 +174,7 @@ cmd_assert_ready() {
   kc get nodes --no-headers 2>/dev/null | grep -qw Ready || { err "node never became Ready"; kc describe nodes | tail -40 >&2 || true; return 1; }
 
   log "waiting for core system pods (coredns / flannel)"
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 "$(scaled 60)"); do
     local cd fl
     cd="$(kc -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c Running || true)"
     fl="$(kc -n kube-system get pods --no-headers 2>/dev/null | grep -i flannel | grep -c Running || true)"
@@ -184,7 +193,7 @@ cmd_assert_ready() {
 cmd_assert_node_ready() {
   local node="$1"
   log "asserting node '${node}' is Ready"
-  for _ in $(seq 1 72); do  # up to 6 min
+  for _ in $(seq 1 "$(scaled 72)"); do  # up to 6 min (x wait-scale)
     if kc get node "$node" --no-headers 2>/dev/null | grep -qw Ready; then
       log "node Ready: $(kc get node "$node" --no-headers | tr -s ' ')"; return 0
     fi
@@ -308,19 +317,20 @@ cmd_agent_setup() {
 cmd_heat_deploy() {
   local md="$1" id="$2" name="$3" node="${4:-$AGENT_NODE}"
   local sig="$AGENT_STATE_DIR/${id}.signal.json"
+  local deploy_timeout="${AGENT_DEPLOY_TIMEOUT:-}"; [ -n "$deploy_timeout" ] || deploy_timeout="$(scaled 900)"
   log "scenario '${name}': publishing deployment id=${id} (node=${node})"
   rm -f "$sig"
   install -m 600 "$md" "$AGENT_STATE_DIR/${node}.md.json.tmp"
   mv "$AGENT_STATE_DIR/${node}.md.json.tmp" "$AGENT_STATE_DIR/${node}.md.json"
-  log "scenario '${name}': waiting up to ${AGENT_DEPLOY_TIMEOUT}s for the agent to run + signal"
+  log "scenario '${name}': waiting up to ${deploy_timeout}s for the agent to run + signal"
   local waited=0
-  while [ "$waited" -lt "$AGENT_DEPLOY_TIMEOUT" ]; do
+  while [ "$waited" -lt "$deploy_timeout" ]; do
     [ -s "$sig" ] && break
     sleep 5; waited=$((waited + 5))
     [ $((waited % 60)) -eq 0 ] && log "  ...still waiting (${waited}s)"
   done
   if [ ! -s "$sig" ]; then
-    err "scenario '${name}': no Heat signal after ${AGENT_DEPLOY_TIMEOUT}s"
+    err "scenario '${name}': no Heat signal after ${deploy_timeout}s"
     podman logs heat-container-agent 2>&1 | tail -50 >&2 || true
     return 1
   fi
