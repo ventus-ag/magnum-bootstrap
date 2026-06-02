@@ -237,6 +237,70 @@ cmd_assert_noop() {
   log "scenario '${name}': zero host changes ✅"
 }
 
+# cmd_lb_start <api_vip> <etcd_vip> <cnet_prefix> <master_cips_csv> — stand up the
+# two control-plane load balancers a real Magnum cluster gets from Octavia:
+#   api_lb  : <api_vip>:6443  -> each master :6443  (KUBE_API_*_ADDRESS)
+#   etcd_lb : <etcd_vip>:2379 -> each master :2379  (ETCD_LB_VIP)
+# Both VIPs are added as IP aliases on this node's cluster interface (master-0
+# hosts the LBs; the VIPs are reachable by every master/worker over the shared
+# cluster network). mock-lb is L4 only, so the masters' real TLS passes through.
+cmd_lb_start() {
+  local api_vip="$1" etcd_vip="$2" prefix="$3" cips="$4"
+  chmod +x "$E2E_DIR/mock-lb"
+  local dev
+  dev="$(ip -o -4 addr show 2>/dev/null | awk -v p="$prefix" '$4 ~ ("^" p "\\.") {print $2; exit}')"
+  [ -n "$dev" ] || { err "lb-start: no interface on ${prefix}.0/24"; ip -o -4 addr show >&2; return 1; }
+  log "lb-start: VIPs api=${api_vip} etcd=${etcd_vip} on ${dev}; backends ${cips}"
+  ip addr add "${api_vip}/24"  dev "$dev" 2>/dev/null || true   # idempotent: EEXIST is fine
+  ip addr add "${etcd_vip}/24" dev "$dev" 2>/dev/null || true
+  local api_be="" etcd_be="" ip
+  for ip in ${cips//,/ }; do
+    api_be="${api_be:+$api_be,}${ip}:6443"
+    etcd_be="${etcd_be:+$etcd_be,}${ip}:2379"
+  done
+  local unit
+  for unit in mock-lb-api mock-lb-etcd; do systemctl reset-failed "$unit" 2>/dev/null || true; done
+  systemd-run --unit=mock-lb-api  --collect "$E2E_DIR/mock-lb" -name api  -listen "${api_vip}:6443"  -backends "$api_be"
+  systemd-run --unit=mock-lb-etcd --collect "$E2E_DIR/mock-lb" -name etcd -listen "${etcd_vip}:2379" -backends "$etcd_be"
+  # Best-effort confirmation that the LB processes are listening. Backends are
+  # expected to be DOWN here: the LBs come up before any master reconcile, and
+  # mock-lb's health loop picks each apiserver/etcd up within ~2s of it binding.
+  # So this never gates the run — it only surfaces a totally dead LB process.
+  local _
+  for _ in $(seq 1 6); do
+    if ss -ltn 2>/dev/null | grep -q ":6443"; then
+      log "lb-start: mock-lb listening (api ${api_vip}:6443, etcd ${etcd_vip}:2379) ✅"; return 0
+    fi
+    sleep 2
+  done
+  log "lb-start: mock-lb started (api ${api_vip}:6443, etcd ${etcd_vip}:2379); backends register as masters come up"
+  systemctl is-active mock-lb-api mock-lb-etcd >/dev/null 2>&1 \
+    || { err "lb-start: a mock-lb unit failed to start"; journalctl -u mock-lb-api -u mock-lb-etcd --no-pager 2>/dev/null | tail -20 >&2 || true; return 1; }
+  return 0
+}
+
+# cmd_assert_etcd_members <expected> <endpoint> — assert the etcd cluster has
+# <expected> members (run on master-0 after additional masters join). <endpoint>
+# is a reachable etcd client URL, e.g. https://<master-0-cluster-ip>:2379.
+cmd_assert_etcd_members() {
+  local want="$1" ep="$2" cdir=/etc/etcd/certs
+  local etcdctl=/usr/local/bin/etcdctl
+  [ -x "$etcdctl" ] || { err "assert-etcd-members: $etcdctl missing"; return 1; }
+  log "asserting etcd has ${want} member(s) via ${ep}"
+  local _ got
+  for _ in $(seq 1 "$(scaled 36)"); do  # up to 3 min (x wait-scale) for joins to settle
+    got="$("$etcdctl" --endpoints="$ep" --command-timeout=5s \
+            --cacert="$cdir/ca.crt" --cert="$cdir/server.crt" --key="$cdir/server.key" \
+            member list 2>/dev/null | grep -c started || true)"
+    if [ "${got:-0}" = "$want" ]; then log "etcd member count = ${got} ✅"; return 0; fi
+    sleep 5
+  done
+  err "etcd member count = ${got:-?}, want ${want}"
+  "$etcdctl" --endpoints="$ep" --cacert="$cdir/ca.crt" --cert="$cdir/server.crt" --key="$cdir/server.key" \
+    member list 2>&1 | sed 's/^/    | /' >&2 || true
+  return 1
+}
+
 # cmd_cert_hashes — print content fingerprints of the live CA + API server leaf
 # so the host harness can assert a CA rotation actually replaced them. Uses
 # sha256sum (always present) rather than openssl so it has no extra dependency.
@@ -373,6 +437,8 @@ main() {
     assert-noop)      cmd_assert_noop "$@" ;;
     cert-hashes)      cmd_cert_hashes ;;
     kubelet-version)  cmd_kubelet_version "$@" ;;
+    lb-start)            cmd_lb_start "$@" ;;
+    assert-etcd-members) cmd_assert_etcd_members "$@" ;;
     agent-setup)      cmd_agent_setup "$@" ;;
     heat-deploy)      cmd_heat_deploy "$@" ;;
     *) err "unknown subcommand: ${sub}"; exit 2 ;;

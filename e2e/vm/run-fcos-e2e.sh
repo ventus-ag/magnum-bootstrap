@@ -8,14 +8,27 @@
 # asserting health and idempotency. OpenStack-integrated addons (OCCM, Cinder/
 # Manila CSI) are intentionally OFF here — see run-magnum-e2e.sh.
 #
-# Single node (default, WORKERS=0): one VM, user-mode networking, KUBE_NODE_IP
-# 10.0.2.15, mock Magnum on 127.0.0.1 — the proven path.
+# Load balancers (default ON, mirrors Magnum master_lb_enabled=true): every run —
+# even a single master — stands up a dedicated `lb` VM running two L4 TCP load
+# balancers that stand in for the cluster's Octavia api_lb + etcd_lb:
+#     api_lb  (KUBE_API_PRIVATE/PUBLIC_ADDRESS) -> VIP 192.168.77.8 :6443
+#     etcd_lb (ETCD_LB_VIP)                     -> VIP 192.168.77.9 :2379
+# Both VIPs live on the lb node (NOT a master: apiserver binds 0.0.0.0:6443, so a
+# co-located api VIP would clash). mock-lb is L4 pass-through, so the masters'
+# real TLS flows end-to-end. Set MASTER_LB_ENABLED=false for the no-LB direct
+# path (= Heat no_master_lb): single master only, user-mode net, no lb node.
 #
-# Multi node (WORKERS>=1): each VM gets a second NIC on a shared QEMU socket/
-# mcast segment (no host bridge/root needed); MAC-matched static IPs form a
-# cluster network (master 192.168.77.10, workers .20+). The mock Magnum runs on
-# the master's cluster IP so workers can reach it; workers join the master's API.
-# NOTE: the inter-VM path is a first cut — validate on the runner.
+# Because the LB is on by default, every run uses a shared cluster network: each
+# VM gets a second NIC on a QEMU socket/mcast segment (no host bridge/root) with
+# MAC-matched static IPs (lb .8/.9, masters .10/.11/..., workers .20+). The mock
+# Magnum runs on master-0's cluster IP; workers/clients reach the API through the
+# api VIP.
+#
+# Multi master (MASTERS>=2): masters join sequentially through the etcd VIP
+# (member add) and serve behind the api VIP; CA rotation is applied to all
+# masters concurrently so the dual-CA barrier's per-master restart serialization
+# is exercised. TCG-slow, so >1 master is opt-in (MASTERS stays 1 by default).
+# NOTE: the inter-VM + LB path is validated on the runner.
 #
 # Requires: qemu-system-x86_64 (KVM), qemu-img, jq, xz, curl, butane|podman|docker,
 # ssh/scp, go.
@@ -23,8 +36,9 @@
 # Env knobs (defaults):
 #   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade)
-#   WORKERS 0          MASTER_MEM_MB 2048   MASTER_CPUS 1
-#                      WORKER_MEM_MB 2048   WORKER_CPUS 1
+#   WORKERS 0          MASTERS 1            MASTER_LB_ENABLED true
+#   MASTER_MEM_MB 2048 MASTER_CPUS 1        WORKER_MEM_MB 2048   WORKER_CPUS 1
+#   LB_MEM_MB 768      LB_CPUS 1
 #   WORKDIR (mktemp)   KEEP_VM 0
 #
 set -euo pipefail
@@ -37,6 +51,7 @@ FCOS_STREAM="${FCOS_STREAM:-stable}"
 VICTORIA_DIR="${VICTORIA_DIR:-}"
 SCENARIOS="${SCENARIOS:-create ca-rotate upgrade}"
 WORKERS="${WORKERS:-0}"
+MASTERS="${MASTERS:-1}"   # >=2 enables the multi-master + 2-LB path (opt-in; TCG-slow)
 
 # Per-role sizing (VM_MEM_MB/VM_CPUS kept as backward-compatible fallbacks).
 MASTER_MEM_MB="${MASTER_MEM_MB:-${VM_MEM_MB:-2048}}"
@@ -45,10 +60,33 @@ WORKER_MEM_MB="${WORKER_MEM_MB:-2048}"
 WORKER_CPUS="${WORKER_CPUS:-1}"
 
 # Cluster network (multi-node only).
-CNET="${CNET:-192.168.77}"
-MCAST="${MCAST:-230.0.0.77:34801}"
+# Per-run isolation. Multiple pipelines can share one host without colliding on
+# the cluster L2 (mcast group), subnet, or SSH host-ports by deriving everything
+# from a slot. Provide E2E_SLOT for a deterministic slot; otherwise derive one
+# from the CI run id; else 0. (A single self-hosted runner runs one job at a
+# time, so concurrency only happens with multiple runner instances per host —
+# the slot makes that safe.)
+SLOT="${E2E_SLOT:-}"
+if [ -z "$SLOT" ]; then
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0}) % 150 ))
+  else SLOT=0; fi
+fi
+# Unique /24, unique mcast group+port, unique SSH port window per slot.
+CNET="${CNET:-192.168.$((100 + SLOT % 150))}"
+MCAST="${MCAST:-230.$((SLOT / 256)).$((SLOT % 256)).77:$((34801 + SLOT))}"
+PORT_BASE="${PORT_BASE:-$((2200 + (SLOT % 200) * 256))}"
 MASTER_CIP="${CNET}.10"
 MASTER_CMAC="52:54:00:77:00:0a"
+# Control-plane VIPs. These mirror Magnum's two Octavia LBs and live on the lb
+# node (a master can't host the api VIP — apiserver binds 0.0.0.0:6443):
+#   API_VIP  -> api_lb  (KUBE_API_PRIVATE/PUBLIC_ADDRESS), TCP :6443  (lb node primary IP)
+#   ETCD_VIP -> etcd_lb (ETCD_LB_VIP),                     TCP :2379  (lb node alias IP)
+API_VIP="${API_VIP:-${CNET}.8}"
+ETCD_VIP="${ETCD_VIP:-${CNET}.9}"
+LB_CIP="$API_VIP"               # the lb node's primary cluster IP
+LB_CMAC="52:54:00:77:00:08"
+LB_MEM_MB="${LB_MEM_MB:-768}"
+LB_CPUS="${LB_CPUS:-1}"
 
 # QEMU CPU/accel/machine. QEMU_CPU=auto (default) resolves at preflight. On a
 # nested AMD-V host LAPIC interrupt delivery to the L2 guest is unreliable, which
@@ -94,7 +132,8 @@ FIRSTBOOT_KARGS="${FIRSTBOOT_KARGS:-idle=poll nox2apic no-kvmclock tsc=reliable 
 
 GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
-ROT_SEQ=0   # monotonic counter so repeated ca-rotate scenarios get unique ids
+ROT_SEQ=0     # monotonic counter so repeated ca-rotate scenarios get unique ids
+LBS_STARTED=0 # set once the control-plane LBs are up on master-0 (multi-master)
 
 # Trigger mode — how the reconciler is invoked on each node:
 #   direct (default) - place heat-params + run the systemd unit directly (fast).
@@ -115,14 +154,36 @@ log()  { printf '\033[1;32m[host %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 err()  { printf '\033[1;31m[host %s] ERROR:\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-multinode() { [ "${WORKERS:-0}" -ge 1 ]; }
+multinode()   { [ "${WORKERS:-0}" -ge 1 ]; }
+multimaster() { [ "${MASTERS:-1}" -ge 2 ]; }
+lb_enabled()  { [ "${MASTER_LB_ENABLED:-true}" = true ]; }
+# A shared cluster network is needed whenever there is more than one node — which,
+# because the LB is on by default, is every run except an explicit
+# MASTER_LB_ENABLED=false single master (the user-mode direct path).
+clustered()   { lb_enabled || multimaster || multinode; }
 
 # --- node identity helpers -------------------------------------------------
-worker_ip()   { echo "${CNET}.$((20 + $1))"; }
-worker_cmac() { printf '52:54:00:77:00:%02x' "$((20 + $1))"; }
-master_ip()   { if multinode; then echo "$MASTER_CIP"; else echo "10.0.2.15"; fi; }
-mock_host()   { if multinode; then echo "$MASTER_CIP"; else echo "127.0.0.1"; fi; }
-ssh_port()    { case "$1" in master) echo 2222 ;; *) echo "$((2300 + ${1#worker}))" ;; esac; }
+worker_ip()    { echo "${CNET}.$((20 + $1))"; }
+worker_cmac()  { printf '52:54:00:77:00:%02x' "$((20 + $1))"; }
+master_cip()   { echo "${CNET}.$((10 + $1))"; }                  # master i cluster IP (.10, .11, ...)
+master_cmac()  { printf '52:54:00:77:00:%02x' "$((10 + $1))"; }  # master i cluster MAC
+master_key()   { [ "$1" = 0 ] && echo master || echo "master$1"; }
+master_nodeip(){ if clustered; then master_cip "$1"; else echo 10.0.2.15; fi; }
+master_ip()    { master_nodeip 0; }                              # master-0 IP (workers/mock target)
+mock_host()    { if clustered; then echo "$MASTER_CIP"; else echo "127.0.0.1"; fi; }
+# The API endpoint workers/clients join: the api_lb VIP when the LB is enabled,
+# else master-0 directly.
+api_endpoint() { if lb_enabled; then echo "$API_VIP"; else master_ip; fi; }
+# SSH host-ports, all within this run's PORT_BASE window (slot-isolated):
+#   lb = +1, master-i = +10+i, worker-i = +50+i
+ssh_port() {
+  case "$1" in
+    lb)       echo "$((PORT_BASE + 1))" ;;
+    master)   echo "$((PORT_BASE + 10))" ;;
+    master*)  echo "$((PORT_BASE + 10 + ${1#master}))" ;;
+    *)        echo "$((PORT_BASE + 50 + ${1#worker}))" ;;
+  esac
+}
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 resolve_butane() {
@@ -246,6 +307,7 @@ build_binaries() {
   ( cd "$REPO_ROOT" && make build >/dev/null )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-magnum"  ./e2e/cmd/mock-magnum )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/scenario-gen" ./e2e/cmd/scenario-gen )
+  ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-lb" ./e2e/cmd/mock-lb )
   [ "$TRIGGER" = agent ] && ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-heat" ./e2e/cmd/mock-heat )
   cp "$REPO_ROOT/dist/bootstrap" "$WORKDIR/bootstrap"
 }
@@ -495,14 +557,36 @@ provision_node() {
   fi
 }
 
+# node_index <key> -> numeric index for scenario-gen (-node-index).
+node_index() {
+  case "$1" in
+    master)  echo 0 ;;
+    master*) echo "${1#master}" ;;
+    *)       echo "${1#worker}" ;;
+  esac
+}
+
+# scenario_extra_flags <role> <array-name> — fill the array with the master-only
+# scenario-gen flags carrying the cluster's master count and (when the LB is on)
+# the two LB VIPs. Empty for workers.
+scenario_extra_flags() {
+  local role="$1"; local -n _out="$2"; _out=()
+  if [ "$role" = master ]; then
+    _out+=(-number-of-masters "${MASTERS:-1}")
+    if lb_enabled; then _out+=(-api-ip "$API_VIP" -etcd-lb-vip "$ETCD_VIP"); fi
+  fi
+}
+
 # render_and_push <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
 render_and_push() {
   local key="$1" role="$2" op="$3" tag="$4" rot="$5" nip="$6" mip="${7:-}"
-  local idx=0; [ "$key" != master ] && idx="${key#worker}"
+  local idx; idx="$(node_index "$key")"
   local host="$(mock_host)" port; port="$(ssh_port "$key")"
   local hp="$WORKDIR/heat-params.${key}.${op}"
+  local extra; scenario_extra_flags "$role" extra
   "$WORKDIR/scenario-gen" \
     -role "$role" -op "$op" -node-index "$idx" -node-ip "$nip" ${mip:+-master-ip "$mip"} \
+    ${extra[@]+"${extra[@]}"} \
     -kube-tag "$tag" -ca-rotation-id "$rot" \
     -ca-key-file "$WORKDIR/ca.key" -sa-key-file "$WORKDIR/sa.pub" -sa-priv-file "$WORKDIR/sa.key" \
     -auth-url "http://${host}:9511/v3" -magnum-url "http://${host}:9511/v1" \
@@ -518,13 +602,15 @@ render_and_push() {
 # A fresh id per call is required: 55-heat-config skips an already-deployed id.
 render_and_push_deploy() {
   local key="$1" role="$2" op="$3" tag="$4" rot="$5" nip="$6" mip="${7:-}"
-  local idx=0; [ "$key" != master ] && idx="${key#worker}"
+  local idx; idx="$(node_index "$key")"
   local host; host="$(mock_host)"; local port; port="$(ssh_port "$key")"
   local id="${key}-${op}-$(date +%s)" action=UPDATE
   [ "$op" = create ] && action=CREATE
   local dep="$WORKDIR/deploy.${key}.${op}.json"
+  local extra; scenario_extra_flags "$role" extra
   "$WORKDIR/scenario-gen" -emit deployment \
     -role "$role" -op "$op" -node-index "$idx" -node-ip "$nip" ${mip:+-master-ip "$mip"} \
+    ${extra[@]+"${extra[@]}"} \
     -kube-tag "$tag" -ca-rotation-id "$rot" \
     -ca-key-file "$WORKDIR/ca.key" -sa-key-file "$WORKDIR/sa.pub" -sa-priv-file "$WORKDIR/sa.key" \
     -auth-url "http://${host}:9511/v3" -magnum-url "http://${host}:9511/v1" \
@@ -542,26 +628,54 @@ for_each_worker() {  # for_each_worker <fn>; calls fn <i>
   while [ "$i" -lt "$WORKERS" ]; do "$fn" "$i"; i=$((i + 1)); done
 }
 
-apply_master() {  # apply_master <op> <tag> [rot]
-  local op="$1" tag="$2" rot="${3:-}" mp; mp="$(ssh_port master)"
+# apply_master_idx <i> <op> <tag> [rot] — render + apply heat-params on master i.
+apply_master_idx() {
+  local i="$1" op="$2" tag="$3" rot="${4:-}"
+  local key; key="$(master_key "$i")"; local mp; mp="$(ssh_port "$key")"
+  local nip; nip="$(master_nodeip "$i")"
   if [ "$TRIGGER" = agent ]; then
-    local res; res="$(render_and_push_deploy master master "$op" "$tag" "$rot" "$(master_ip)")"
+    local res; res="$(render_and_push_deploy "$key" master "$op" "$tag" "$rot" "$nip")"
     gssh "$mp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
   else
-    local hp; hp="$(render_and_push master master "$op" "$tag" "$rot" "$(master_ip)")"
+    local hp; hp="$(render_and_push "$key" master "$op" "$tag" "$rot" "$nip")"
     gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
   fi
 }
+# apply_master <op> <tag> [rot] — master-0 (back-compat for single-master scenarios).
+apply_master() { apply_master_idx 0 "$@"; }
 
 apply_worker() {  # apply_worker <i> <op> <tag>
   local i="$1" op="$2" tag="$3" wp; wp="$(ssh_port "worker$i")"
   if [ "$TRIGGER" = agent ]; then
-    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
+    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
   else
-    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(master_ip)")"
+    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
   fi
+}
+
+# start_lbs — bring up the two control-plane LBs (api_lb + etcd_lb) on the lb node,
+# each forwarding to every master. Started before any master reconcile; mock-lb's
+# health loop registers each backend as its apiserver/etcd binds. Idempotent.
+start_lbs() {
+  [ "$LBS_STARTED" = 1 ] && return 0
+  lb_enabled || return 0
+  local cips="" i=0
+  while [ "$i" -lt "${MASTERS:-1}" ]; do cips="${cips:+$cips,}$(master_cip "$i")"; i=$((i + 1)); done
+  log "starting control-plane LBs on lb node (api ${API_VIP}:6443, etcd ${ETCD_VIP}:2379 -> ${cips})"
+  gssh "$(ssh_port lb)" "$GUEST_E2E_DIR/guest-run.sh lb-start $API_VIP $ETCD_VIP $CNET $cips"
+  LBS_STARTED=1
+}
+
+# provision_lb — minimal provisioning for the lb node: just mock-lb + guest-run.sh
+# (no mock Magnum, no reconciler).
+provision_lb() {
+  local port; port="$(ssh_port lb)"
+  log "provisioning lb node"
+  gssh "$port" "mkdir -p $GUEST_E2E_DIR"
+  gscp "$port" "$WORKDIR/mock-lb" "$REPO_ROOT/e2e/vm/guest-run.sh" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
+  gssh "$port" "chmod +x $GUEST_E2E_DIR/guest-run.sh $GUEST_E2E_DIR/mock-lb; echo ${WAIT_SCALE:-1} > $GUEST_E2E_DIR/wait-scale"
 }
 
 assert_worker_joined() {  # <i>
@@ -569,9 +683,22 @@ assert_worker_joined() {  # <i>
 }
 
 scenario_create() {
-  log "=== SCENARIO: create (trigger=$TRIGGER) ==="
+  log "=== SCENARIO: create (trigger=$TRIGGER, masters=${MASTERS:-1}) ==="
   apply_master create "$KUBE_TAG"
   gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  if multimaster; then
+    # master-0 is up and its etcd is now reachable through the etcd VIP; bring up
+    # the remaining masters one at a time (each joins the existing etcd via the LB,
+    # exactly as Heat rolls out the master batch).
+    local i=1
+    while [ "$i" -lt "${MASTERS:-1}" ]; do
+      log "--- joining master-$i ---"
+      apply_master_idx "$i" create "$KUBE_TAG"
+      gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-node-ready e2e-master-$i"
+      i=$((i + 1))
+    done
+    gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-etcd-members ${MASTERS} https://$(master_cip 0):2379"
+  fi
   # Idempotency re-run only in direct mode: re-applying the same heat-params must
   # be a no-op. Under the agent, Heat re-runs only on a NEW deployment id, so a
   # same-id replay is skipped by 55-heat-config by design — not a meaningful test.
@@ -596,7 +723,20 @@ scenario_ca_rotate() {
   mp="$(ssh_port master)"
   log "=== SCENARIO: ca-rotate (id=$rot) ==="
   before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
-  apply_master ca-rotate "$KUBE_TAG" "$rot"
+  if multimaster; then
+    # Apply the rotation to every master ~concurrently — Heat rotates the whole
+    # master batch at once, and the dual-CA barrier's per-master restart Lease is
+    # only exercised under concurrent applies (sequential would block at barrier 1).
+    local pids=() i=0 rc=0 p
+    while [ "$i" -lt "${MASTERS:-1}" ]; do
+      apply_master_idx "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
+      i=$((i + 1))
+    done
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+    [ "$rc" = 0 ] || die "ca-rotate: a master reconcile failed (see per-master output above)"
+  else
+    apply_master ca-rotate "$KUBE_TAG" "$rot"
+  fi
   gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
   after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
   sb="${before##*server=}"; sa="${after##*server=}"
@@ -610,8 +750,20 @@ scenario_upgrade() {
   log "=== SCENARIO: upgrade -> $KUBE_TAG_UPGRADE ==="
   local mp before after; mp="$(ssh_port master)"
   before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh kubelet-version")"
-  apply_master upgrade "$KUBE_TAG_UPGRADE"
-  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  if multimaster; then
+    # Rolling upgrade: one master at a time (each cordons/drains itself), like
+    # Heat's per-batch master rollout.
+    local i=0
+    while [ "$i" -lt "${MASTERS:-1}" ]; do
+      log "--- upgrading master-$i ---"
+      apply_master_idx "$i" upgrade "$KUBE_TAG_UPGRADE"
+      gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-ready e2e-master-$i"
+      i=$((i + 1))
+    done
+  else
+    apply_master upgrade "$KUBE_TAG_UPGRADE"
+    gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  fi
   after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh kubelet-version e2e-master-0")"
   log "upgrade kubelet version: before[$before] after[$after] (want ~$KUBE_TAG_UPGRADE)"
   case "$after" in
@@ -624,17 +776,28 @@ _upgrade_worker() { apply_worker "$1" upgrade "$KUBE_TAG_UPGRADE"; assert_worker
 
 # --- main ------------------------------------------------------------------
 boot_all() {
-  if multinode; then
-    render_ignition master e2e-master-0 "$MASTER_CMAC" "$MASTER_CIP"
-    boot_node master "$(ssh_port master)" "$MASTER_MEM_MB" "$MASTER_CPUS" "$MASTER_CMAC"
-    local i=0
+  if clustered; then
+    # lb node first (small; mock-lb tolerates down backends and registers each
+    # master as its apiserver/etcd comes up).
+    if lb_enabled; then
+      render_ignition lb e2e-lb "$LB_CMAC" "$LB_CIP"
+      boot_node lb "$(ssh_port lb)" "$LB_MEM_MB" "$LB_CPUS" "$LB_CMAC"
+    fi
+    local i=0 key
+    while [ "$i" -lt "${MASTERS:-1}" ]; do
+      key="$(master_key "$i")"
+      render_ignition "$key" "e2e-master-$i" "$(master_cmac "$i")" "$(master_cip "$i")"
+      boot_node "$key" "$(ssh_port "$key")" "$MASTER_MEM_MB" "$MASTER_CPUS" "$(master_cmac "$i")"
+      i=$((i + 1))
+    done
+    i=0
     while [ "$i" -lt "$WORKERS" ]; do
       render_ignition "worker$i" "e2e-minion-$i" "$(worker_cmac "$i")" "$(worker_ip "$i")"
       boot_node "worker$i" "$(ssh_port "worker$i")" "$WORKER_MEM_MB" "$WORKER_CPUS" "$(worker_cmac "$i")"
       i=$((i + 1))
     done
   else
-    # Single-node: original user-mode path, no cluster NIC.
+    # MASTER_LB_ENABLED=false single master: user-mode path, no cluster NIC.
     render_ignition master e2e-master-0 "$MASTER_CMAC" "$MASTER_CIP"
     boot_node master "$(ssh_port master)" "$MASTER_MEM_MB" "$MASTER_CPUS" ""
   fi
@@ -642,10 +805,18 @@ boot_all() {
 
 provision_all() {
   provision_node master "$(ssh_port master)" 1
-  if multinode; then
-    local i=0
+  if clustered; then
+    if lb_enabled; then provision_lb; fi
+    local i=1 key
+    while [ "$i" -lt "${MASTERS:-1}" ]; do
+      key="$(master_key "$i")"; provision_node "$key" "$(ssh_port "$key")" 0; i=$((i + 1))
+    done
+    i=0
     while [ "$i" -lt "$WORKERS" ]; do provision_node "worker$i" "$(ssh_port "worker$i")" 0; i=$((i + 1)); done
   fi
+  # Start the LBs once the nodes are provisioned; backends register as each master
+  # reconciles. (master-0 bootstraps its etcd before the LB has a healthy backend.)
+  start_lbs
 }
 
 main() {

@@ -24,6 +24,12 @@ on:
       workers:
         description: Number of worker nodes (0 = single-node master)
         default: "0"
+      masters:
+        description: Number of master nodes (>=2 uses the dedicated e2e-fcos-multimaster path; keep 1 here)
+        default: "1"
+      master_lb_enabled:
+        description: Front the control plane with the two L4 LBs (api_lb + etcd_lb), like Heat (false = direct no-LB path)
+        default: "true"
       qemu_accel:
         description: QEMU accelerator (kvm = fast/needs nested virt; tcg = pure emulation, reliable but slow)
         default: kvm
@@ -125,6 +131,8 @@ jobs:
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
           WORKERS: ${{ github.event.inputs.workers || '0' }}
+          MASTERS: ${{ github.event.inputs.masters || '1' }}
+          MASTER_LB_ENABLED: ${{ github.event.inputs.master_lb_enabled || 'true' }}
           QEMU_ACCEL: ${{ github.event.inputs.qemu_accel || 'kvm' }}
           QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
           QEMU_MACHINE: ${{ github.event.inputs.qemu_machine || '' }}

@@ -34,6 +34,9 @@ func main() {
 		nodeIndex    = flag.Int("node-index", 0, "node index (master-0, minion-0, ...)")
 		nodeIP       = flag.String("node-ip", "", "KUBE_NODE_IP (required)")
 		masterIP     = flag.String("master-ip", "", "worker: API server IP to join (defaults to node-ip)")
+		apiIP        = flag.String("api-ip", "", "master: KUBE_API_PRIVATE/PUBLIC_ADDRESS — the api_lb VIP in multi-master (defaults to node-ip)")
+		etcdLBVIP    = flag.String("etcd-lb-vip", "", "master: ETCD_LB_VIP — the etcd_lb VIP in multi-master (empty = single-master bootstrap)")
+		numMasters   = flag.Int("number-of-masters", 1, "master: NUMBER_OF_MASTERS")
 		kubeTag      = flag.String("kube-tag", "v1.30.5", "Kubernetes version tag")
 		clusterUUID  = flag.String("cluster-uuid", "11111111-1111-1111-1111-111111111111", "Magnum cluster UUID")
 		authURL      = flag.String("auth-url", "http://127.0.0.1:9511/v3", "Keystone auth URL")
@@ -88,6 +91,9 @@ func main() {
 		Operation:                 scenario.Operation(*op),
 		NodeIP:                    *nodeIP,
 		MasterIP:                  mIP,
+		APIIP:                     *apiIP,
+		EtcdLBVIP:                 *etcdLBVIP,
+		NumberOfMasters:           *numMasters,
 		KubeTag:                   *kubeTag,
 		CARotationID:              *caRotationID,
 		AuthURL:                   *authURL,

@@ -46,9 +46,14 @@ type Config struct {
 	Operation   Operation
 
 	// Networking / identity.
-	NodeIP   string // KUBE_NODE_IP (set explicitly so the metadata service is never needed)
-	APIIP    string // master: API address; also used as ETCD/LB address for single-master
-	MasterIP string // worker: KUBE_MASTER_IP (the API server address to join)
+	NodeIP string // KUBE_NODE_IP (set explicitly so the metadata service is never needed)
+	APIIP  string // master: API server address -> KUBE_API_PRIVATE/PUBLIC_ADDRESS. In a
+	// multi-master cluster this is the api_lb VIP (same on every master); single-master
+	// defaults to NodeIP.
+	EtcdLBVIP string // master: etcd_lb VIP -> ETCD_LB_VIP. Empty for single-master (the
+	// etcd module then bootstraps a new cluster); set to the etcd_lb VIP for multi-master
+	// so joining masters reach the existing members through the LB.
+	MasterIP string // worker: KUBE_MASTER_IP (the API server address to join — the api_lb VIP in multi-master)
 	KubeTag  string // e.g. v1.30.5 (kubelet/kubectl URLs are derived from this)
 
 	// CA-rotate trigger. Leave empty except for OpCARotate.
@@ -281,7 +286,7 @@ func (c Config) pairs() []KV {
 		put("MASTER_INDEX", fmt.Sprint(c.NodeIndex))
 		put("KUBE_API_PRIVATE_ADDRESS", c.APIIP)
 		put("KUBE_API_PUBLIC_ADDRESS", c.APIIP)
-		put("ETCD_LB_VIP", "")
+		put("ETCD_LB_VIP", c.EtcdLBVIP)
 		put("ETCD_DISCOVERY_URL", "")
 		put("ETCD_VOLUME", "")
 		put("ETCD_VOLUME_SIZE", "0")

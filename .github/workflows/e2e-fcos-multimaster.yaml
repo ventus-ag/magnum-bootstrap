@@ -1,0 +1,123 @@
+name: e2e-fcos-multimaster
+
+# Multi-master variant of e2e-fcos: boots N master VMs plus the dedicated lb VM
+# (the two L4 TCP load balancers that stand in for Magnum's Octavia api_lb +
+# etcd_lb) and drives create -> ca-rotate across the whole control plane. This
+# exercises the etcd LB join path and the dual-CA rotation barrier's per-master
+# restart serialization across real nodes.
+#
+# It is HEAVY: several FCoS VMs, and on a nested-AMD runner everything runs under
+# pure-emulation TCG (tens of minutes). So it is NOT on every PR — it runs on
+# manual dispatch or when a PR carries the `e2e-multimaster` label (plus nightly).
+
+on:
+  workflow_dispatch:
+    inputs:
+      masters:
+        description: Number of master nodes
+        default: "3"
+      workers:
+        description: Number of worker nodes
+        default: "0"
+      scenarios:
+        description: Space-separated scenarios (upgrade is very slow with N masters under TCG)
+        default: create ca-rotate
+      kube_tag:
+        description: Initial Kubernetes version
+        default: v1.30.5
+      kube_tag_upgrade:
+        description: Upgrade target version
+        default: v1.31.4
+      magnum_ref:
+        description: Branch/ref of the forked driver repo (ventus-ag/magnum)
+        default: victoria-ca-rotation
+      qemu_accel:
+        description: QEMU accelerator (kvm = needs sound nested virt; tcg = pure emulation)
+        default: kvm
+      qemu_cpu:
+        description: QEMU -cpu model (auto resolves per host)
+        default: auto
+  schedule:
+    - cron: "0 3 * * *" # nightly 03:00 UTC (after the single-master e2e at 02:00)
+  pull_request:
+    # Opt-in per PR: add the `e2e-multimaster` label. `synchronize`/`reopened`
+    # keep it running on pushes while the label is present.
+    types: [labeled, synchronize, reopened]
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-fcos-mm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    # Dispatch/schedule always; PRs only when carrying the e2e-multimaster label.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e-multimaster')
+    runs-on: self-hosted
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Checkout forked driver (ventus-ag/magnum)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          path: magnum
+          token: ${{ secrets.RW_PAT_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: |
+          sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh
+          sudo chmod 0666 /dev/kvm || true
+
+      - name: Runner preflight
+        run: ./e2e/vm/runner-preflight.sh
+
+      - name: Run multi-master Fedora CoreOS e2e
+        env:
+          VICTORIA_DIR: ${{ github.workspace }}/magnum
+          MASTERS: ${{ github.event.inputs.masters || '3' }}
+          WORKERS: ${{ github.event.inputs.workers || '0' }}
+          SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate' }}
+          KUBE_TAG: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
+          KUBE_TAG_UPGRADE: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+          QEMU_ACCEL: ${{ github.event.inputs.qemu_accel || 'kvm' }}
+          QEMU_CPU: ${{ github.event.inputs.qemu_cpu || 'auto' }}
+          # A stable per-run slot so this job's cluster network/ports never collide
+          # with a concurrent single-master e2e on the same host.
+          E2E_SLOT: "20"
+          WORKDIR: ${{ runner.temp }}/fcos-e2e-mm
+        run: ./e2e/vm/run-fcos-e2e.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcos-e2e-mm-diag
+          path: |
+            ${{ runner.temp }}/fcos-e2e-mm/console.*.log
+            ${{ runner.temp }}/fcos-e2e-mm/heat-params.*
+            ${{ runner.temp }}/fcos-e2e-mm/ignition.*.json
+          if-no-files-found: ignore
+
+      - name: Clean up VMs and workdir
+        if: always()
+        run: |
+          WD="${{ runner.temp }}/fcos-e2e-mm"
+          pkill -f "$WD" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "$WD" 2>/dev/null || true
+          rm -rf "$WD" || true

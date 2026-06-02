@@ -63,11 +63,18 @@ go test ./e2e/...
 FCoS VM tier (needs KVM + qemu, jq, xz, podman, go, and a magnum_victoria checkout):
 
 ```bash
-# single node (default)
+# single node + LB (default): 1 master + 1 lb VM (the two L4 LBs)
 VICTORIA_DIR=/path/to/magnum ./e2e/vm/run-fcos-e2e.sh
 
 # multi node: 1 master + 2 workers (exercises worker join + drain/uncordon)
 VICTORIA_DIR=/path/to/magnum WORKERS=2 ./e2e/vm/run-fcos-e2e.sh
+
+# multi master: 3 masters behind the api/etcd LBs (exercises etcd LB join +
+# the dual-CA rotation barrier across masters)
+VICTORIA_DIR=/path/to/magnum MASTERS=3 SCENARIOS="create ca-rotate" ./e2e/vm/run-fcos-e2e.sh
+
+# direct no-LB path (= Heat no_master_lb): single master, user-mode net, no lb VM
+VICTORIA_DIR=/path/to/magnum MASTER_LB_ENABLED=false ./e2e/vm/run-fcos-e2e.sh
 ```
 
 `SCENARIOS` is an ordered, repeatable list — `ca-rotate` may appear many times
@@ -76,13 +83,37 @@ VICTORIA_DIR=/path/to/magnum WORKERS=2 ./e2e/vm/run-fcos-e2e.sh
 the repeated-operation sequence that exposed the wedge bug. `ca-rotate` asserts
 the API server leaf cert content actually changed; `upgrade` asserts the kubelet
 version changed; `create` asserts idempotency = **zero** host changes on re-run.
+Multi-master adds: each extra master joins the existing etcd through the etcd VIP
+and registers Ready; `ca-rotate` is applied to all masters **concurrently** so
+the dual-CA barrier's per-master restart Lease is exercised; `assert-etcd-members`
+checks the final member count.
+
+### Load balancers (mirrors Magnum's two Octavia LBs)
+
+By default (`MASTER_LB_ENABLED=true`, like Heat `master_lb_enabled`), every run —
+even a single master — stands up a dedicated **`lb` VM** running two L4 TCP load
+balancers (`e2e/cmd/mock-lb`):
+
+| LB | heat-params | VIP | port |
+|----|-------------|-----|------|
+| `api_lb`  | `KUBE_API_PRIVATE/PUBLIC_ADDRESS` | `192.168.<slot>.8` | 6443 |
+| `etcd_lb` | `ETCD_LB_VIP`                     | `192.168.<slot>.9` | 2379 |
+
+`mock-lb` is **pass-through** (it never terminates TLS), with TCP health checks —
+exactly what Octavia provides for these pools. The VIPs live on the lb node, not
+a master, because the apiserver binds `0.0.0.0:6443` (a co-located api VIP would
+clash). etcd **peer** traffic (:2380) stays direct node↔node, matching Heat
+(`etcd_lb` is :2379 only). `MASTER_LB_ENABLED=false` reverts to the direct no-LB
+path (single master only; the simple user-mode network, no lb VM).
 
 Knobs: `KUBE_TAG`, `KUBE_TAG_UPGRADE`, `SCENARIOS="create ca-rotate upgrade"`,
-`WORKERS` (0=single node), per-role sizing `MASTER_MEM_MB`/`MASTER_CPUS` and
-`WORKER_MEM_MB`/`WORKER_CPUS` (`VM_MEM_MB`/`VM_CPUS` still work as fallbacks),
-`KEEP_VM=1` (leave VMs up for debugging). Multi-node uses a QEMU socket/mcast
-cluster network — see [IMPROVEMENTS.md](IMPROVEMENTS.md); it's a first cut to
-validate on the runner.
+`MASTERS` (1=single master), `WORKERS` (0=no workers), `MASTER_LB_ENABLED`
+(true), per-role sizing `MASTER_MEM_MB`/`MASTER_CPUS`, `WORKER_MEM_MB`/`WORKER_CPUS`,
+`LB_MEM_MB`/`LB_CPUS` (`VM_MEM_MB`/`VM_CPUS` still work as fallbacks),
+`KEEP_VM=1` (leave VMs up for debugging). The cluster uses a QEMU socket/mcast
+network; `E2E_SLOT` (or `GITHUB_RUN_ID`) isolates the subnet, mcast group, and
+SSH host-ports so multiple runs can share one host — see
+[IMPROVEMENTS.md](IMPROVEMENTS.md).
 
 ### Nested-virt boot reliability
 
