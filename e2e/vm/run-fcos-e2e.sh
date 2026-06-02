@@ -60,7 +60,7 @@ MASTER_CMAC="52:54:00:77:00:0a"
 QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
-QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=off on nested AMD
+QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=split on nested AMD (KVM rejects 'off')
 SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (900s)
 
 # Nested-virt boots can hang at a RANDOM early-init point with no panic — the
@@ -164,9 +164,14 @@ resolve_qemu_cpu() {
     [ -z "$BOOT_RETRIES" ] && { BOOT_RETRIES=1; log "nested AMD-V: enabling $BOOT_RETRIES boot retry for silent early-boot hangs (override with BOOT_RETRIES)"; }
     # The freeze is in the initramfs (pre-Ignition); bake idle=poll onto firstboot.
     [ -z "$INJECT_KARGS" ] && { INJECT_KARGS=1; log "nested AMD-V: will inject first-boot kargs '$FIRSTBOOT_KARGS' into the image (override with INJECT_KARGS=0)"; }
-    # Move the interrupt controllers to QEMU userspace. kernel-irqchip=split still
-    # leaves LAPIC delivery in KVM, which is the broken leg on this nested path.
-    [ -z "$QEMU_IRQCHIP" ] && { QEMU_IRQCHIP=off; log "nested AMD-V: using kernel-irqchip=off (override with QEMU_IRQCHIP=on or split)"; }
+    # Move the IOAPIC/PIC to QEMU userspace. NOTE: kernel-irqchip=off (full
+    # userspace APIC, incl. LAPIC) is REJECTED by KVM on x86 ("KVM does not
+    # support userspace APIC") — KVM requires an in-kernel LAPIC — so it instantly
+    # kills every KVM attempt and is never actually functional. Use `split`, which
+    # IS KVM-valid (userspace IOAPIC, in-kernel LAPIC); combined with -x2apic +
+    # idle=poll + 1 vCPU it's the workable nested-AMD config. If KVM interrupt
+    # delivery is still broken on the host, the stall detector falls back to TCG.
+    [ -z "$QEMU_IRQCHIP" ] && { QEMU_IRQCHIP=split; log "nested AMD-V: using kernel-irqchip=split (KVM rejects 'off'/userspace APIC; override with QEMU_IRQCHIP=on)"; }
   else
     log "QEMU cpu=auto -> host (virt=$virt vendor=${vendor:-unknown})"
   fi
@@ -378,9 +383,17 @@ boot_node_once() {
     # Second NIC on a shared QEMU mcast segment = the cluster network.
     net+=(-netdev "socket,id=n1,mcast=${MCAST}" -device "virtio-net-pci,netdev=n1,mac=${cmac}")
   fi
-  log "booting $name (attempt $n/$total mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} irqchip=${QEMU_IRQCHIP:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
+  # kernel-irqchip=off (userspace APIC) is invalid under KVM on x86 — QEMU exits
+  # immediately with "KVM does not support userspace APIC". Coerce off->split for
+  # KVM here so no code path (auto or explicit) can feed KVM an impossible config.
+  local irq="$QEMU_IRQCHIP"
+  if [ "$QEMU_ACCEL" = kvm ] && [ "$irq" = off ]; then
+    irq=split
+    log "$name: kernel-irqchip=off is rejected by KVM (userspace APIC) — using split"
+  fi
+  log "booting $name (attempt $n/$total mem=${mem}MB cpus=${cpus} machine=${QEMU_MACHINE:-default} irqchip=${irq:-default} accel=${QEMU_ACCEL} cpu=${QEMU_CPU} ssh=:$port${cmac:+ cluster-mac=$cmac})"
   qemu-system-x86_64 \
-    -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}${QEMU_IRQCHIP:+,kernel-irqchip=${QEMU_IRQCHIP}}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
+    -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}${irq:+,kernel-irqchip=${irq}}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
     -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \

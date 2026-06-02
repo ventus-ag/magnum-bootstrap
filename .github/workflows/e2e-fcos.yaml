@@ -34,7 +34,7 @@ on:
         description: QEMU -machine type (blank = qemu default/i440fx; try q35 if early boot hangs)
         default: ""
       qemu_irqchip:
-        description: QEMU kernel-irqchip (blank = auto/off on nested AMD; set 'on' to force in-kernel or 'split' for userspace IOAPIC only)
+        description: QEMU kernel-irqchip (blank = auto/split on nested AMD; 'on' = in-kernel; 'off' is invalid under KVM and auto-coerced to split)
         default: ""
       trigger:
         description: How the reconciler is invoked (direct = systemd unit; agent = real heat-container-agent + mock Heat)
