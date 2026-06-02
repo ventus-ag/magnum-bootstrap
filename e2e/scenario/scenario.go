@@ -50,9 +50,13 @@ type Config struct {
 	APIIP  string // master: API server address -> KUBE_API_PRIVATE/PUBLIC_ADDRESS. In a
 	// multi-master cluster this is the api_lb VIP (same on every master); single-master
 	// defaults to NodeIP.
-	EtcdLBVIP string // master: etcd_lb VIP -> ETCD_LB_VIP. Empty for single-master (the
-	// etcd module then bootstraps a new cluster); set to the etcd_lb VIP for multi-master
-	// so joining masters reach the existing members through the LB.
+	EtcdLBVIP string // master: etcd_lb VIP -> ETCD_LB_VIP. Set to the etcd_lb VIP whenever
+	// the LB is enabled; joining masters reach existing members through it. A first/single
+	// master bootstraps from the static initial-cluster regardless (the LB has no backend yet).
+	InitialCluster string // master: ETCD_INITIAL_CLUSTER -> static etcd member list
+	// ("name0=https://ip0:2380,..."). Empty for a first/single master (the etcd module
+	// then bootstraps a one-node cluster from its own peer URL); set to the full member
+	// list to bootstrap a multi-master cluster all at once without v2 discovery.
 	MasterIP string // worker: KUBE_MASTER_IP (the API server address to join — the api_lb VIP in multi-master)
 	KubeTag  string // e.g. v1.30.5 (kubelet/kubectl URLs are derived from this)
 
@@ -288,6 +292,7 @@ func (c Config) pairs() []KV {
 		put("KUBE_API_PUBLIC_ADDRESS", c.APIIP)
 		put("ETCD_LB_VIP", c.EtcdLBVIP)
 		put("ETCD_DISCOVERY_URL", "")
+		put("ETCD_INITIAL_CLUSTER", c.InitialCluster)
 		put("ETCD_VOLUME", "")
 		put("ETCD_VOLUME_SIZE", "0")
 		put("LEAD_NODE_ROLE_NAME", leadNodeRole(c.KubeTag))
