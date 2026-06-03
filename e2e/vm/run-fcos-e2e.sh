@@ -340,7 +340,11 @@ build_binaries() {
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-magnum"  ./e2e/cmd/mock-magnum )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/scenario-gen" ./e2e/cmd/scenario-gen )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-lb" ./e2e/cmd/mock-lb )
-  [ "$TRIGGER" = agent ] && ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-heat" ./e2e/cmd/mock-heat )
+  # if-block, not `[ ] && (...)`: as the function's last statement a false test
+  # would make build_binaries return non-zero and trip `set -e` in main().
+  if [ "$TRIGGER" = agent ]; then
+    ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-heat" ./e2e/cmd/mock-heat )
+  fi
 }
 
 generate_keys() {
