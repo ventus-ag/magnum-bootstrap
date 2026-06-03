@@ -161,44 +161,48 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
 		}
 		changes = append(changes, dl.Changes...)
-		// On Fedora CoreOS /usr/local and /opt are symlinks into /var
-		// (/usr/local -> ../var/usrlocal, /opt -> ../var/opt). Ensure the symlink
-		// targets exist before extracting so tar writes THROUGH the symlinks into
-		// their targets instead of replacing them: replacing the /usr/local symlink
-		// with a real directory fails with EXDEV ("Invalid cross-device link") on a
-		// composefs FCoS image where /usr is a read-only overlay. --keep-directory-
-		// symlink only preserves a symlink whose target already exists; a dangling
-		// symlink is replaced regardless, so the targets must be created first. This
-		// makes the install version-independent (composefs or not), with no node
-		// pre-provisioning required.
+		// Fedora CoreOS makes /usr/local and /opt symlinks into the writable /var
+		// (/usr/local -> ../var/usrlocal, /opt -> ../var/opt) while /usr itself is a
+		// read-only composefs overlay. tar cannot create the cri bundle's usr/local/*
+		// or opt/* members through those symlinks — composefs rejects the directory
+		// create with EXDEV ("Invalid cross-device link"), even with
+		// --keep-directory-symlink and a pre-created target. So never extract through
+		// /usr: extract straight into the writable /var target (containerd 2.x) or
+		// unpack to a scratch dir and copy each tree into its real writable location
+		// (containerd 1.x). /var/usrlocal IS /usr/local and /var/opt IS /opt, so the
+		// installed files appear at the expected paths; /etc is writable directly.
+		// This installs on any FCoS image (composefs or not) with no pre-provisioning.
 		usrLocalTarget, err := (hostresource.DirectorySpec{Path: "/var/usrlocal", Mode: 0o755}).Apply(executor)
 		if err != nil {
-			return nil, false, fmt.Errorf("ensure containerd extract target /var/usrlocal: %w", err)
+			return nil, false, fmt.Errorf("ensure containerd install target /var/usrlocal: %w", err)
 		}
 		changes = append(changes, usrLocalTarget.Changes...)
 
 		if useV2Layout {
-			// containerd 2.x: tarball has a bin/ directory; extract to /usr/local
-			// (resolves through the symlink into /var/usrlocal).
+			// containerd 2.x: tarball has a bin/ directory; extract straight into
+			// /var/usrlocal (== /usr/local), bypassing the read-only /usr overlay.
 			if err := executor.Run("tar", "xzf", localPath,
-				"-C", "/usr/local",
+				"-C", "/var/usrlocal",
 				"--no-same-owner", "--touch", "--no-same-permissions",
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 			}
 		} else {
-			// containerd 1.x cri-containerd-cni bundle: extract to /. The bundle
-			// carries bare "usr/local/" and "opt/" directory members, so
-			// --keep-directory-symlink is required to extract through the FCoS
-			// symlinks rather than replace them.
-			optTarget, err := (hostresource.DirectorySpec{Path: "/var/opt", Mode: 0o755}).Apply(executor)
-			if err != nil {
-				return nil, false, fmt.Errorf("ensure containerd extract target /var/opt: %w", err)
+			// containerd 1.x cri-containerd-cni bundle: unpack to a scratch dir on
+			// writable storage, then copy each tree to its real location. The bundle's
+			// kept members are binaries under usr/local/{bin,sbin}, the systemd unit
+			// + crictl.yaml under etc/, and the (mostly-excluded) opt/containerd tree.
+			scratch := "/srv/magnum/containerd-bundle"
+			if err := executor.Run("rm", "-rf", scratch); err != nil {
+				return nil, false, fmt.Errorf("clean containerd scratch dir: %w", err)
 			}
-			changes = append(changes, optTarget.Changes...)
+			scratchDir, err := (hostresource.DirectorySpec{Path: scratch, Mode: 0o755}).Apply(executor)
+			if err != nil {
+				return nil, false, fmt.Errorf("create containerd scratch dir: %w", err)
+			}
+			changes = append(changes, scratchDir.Changes...)
 			if err := executor.Run("tar", "xzf", localPath,
-				"-C", "/",
-				"--keep-directory-symlink",
+				"-C", scratch,
 				"--no-same-owner", "--touch", "--no-same-permissions",
 				"--exclude=etc/cni/net.d",
 				"--exclude=etc/containerd/config.toml",
@@ -207,6 +211,28 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 				"--exclude=opt/containerd/cluster/gce",
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
+			}
+			// dst /var/usrlocal == /usr/local, /var/opt == /opt; /etc is writable.
+			placements := []struct{ tree, dst string }{
+				{"usr/local", "/var/usrlocal"},
+				{"opt", "/var/opt"},
+				{"etc", "/etc"},
+			}
+			for _, p := range placements {
+				if _, statErr := os.Stat(scratch + "/" + p.tree); statErr != nil {
+					continue // tree absent after excludes
+				}
+				dstDir, err := (hostresource.DirectorySpec{Path: p.dst, Mode: 0o755}).Apply(executor)
+				if err != nil {
+					return nil, false, fmt.Errorf("ensure containerd install dir %s: %w", p.dst, err)
+				}
+				changes = append(changes, dstDir.Changes...)
+				if err := executor.Run("cp", "-a", scratch+"/"+p.tree+"/.", p.dst); err != nil {
+					return nil, false, fmt.Errorf("install containerd files %s -> %s: %w", p.tree, p.dst, err)
+				}
+			}
+			if err := executor.Run("rm", "-rf", scratch); err != nil {
+				return nil, false, fmt.Errorf("remove containerd scratch dir: %w", err)
 			}
 		}
 		configChanged = true
