@@ -13,6 +13,12 @@ import (
 // If the exact minor version is not in the map:
 //   - versions above the highest key return the highest key's value
 //   - versions below the lowest key return the lowest key's value
+//   - versions between two keys return the nearest lower key's value (floor)
+//
+// The floor rule matters for sparse maps (e.g. containerd, which only pins
+// 1.31/1.32/1.35): k8s 1.33 must resolve to the 1.32 entry, not silently fall
+// back to the lowest key — the previous behavior gave 1.33/1.34 the 1.7.x (v1
+// layout) containerd instead of the intended 2.x.
 func LookupByKubeVersion(versionMap map[string]string, kubeVersion string) string {
 	v := strings.TrimPrefix(kubeVersion, "v")
 	parts := strings.SplitN(v, ".", 3)
@@ -52,7 +58,19 @@ func LookupByKubeVersion(versionMap map[string]string, kubeVersion string) strin
 	if requested > entries[len(entries)-1].num {
 		return versionMap[entries[len(entries)-1].key]
 	}
-	return versionMap[entries[0].key]
+	// Nearest key <= requested (floor). Entries are sorted ascending, so walk up
+	// keeping the highest key that does not exceed the requested minor. A version
+	// below the lowest key never advances past entries[0], so it clamps up to the
+	// lowest entry as documented.
+	chosen := entries[0].key
+	for _, e := range entries {
+		if e.num <= requested {
+			chosen = e.key
+		} else {
+			break
+		}
+	}
+	return versionMap[chosen]
 }
 
 // boundaryValue returns the highest (upper=true) or lowest (upper=false)
