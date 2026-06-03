@@ -107,10 +107,32 @@ cache_binary() {
   ( cd "$E2E_DIR" && sha256sum bootstrap | awk '{print $1}' > bootstrap.sha256 )
 }
 
+# enable_host_provider — when the magnumhost Pulumi plugin was delivered
+# (HOST_PROVIDER_PATH), point the reconcile systemd units at it via a drop-in so
+# the launcher-spawned reconciler runs the real provider instead of the legacy
+# hostresource bridge. The reconciler reads MAGNUM_HOST_PROVIDER_PATH, adds its
+# dir to PATH, and pulumi loads the ambient pulumi-resource-magnumhost plugin.
+enable_host_provider() {
+  [ -n "${HOST_PROVIDER_PATH:-}" ] && [ -f "$HOST_PROVIDER_PATH" ] || return 0
+  chmod +x "$HOST_PROVIDER_PATH"
+  log "enabling magnumhost provider for reconcile: $HOST_PROVIDER_PATH"
+  local u
+  for u in magnum-reconcile magnum-reconcile-periodic; do
+    mkdir -p "/etc/systemd/system/${u}.service.d"
+    cat > "/etc/systemd/system/${u}.service.d/host-provider.conf" <<EOF
+[Service]
+Environment=MAGNUM_USE_HOST_PROVIDER=true
+Environment=MAGNUM_HOST_PROVIDER_PATH=${HOST_PROVIDER_PATH}
+EOF
+  done
+  systemctl daemon-reload 2>/dev/null || true
+}
+
 cmd_setup() {
   # Persist the wait multiplier so every later guest-run invocation (assert-*,
   # heat-deploy) scales its timeouts identically.
   echo "${WAIT_SCALE:-1}" > "$E2E_DIR/wait-scale"
+  enable_host_provider
   setup_self_ssh
   # Workers set START_MOCK=0 — only the master runs the mock Magnum, which
   # workers reach over the cluster network at MOCK_LISTEN.

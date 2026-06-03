@@ -1,12 +1,68 @@
 name: CI
 
+# One pipeline for everything: a single `build` job compiles + unit-tests the
+# reconciler and publishes the binary as an artifact; every heavier job depends
+# on it and reuses that one binary instead of rebuilding. Downstream jobs run in
+# parallel:
+#
+#   build  ──┬─▶ e2e-fcos              (single-master FCoS VM, every PR)
+#            ├─▶ e2e-fcos-multimaster  (multi-master + LBs; dispatch/label/nightly)
+#            └─▶ e2e-openstack         (real OpenStack; dispatch/label/nightly)
+#   lint-shell                          (shellcheck, parallel, no deps)
+#
+# The FCoS VM tiers run on the self-hosted `ventus` runner; e2e-openstack needs
+# OpenStack credentials. See e2e/README.md.
+
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+    # `labeled` lets the opt-in heavy tiers (multimaster / openstack) start when
+    # their label is added without a new push.
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      kube_tag:
+        description: Initial Kubernetes version
+        default: v1.30.5
+      kube_tag_upgrade:
+        description: Upgrade target version
+        default: v1.31.4
+      scenarios:
+        description: Space-separated scenarios
+        default: create ca-rotate upgrade
+      magnum_ref:
+        description: Branch/ref of the forked driver repo (ventus-ag/magnum)
+        default: victoria-ca-rotation
+      run_multimaster:
+        description: Also run the multi-master FCoS tier
+        type: boolean
+        default: false
+      run_openstack:
+        description: Also run the real-OpenStack tier (provisions billed cloud resources)
+        type: boolean
+        default: false
+      masters:
+        description: Multi-master node count (multimaster tier)
+        default: "3"
+  schedule:
+    - cron: "0 2 * * *" # nightly 02:00 UTC
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same PR/branch so VM jobs don't pile up.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # build — the single source of the reconciler binary. Unit tests + lint gate
+  # here, then dist/bootstrap is uploaded so every e2e job downloads it instead
+  # of recompiling the ~105MB binary.
+  # ---------------------------------------------------------------------------
   build:
     name: Build & Test
     runs-on: ubuntu-latest
@@ -24,7 +80,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
-          ref: ${{ vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
 
@@ -57,13 +113,31 @@ jobs:
           else
             echo "::warning::driver checkout unavailable — heat-params contract guard will skip"
           fi
-          go test -short ./...
+          go test ./...
 
-      - name: Build release binaries
+      - name: Build release binaries (reconciler + magnumhost provider)
         run: |
+          # `make build` builds BOTH dist/bootstrap and the Pulumi host provider
+          # plugin dist/pulumi-resource-magnumhost. Both are uploaded so the e2e
+          # jobs reuse them (provider path is opt-in via USE_HOST_PROVIDER).
           make build VERSION=ci REPOSITORY=${{ github.repository }}
           ls -lh dist/
+          test -x dist/bootstrap
+          test -x dist/pulumi-resource-magnumhost
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: |
+            dist/bootstrap
+            dist/pulumi-resource-magnumhost
+          retention-days: 3
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # lint-shell — independent of build, runs in parallel.
+  # ---------------------------------------------------------------------------
   lint-shell:
     name: Shellcheck e2e scripts
     runs-on: ubuntu-latest
@@ -74,3 +148,256 @@ jobs:
         # -S error only: fail on real bugs, not pre-existing style warnings, so
         # the gate is green on introduction. Tighten to -S warning later.
         run: shellcheck -S error $(git ls-files 'e2e/**/*.sh')
+
+  # ---------------------------------------------------------------------------
+  # resolve — latest stable k8s, shared by the e2e matrices.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve latest k8s
+    needs: build
+    runs-on: self-hosted
+    if: ${{ github.event.action != 'labeled' || contains(github.event.pull_request.labels.*.name, 'e2e-multimaster') || contains(github.event.pull_request.labels.*.name, 'e2e-openstack') }}
+    outputs:
+      latest: ${{ steps.k.outputs.latest }}
+    steps:
+      - id: k
+        run: echo "latest=$(curl -fsSL https://dl.k8s.io/release/stable.txt)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # e2e-fcos — single-master FCoS VM tier. Every PR (open/sync/reopen), dispatch
+  # and nightly. Skipped on plain `push` and on bare `labeled` events (those are
+  # for the opt-in tiers below). Reuses the build artifact.
+  # ---------------------------------------------------------------------------
+  e2e-fcos:
+    name: e2e-fcos (${{ matrix.name }})
+    needs: [build, resolve]
+    runs-on: self-hosted
+    if: ${{ github.event_name != 'push' && github.event.action != 'labeled' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pinned
+            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
+            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
+            use_host_provider: "false"
+          - name: latest
+            kube_tag: v1.31.4
+            kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
+            use_host_provider: "false"
+          # Exercises the real magnumhost Pulumi provider plugin (built by `build`)
+          # instead of the legacy hostresource bridge. create-only to bound cost.
+          - name: provider
+            kube_tag: v1.30.5
+            kube_tag_upgrade: v1.31.4
+            scenarios: create
+            use_host_provider: "true"
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Checkout forked driver (ventus-ag/magnum)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          path: magnum
+          token: ${{ secrets.RW_PAT_TOKEN }}
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: ${{ runner.temp }}/prebuilt
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: |
+          sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh
+          sudo chmod 0666 /dev/kvm || true
+
+      - name: Runner preflight
+        run: ./e2e/vm/runner-preflight.sh
+
+      - name: Run Fedora CoreOS e2e (${{ matrix.name }})
+        env:
+          VICTORIA_DIR: ${{ github.workspace }}/magnum
+          PREBUILT_BOOTSTRAP: ${{ runner.temp }}/prebuilt/bootstrap
+          PREBUILT_HOST_PROVIDER: ${{ runner.temp }}/prebuilt/pulumi-resource-magnumhost
+          USE_HOST_PROVIDER: ${{ matrix.use_host_provider }}
+          KUBE_TAG: ${{ matrix.kube_tag }}
+          KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
+          SCENARIOS: ${{ matrix.scenarios }}
+          WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
+        run: |
+          chmod +x "$PREBUILT_BOOTSTRAP" "$PREBUILT_HOST_PROVIDER" || true
+          ./e2e/vm/run-fcos-e2e.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcos-e2e-${{ matrix.name }}-diag
+          path: |
+            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/console.*.log
+            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/heat-params.*
+            ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}/ignition.*.json
+          if-no-files-found: ignore
+
+      - name: Clean up VMs and workdir
+        if: always()
+        run: |
+          WD="${{ runner.temp }}/fcos-e2e-${{ matrix.name }}"
+          pkill -f "$WD" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "$WD" 2>/dev/null || true
+          rm -rf "$WD" || true
+
+  # ---------------------------------------------------------------------------
+  # e2e-fcos-multimaster — N masters + the two L4 LBs. Opt-in: dispatch with
+  # run_multimaster, the `e2e-multimaster` PR label, or nightly. Reuses build.
+  # ---------------------------------------------------------------------------
+  e2e-fcos-multimaster:
+    name: e2e-fcos-multimaster
+    needs: [build, resolve]
+    runs-on: self-hosted
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_multimaster == 'true') ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-multimaster'))
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Checkout forked driver (ventus-ag/magnum)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          path: magnum
+          token: ${{ secrets.RW_PAT_TOKEN }}
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: ${{ runner.temp }}/prebuilt
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: |
+          sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh
+          sudo chmod 0666 /dev/kvm || true
+
+      - name: Runner preflight
+        run: ./e2e/vm/runner-preflight.sh
+
+      - name: Run multi-master Fedora CoreOS e2e
+        env:
+          VICTORIA_DIR: ${{ github.workspace }}/magnum
+          PREBUILT_BOOTSTRAP: ${{ runner.temp }}/prebuilt/bootstrap
+          MASTERS: ${{ github.event.inputs.masters || '3' }}
+          WORKERS: "0"
+          SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate' }}
+          KUBE_TAG: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
+          KUBE_TAG_UPGRADE: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+          # A stable per-run slot so this job's cluster network/ports never collide
+          # with a concurrent single-master e2e on the same host.
+          E2E_SLOT: "20"
+          WORKDIR: ${{ runner.temp }}/fcos-e2e-mm
+        run: |
+          chmod +x "$PREBUILT_BOOTSTRAP"
+          ./e2e/vm/run-fcos-e2e.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcos-e2e-mm-diag
+          path: |
+            ${{ runner.temp }}/fcos-e2e-mm/console.*.log
+            ${{ runner.temp }}/fcos-e2e-mm/heat-params.*
+            ${{ runner.temp }}/fcos-e2e-mm/ignition.*.json
+          if-no-files-found: ignore
+
+      - name: Clean up VMs and workdir
+        if: always()
+        run: |
+          WD="${{ runner.temp }}/fcos-e2e-mm"
+          pkill -f "$WD" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "$WD" 2>/dev/null || true
+          rm -rf "$WD" || true
+
+  # ---------------------------------------------------------------------------
+  # e2e-openstack — real Magnum cluster. Opt-in: dispatch with run_openstack,
+  # the `e2e-openstack` PR label, or nightly. Provisions billed cloud resources.
+  # The node binary is delivered via RECONCILER_BINARY_URL (not the artifact).
+  # ---------------------------------------------------------------------------
+  e2e-openstack:
+    name: e2e-openstack (${{ matrix.name }})
+    needs: [build, resolve]
+    runs-on: self-hosted
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_openstack == 'true') ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pinned
+            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
+            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+          - name: latest
+            kube_tag: v1.31.4
+            kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh --no-vm --openstack
+
+      - name: Write clouds.yaml
+        run: |
+          mkdir -p ~/.config/openstack
+          printf '%s' "${{ secrets.OS_CLOUDS_YAML }}" > ~/.config/openstack/clouds.yaml
+          chmod 600 ~/.config/openstack/clouds.yaml
+
+      - name: Runner preflight
+        env:
+          OS_CLOUD: e2e
+        run: ./e2e/vm/runner-preflight.sh --openstack
+
+      - name: Run OpenStack Magnum e2e (${{ matrix.name }})
+        env:
+          OS_CLOUD: e2e
+          CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
+          KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
+          CLUSTER_NAME: recon-e2e-${{ matrix.name }}-${{ github.run_id }}
+          KUBE_TAG: ${{ matrix.kube_tag }}
+          KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
+          RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
+          KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster || '0' }}
+          WORKDIR: ${{ runner.temp }}/magnum-e2e-${{ matrix.name }}
+        run: ./e2e/openstack/run-magnum-e2e.sh
+
+      - name: Tear down cluster + workdir
+        if: always()
+        env:
+          OS_CLOUD: e2e
+        run: |
+          CN="recon-e2e-${{ matrix.name }}-${{ github.run_id }}"
+          if [ "${{ github.event.inputs.keep_cluster || '0' }}" = "1" ]; then
+            echo "keep_cluster=1 — leaving $CN in place"
+          elif openstack coe cluster show "$CN" >/dev/null 2>&1; then
+            echo "deleting leftover cluster $CN"
+            openstack coe cluster delete "$CN" || true
+          else
+            echo "no leftover cluster $CN"
+          fi
+          rm -rf "${{ runner.temp }}/magnum-e2e-${{ matrix.name }}" || true

@@ -307,13 +307,40 @@ preflight() {
 }
 
 build_binaries() {
-  log "building reconciler + e2e helpers"
-  ( cd "$REPO_ROOT" && make build >/dev/null )
+  # The reconciler binary can be supplied prebuilt (PREBUILT_BOOTSTRAP) so a CI
+  # `build` job compiles it once and every e2e job reuses the same artifact
+  # instead of rebuilding the ~105MB binary per job. The e2e helpers are tiny and
+  # always built from the local tree.
+  if [ -n "${PREBUILT_BOOTSTRAP:-}" ]; then
+    [ -x "$PREBUILT_BOOTSTRAP" ] || die "PREBUILT_BOOTSTRAP=$PREBUILT_BOOTSTRAP not found or not executable"
+    log "using prebuilt reconciler binary: $PREBUILT_BOOTSTRAP"
+    cp "$PREBUILT_BOOTSTRAP" "$WORKDIR/bootstrap"
+  else
+    log "building reconciler"
+    ( cd "$REPO_ROOT" && make build >/dev/null )
+    cp "$REPO_ROOT/dist/bootstrap" "$WORKDIR/bootstrap"
+  fi
+  # Optional: the magnumhost Pulumi provider plugin. The reconciler normally runs
+  # the legacy hostresource bridge (prod default); USE_HOST_PROVIDER=true delivers
+  # the plugin into the VM and points the reconcile at it (MAGNUM_HOST_PROVIDER_PATH)
+  # so the real provider CRUD/Read path is exercised. Reuses PREBUILT_HOST_PROVIDER
+  # (CI artifact) or dist/ (make build also builds it) or builds it from source.
+  if [ "${USE_HOST_PROVIDER:-false}" = true ]; then
+    if [ -n "${PREBUILT_HOST_PROVIDER:-}" ]; then
+      [ -x "$PREBUILT_HOST_PROVIDER" ] || die "PREBUILT_HOST_PROVIDER=$PREBUILT_HOST_PROVIDER not found or not executable"
+      cp "$PREBUILT_HOST_PROVIDER" "$WORKDIR/pulumi-resource-magnumhost"
+    elif [ -x "$REPO_ROOT/dist/pulumi-resource-magnumhost" ]; then
+      cp "$REPO_ROOT/dist/pulumi-resource-magnumhost" "$WORKDIR/pulumi-resource-magnumhost"
+    else
+      ( cd "$REPO_ROOT" && go build -o "$WORKDIR/pulumi-resource-magnumhost" ./cmd/pulumi-resource-magnumhost )
+    fi
+    log "host provider plugin enabled: $WORKDIR/pulumi-resource-magnumhost"
+  fi
+  log "building e2e helpers"
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-magnum"  ./e2e/cmd/mock-magnum )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/scenario-gen" ./e2e/cmd/scenario-gen )
   ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-lb" ./e2e/cmd/mock-lb )
   [ "$TRIGGER" = agent ] && ( cd "$REPO_ROOT" && go build -o "$WORKDIR/mock-heat" ./e2e/cmd/mock-heat )
-  cp "$REPO_ROOT/dist/bootstrap" "$WORKDIR/bootstrap"
 }
 
 generate_keys() {
@@ -562,9 +589,14 @@ provision_node() {
   gssh "$port" "mkdir -p $GUEST_E2E_DIR /opt/victoria-bootstrap"
   local files=("$WORKDIR/bootstrap" "$WORKDIR/mock-magnum" "$WORKDIR/ca.crt" "$WORKDIR/ca.key" "$REPO_ROOT/e2e/vm/guest-run.sh")
   [ "$TRIGGER" = agent ] && files+=("$WORKDIR/mock-heat")
+  local host_provider_env=""
+  if [ "${USE_HOST_PROVIDER:-false}" = true ]; then
+    files+=("$WORKDIR/pulumi-resource-magnumhost")
+    host_provider_env="HOST_PROVIDER_PATH=$GUEST_E2E_DIR/pulumi-resource-magnumhost"
+  fi
   gscp "$port" "${files[@]}" root@127.0.0.1:"$GUEST_E2E_DIR/" >/dev/null
   gssh "$port" "chmod +x $GUEST_E2E_DIR/guest-run.sh"
-  gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 WAIT_SCALE=${WAIT_SCALE:-1} $GUEST_E2E_DIR/guest-run.sh setup"
+  gssh "$port" "START_MOCK=${start_mock} MOCK_LISTEN=$(mock_host):9511 WAIT_SCALE=${WAIT_SCALE:-1} ${host_provider_env} $GUEST_E2E_DIR/guest-run.sh setup"
   if [ "$TRIGGER" = agent ]; then
     # The real bootstrap scripts are delivered inside the deployment metadata,
     # not scp'd; the agent installs the launcher/units itself when it runs them.
