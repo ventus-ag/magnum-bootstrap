@@ -93,6 +93,15 @@ storage:
           method=ignore
 systemd:
   units:
+    # Disable Fedora CoreOS auto-updates on every node. zincati otherwise stages an
+    # OSTree update and reboots the node to finalize it (ostree-finalize-staged),
+    # which mid-test resets SSH/etcd and aborts the run — it bit start_lbs when the
+    # reconciler-less lb node rebooted. Production already disables this: the
+    # reconciler's zincati module honors OS_AUTOUPGRADE_ENABLED=false. Masking in
+    # Ignition kills it from first boot (before zincati can run), and covers the lb
+    # node and the master/worker boot→first-reconcile window the module can't.
+    - name: zincati.service
+      mask: true
     # Force SELinux permissive at runtime before the reconciler runs, matching a
     # production Magnum node (selinux_mode "disabled"). The /etc/selinux/config
     # written above takes effect on the next boot; this guarantees the FIRST boot

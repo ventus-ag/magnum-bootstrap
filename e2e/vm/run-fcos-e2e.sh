@@ -27,7 +27,11 @@
 # Multi master (MASTERS>=2): masters join sequentially through the etcd VIP
 # (member add) and serve behind the api VIP; CA rotation is applied to all
 # masters concurrently so the dual-CA barrier's per-master restart serialization
-# is exercised. TCG-slow, so >1 master is opt-in (MASTERS stays 1 by default).
+# is exercised. The `scale-masters` scenario drives the explicit horizontal
+# scale-up: master-0 forms a 1-member etcd and goes Ready, then each remaining
+# master joins the running cluster (op=create, as Magnum CREATEs added masters),
+# with the etcd member count asserted to climb by one per node. TCG-slow, so >1
+# master is opt-in (MASTERS stays 1 by default).
 # NOTE: the inter-VM + LB path is validated on the runner.
 #
 # Requires: qemu-system-x86_64 (KVM), qemu-img, jq, xz, curl, butane|podman|docker,
@@ -37,7 +41,8 @@
 #   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
 #   FCOS_VERSION (pin an older, pre-composefs build, e.g. 38.20231027.3.2 — old
 #                 FCoS + v1 containerd layout, the production node layout)
-#   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade)
+#   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade;
+#                             also: scale-masters [1->MASTERS, needs MASTERS>=2])
 #   WORKERS 0          MASTERS 1            MASTER_LB_ENABLED true
 #   MASTER_MEM_MB 2048 MASTER_CPUS 1        WORKER_MEM_MB 2048   WORKER_CPUS 1
 #   LB_MEM_MB 768      LB_CPUS 1
@@ -136,6 +141,8 @@ GUEST_E2E_DIR=/opt/e2e
 KEEP_VM="${KEEP_VM:-0}"
 ROT_SEQ=0     # monotonic counter so repeated ca-rotate scenarios get unique ids
 LBS_STARTED=0 # set once the control-plane LBs are up on master-0 (multi-master)
+RUN_START="$(date +%s)"        # wall-clock start, for the end-of-run summary
+declare -a SCENARIO_RESULTS=() # "<name>\t<status>\t<detail>" per scenario, for the summary
 
 # Trigger mode — how the reconciler is invoked on each node:
 #   direct (default) - place heat-params + run the systemd unit directly (fast).
@@ -828,6 +835,92 @@ scenario_upgrade() {
 }
 _upgrade_worker() { apply_worker "$1" upgrade "$KUBE_TAG_UPGRADE"; assert_worker_joined "$1"; }
 
+# scenario_scale_masters — grow the control plane from 1 to MASTERS one node at a
+# time, asserting the etcd membership climbs by exactly one per added master.
+#
+# This is the explicit horizontal scale-up path, distinct from scenario_create's
+# fixed-size master batch: master-0 first bootstraps a *single*-member etcd and
+# goes fully Ready, *then* each remaining master is brought in and must join the
+# already-running cluster through the etcd LB. The per-step member-count assert
+# proves the join actually added a member, not just that the final count happens
+# to be right.
+#
+# Each added master joins with op=create, not resize — faithful to Magnum, where a
+# master-count increase CREATEs brand-new master servers (a fresh node does its
+# first-time bring-up; IS_RESIZE drives the *existing* nodes' reconfigure). It also
+# matters operationally: under create the stop/start-services phases skip the
+# drain→cordon→uncordon cycle, so the new master's apiserver converges promptly;
+# under resize that disruptive cycle (meaningless for a node with no workloads yet)
+# delays apiserver past the health window, tripping a full-reconcile retry that
+# then restarts the fresh etcd member and wedges the 2-member quorum.
+#
+# All MASTERS VMs are already booted (boot_all); the not-yet-scaled masters simply
+# sit idle until their join apply. Requires MASTERS>=2.
+scenario_scale_masters() {
+  multimaster || die "scale-masters needs MASTERS>=2 (got ${MASTERS:-1})"
+  local mp ep n=1 i=1
+  mp="$(ssh_port master)"; ep="https://$(master_cip 0):2379"
+  log "=== SCENARIO: scale-masters (1 -> ${MASTERS} masters) ==="
+  # Seed master alone: a 1-member etcd, fully Ready before anything joins.
+  apply_master create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-etcd-members 1 $ep"
+  log "seed master-0 up (etcd: 1 member)"
+  while [ "$i" -lt "${MASTERS:-1}" ]; do
+    n=$((n + 1))
+    log "--- scaling out master-$i (join, target $n etcd members) ---"
+    apply_master_idx "$i" create "$KUBE_TAG"
+    gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-ready e2e-master-$i"
+    gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-etcd-members $n $ep"
+    log "master-$i joined (etcd: $n members)"
+    i=$((i + 1))
+  done
+  log "control plane scaled 1 -> ${MASTERS}; etcd quorum = ${MASTERS} members ✅"
+  for_each_worker _create_worker
+}
+
+# record_scenario <name> <status> [detail] — append one row to the run summary.
+record_scenario() { SCENARIO_RESULTS+=("$1"$'\t'"$2"$'\t'"${3:-}"); }
+
+# print_summary — end-of-run report: what tier ran, per-scenario verdicts, and the
+# live cluster state, so a green run shows *what* converged, not just that asserts
+# passed. Also emitted as GitHub-flavoured markdown to $GITHUB_STEP_SUMMARY when
+# running under Actions, so the run's summary page carries the same description.
+print_summary() {
+  local elapsed=$(( $(date +%s) - RUN_START )) mm ss row name status detail
+  mm=$((elapsed / 60)); ss=$((elapsed % 60))
+  local tier="single-master"
+  multimaster && tier="multi-master (${MASTERS} masters)"
+  [ "${WORKERS:-0}" -ge 1 ] && tier="${tier} + ${WORKERS} worker(s)"
+  log "================ E2E SUMMARY ================"
+  log "tier:      ${tier}"
+  log "trigger:   ${TRIGGER}   accel: ${QEMU_ACCEL}   k8s: ${KUBE_TAG} -> ${KUBE_TAG_UPGRADE}"
+  log "scenarios: ${SCENARIOS}"
+  log "duration:  ${mm}m${ss}s"
+  log "--- scenario results ---"
+  for row in "${SCENARIO_RESULTS[@]+"${SCENARIO_RESULTS[@]}"}"; do
+    IFS=$'\t' read -r name status detail <<<"$row"
+    log "  ${status}  ${name}${detail:+  — ${detail}}"
+  done
+  log "============================================="
+
+  # GitHub Actions step summary (markdown) — mirrors the console summary.
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo "## FCoS e2e — ${tier}"
+      echo
+      echo "**trigger** \`${TRIGGER}\` · **accel** \`${QEMU_ACCEL}\` · **k8s** \`${KUBE_TAG}\` → \`${KUBE_TAG_UPGRADE}\` · **duration** ${mm}m${ss}s"
+      echo
+      echo "| scenario | result | detail |"
+      echo "| --- | --- | --- |"
+      for row in "${SCENARIO_RESULTS[@]+"${SCENARIO_RESULTS[@]}"}"; do
+        IFS=$'\t' read -r name status detail <<<"$row"
+        echo "| ${name} | ${status} | ${detail:-} |"
+      done
+    } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+  fi
+}
+
 # --- main ------------------------------------------------------------------
 boot_all() {
   if clustered; then
@@ -880,10 +973,13 @@ main() {
   boot_all
   provision_all
   for s in $SCENARIOS; do
+    # A scenario either converges or `die`s (set -e aborts the run), so reaching
+    # the record_scenario line means it passed; detail is a short human note.
     case "$s" in
-      create)    scenario_create ;;
-      ca-rotate) scenario_ca_rotate ;;
-      upgrade)   scenario_upgrade ;;
+      create)        scenario_create;        record_scenario "$s" PASS "${MASTERS} master(s), ${WORKERS} worker(s), k8s ${KUBE_TAG}" ;;
+      scale-masters) scenario_scale_masters;  record_scenario "$s" PASS "control plane 1 -> ${MASTERS}, etcd ${MASTERS} members" ;;
+      ca-rotate)     scenario_ca_rotate;      record_scenario "$s" PASS "API server leaf cert re-keyed" ;;
+      upgrade)       scenario_upgrade;        record_scenario "$s" PASS "kubelet ${KUBE_TAG} -> ${KUBE_TAG_UPGRADE}" ;;
       *) die "unknown scenario: $s" ;;
     esac
   done
@@ -891,6 +987,7 @@ main() {
   # makes visible what came up, not just that the asserts passed.
   log "=== final cluster state ==="
   gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" || true
+  print_summary
   log "ALL SCENARIOS PASSED ✅"
 }
 

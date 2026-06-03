@@ -29,7 +29,7 @@ on:
         description: Upgrade target version
         default: v1.31.4
       scenarios:
-        description: Space-separated scenarios
+        description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade)"
         default: create ca-rotate upgrade
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
@@ -300,7 +300,11 @@ jobs:
           PREBUILT_BOOTSTRAP: ${{ runner.temp }}/prebuilt/bootstrap
           MASTERS: ${{ github.event.inputs.masters || '3' }}
           WORKERS: "0"
-          SCENARIOS: ${{ github.event.inputs.scenarios || 'create ca-rotate' }}
+          # scale-masters seeds master-0 (1-member etcd) then grows the control
+          # plane 1 -> MASTERS one node at a time (each new master joins the
+          # running cluster), asserting the etcd member count climbs each step;
+          # ca-rotate then exercises the dual-CA barrier across the full batch.
+          SCENARIOS: ${{ github.event.inputs.scenarios || 'scale-masters ca-rotate' }}
           KUBE_TAG: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
           KUBE_TAG_UPGRADE: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
           # A stable per-run slot so this job's cluster network/ports never collide

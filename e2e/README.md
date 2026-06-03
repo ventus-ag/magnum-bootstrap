@@ -73,6 +73,11 @@ VICTORIA_DIR=/path/to/magnum WORKERS=2 ./e2e/vm/run-fcos-e2e.sh
 # the dual-CA rotation barrier across masters)
 VICTORIA_DIR=/path/to/magnum MASTERS=3 SCENARIOS="create ca-rotate" ./e2e/vm/run-fcos-e2e.sh
 
+# horizontal scale-up: seed master-0 (1-member etcd) then grow the control plane
+# 1 -> MASTERS one node at a time (each new master joins the running cluster),
+# asserting the etcd member count climbs by one per added master
+VICTORIA_DIR=/path/to/magnum MASTERS=3 SCENARIOS="scale-masters ca-rotate" ./e2e/vm/run-fcos-e2e.sh
+
 # direct no-LB path (= Heat no_master_lb): single master, user-mode net, no lb VM
 VICTORIA_DIR=/path/to/magnum MASTER_LB_ENABLED=false ./e2e/vm/run-fcos-e2e.sh
 ```
@@ -86,7 +91,14 @@ version changed; `create` asserts idempotency = **zero** host changes on re-run.
 Multi-master adds: each extra master joins the existing etcd through the etcd VIP
 and registers Ready; `ca-rotate` is applied to all masters **concurrently** so
 the dual-CA barrier's per-master restart Lease is exercised; `assert-etcd-members`
-checks the final member count.
+checks the final member count. `scale-masters` is the explicit horizontal
+scale-up (`MASTERS>=2`): master-0 first forms a **single**-member etcd and goes
+Ready, then each remaining master joins the running cluster through the etcd LB
+(op=create, mirroring Magnum, which CREATEs added master servers), with the member
+count asserted to climb by exactly one per node (1 → 2 → … → MASTERS).
+Every run ends with an **E2E SUMMARY** block — tier, trigger, per-scenario
+verdicts, duration, and the live cluster state (`kubectl get nodes/pods`, helm
+releases) — also written to `$GITHUB_STEP_SUMMARY` under Actions.
 
 ### Load balancers (mirrors Magnum's two Octavia LBs)
 
