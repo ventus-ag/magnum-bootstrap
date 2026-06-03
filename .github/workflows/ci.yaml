@@ -42,6 +42,10 @@ on:
         description: Also run the real-OpenStack tier (provisions billed cloud resources)
         type: boolean
         default: false
+      use_host_provider:
+        description: Run e2e-fcos against the real magnumhost Pulumi provider (instead of the legacy bridge)
+        type: boolean
+        default: false
       masters:
         description: Multi-master node count (multimaster tier)
         default: "3"
@@ -149,9 +153,11 @@ jobs:
         run: echo "latest=$(curl -fsSL https://dl.k8s.io/release/stable.txt)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # e2e-fcos — single-master FCoS VM tier. Every PR (open/sync/reopen), dispatch
-  # and nightly. Skipped on plain `push` and on bare `labeled` events (those are
-  # for the opt-in tiers below). Reuses the build artifact.
+  # e2e-fcos — single-master FCoS VM tier (matrix: pinned + latest k8s). Every PR
+  # (open/sync/reopen), dispatch and nightly. Skipped on plain `push` and on bare
+  # `labeled` events (those are for the opt-in tiers below). Reuses the build
+  # artifact. Dispatch use_host_provider=true swaps the legacy hostresource
+  # bridge for the real magnumhost Pulumi provider plugin.
   # ---------------------------------------------------------------------------
   e2e-fcos:
     name: e2e-fcos (${{ matrix.name }})
@@ -166,19 +172,10 @@ jobs:
             kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
             kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
             scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
-            use_host_provider: "false"
           - name: latest
             kube_tag: v1.31.4
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
             scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
-            use_host_provider: "false"
-          # Exercises the real magnumhost Pulumi provider plugin (built by `build`)
-          # instead of the legacy hostresource bridge. create-only to bound cost.
-          - name: provider
-            kube_tag: v1.30.5
-            kube_tag_upgrade: v1.31.4
-            scenarios: create
-            use_host_provider: "true"
     steps:
       - name: Checkout magnum-bootstrap
         uses: actions/checkout@v4
@@ -219,7 +216,9 @@ jobs:
           VICTORIA_DIR: ${{ github.workspace }}/magnum
           PREBUILT_BOOTSTRAP: ${{ runner.temp }}/prebuilt/bootstrap
           PREBUILT_HOST_PROVIDER: ${{ runner.temp }}/prebuilt/pulumi-resource-magnumhost
-          USE_HOST_PROVIDER: ${{ matrix.use_host_provider }}
+          # Real magnumhost provider is opt-in (dispatch use_host_provider=true);
+          # per-PR runs use the prod-default legacy hostresource bridge.
+          USE_HOST_PROVIDER: ${{ github.event.inputs.use_host_provider || 'false' }}
           KUBE_TAG: ${{ matrix.kube_tag }}
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ matrix.scenarios }}
