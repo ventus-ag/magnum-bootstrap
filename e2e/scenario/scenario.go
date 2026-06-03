@@ -298,8 +298,10 @@ func (c Config) pairs() []KV {
 		put("LEAD_NODE_ROLE_NAME", leadNodeRole(c.KubeTag))
 		// Master-only fields the real write-heat-params-master.sh emits. Cloud /
 		// autoscaler / image fields are empty on the self-contained tier (no real
-		// OpenStack); SELINUX_MODE/TIMESTAMP_UPGRADE are node metadata.
-		put("SELINUX_MODE", "")
+		// OpenStack); SELINUX_MODE/TIMESTAMP_UPGRADE are node metadata. The test
+		// node boots SELinux permissive (butane) to match production Magnum nodes,
+		// whose cluster selinux_mode default is non-enforcing.
+		put("SELINUX_MODE", "permissive")
 		put("TIMESTAMP_UPGRADE", "")
 		put("CLUSTER_NETWORK_NAME", "")
 		put("CLUSTER_SUBNET", "")

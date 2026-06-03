@@ -26,10 +26,10 @@ passwd:
         - "@@SSH_AUTHORIZED_KEY@@"
 storage:
   # NOTE: no /usr/local or /opt symlink-target pre-creation here. The reconciler's
-  # container-runtime module ensures /var/usrlocal and /var/opt exist and extracts
-  # the containerd bundle with `tar --keep-directory-symlink`, so it installs on a
-  # bare Fedora CoreOS image (composefs read-only /usr included) without any node
-  # pre-provisioning — exactly as it must on a real Magnum node.
+  # container-runtime module unpacks the containerd bundle to a scratch dir and
+  # copies it into /var/usrlocal + /var/opt (never through the read-only /usr
+  # overlay), so it installs on a bare Fedora CoreOS image (composefs included)
+  # without any node pre-provisioning — exactly as it must on a real Magnum node.
   links:
     # Compat path for the system CA bundle. Real Magnum FCoS nodes have
     # /etc/pki/tls/certs/ca-bundle.crt (the reconciler's kube-os-config copies it
@@ -58,6 +58,21 @@ storage:
         inline: |
           PermitRootLogin prohibit-password
           PubkeyAuthentication yes
+    # Match production Magnum nodes, which do NOT run SELinux in enforcing mode
+    # (the cluster's selinux_mode default is "disabled" — the driver's
+    # fcct-config.yaml writes /etc/selinux/config accordingly). A bare FCoS image
+    # boots ENFORCING, under which systemd refuses to load the reconciler-written
+    # kube-*.service unit files ("Unit ... does not exist") and confined writes
+    # fail. FCoS honors "permissive" from this file on boot ("disabled" is ignored
+    # by modern systemd, so use permissive); the e2e-selinux-permissive.service
+    # unit below also enforces it at runtime before the reconciler runs.
+    - path: /etc/selinux/config
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: |
+          SELINUX=permissive
+          SELINUXTYPE=targeted
     # Cluster network NIC (multi-node). Matched by MAC so interface naming does
     # not matter; ignored when no NIC carries this MAC (single-node).
     - path: /etc/NetworkManager/system-connections/cluster.nmconnection
@@ -76,6 +91,26 @@ storage:
           may-fail=true
           [ipv6]
           method=ignore
+systemd:
+  units:
+    # Force SELinux permissive at runtime before the reconciler runs, matching a
+    # production Magnum node (selinux_mode "disabled"). The /etc/selinux/config
+    # written above takes effect on the next boot; this guarantees the FIRST boot
+    # is non-enforcing too, so systemd can load the reconciler-written kube-*
+    # unit files and confined operations are not denied.
+    - name: e2e-selinux-permissive.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=e2e: set SELinux permissive to match production Magnum nodes
+        Before=magnum-reconcile.service
+        ConditionSecurity=selinux
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/sbin/setenforce 0
+        [Install]
+        WantedBy=multi-user.target
 # NOTE: no kernel_arguments here — this config mirrors the real Magnum
 # `fcct-config.yaml`, which carries none. The nested AMD-V (Zen1) workaround kargs
 # (idle=poll/nox2apic/no-kvmclock/tsc=reliable/pci=nomsi) are injected by the
