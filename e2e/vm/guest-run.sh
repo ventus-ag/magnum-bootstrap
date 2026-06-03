@@ -45,6 +45,13 @@ kubectl_bin() {
 
 kc() { KUBECONFIG="$ADMIN_KUBECONFIG" "$(kubectl_bin)" "$@"; }
 
+helm_bin() {
+  for h in /usr/local/bin/helm /srv/magnum/bin/helm helm; do
+    if command -v "$h" >/dev/null 2>&1 || [ -x "$h" ]; then echo "$h"; return; fi
+  done
+  echo helm
+}
+
 setup_self_ssh() {
   # The magnum_victoria bootstrap scripts run `ssh -F /srv/magnum/.ssh/config
   # root@localhost`. Reproduce that channel so we can run them unmodified.
@@ -319,6 +326,19 @@ cmd_cert_hashes() {
   echo "ca=${ca:-none} server=${server:-none}"
 }
 
+# cmd_dump_state — print the cluster's nodes, pods (all namespaces) and Helm
+# releases so a finished run shows what actually came up, and a failed run shows
+# what didn't. Best-effort: never fails the run (callers ignore the exit code).
+cmd_dump_state() {
+  log "cluster state: nodes / pods / helm releases"
+  echo "    --- nodes ---"
+  kc get nodes -o wide 2>&1 | sed 's/^/    | /' || true
+  echo "    --- pods (all namespaces) ---"
+  kc get pods -A -o wide 2>&1 | sed 's/^/    | /' || true
+  echo "    --- helm releases ---"
+  KUBECONFIG="$ADMIN_KUBECONFIG" "$(helm_bin)" list -A 2>&1 | sed 's/^/    | /' || true
+}
+
 # cmd_kubelet_version [node] — print a node's reported kubelet version (defaults
 # to the first node) so the host can assert an upgrade actually took effect.
 cmd_kubelet_version() {
@@ -444,6 +464,7 @@ main() {
     assert-node-ready) cmd_assert_node_ready "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
     cert-hashes)      cmd_cert_hashes ;;
+    dump-state)       cmd_dump_state ;;
     kubelet-version)  cmd_kubelet_version "$@" ;;
     lb-start)            cmd_lb_start "$@" ;;
     assert-etcd-members) cmd_assert_etcd_members "$@" ;;

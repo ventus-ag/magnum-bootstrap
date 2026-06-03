@@ -35,6 +35,8 @@
 #
 # Env knobs (defaults):
 #   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
+#   FCOS_VERSION (pin an older, pre-composefs build, e.g. 38.20231027.3.2 — old
+#                 FCoS + v1 containerd layout, the production node layout)
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade)
 #   WORKERS 0          MASTERS 1            MASTER_LB_ENABLED true
 #   MASTER_MEM_MB 2048 MASTER_CPUS 1        WORKER_MEM_MB 2048   WORKER_CPUS 1
@@ -270,6 +272,8 @@ cleanup() {
   if [ "$rc" -ne 0 ]; then
     err "failure (rc=$rc) — collecting master diagnostics"
     gssh "$(ssh_port master)" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null' 2>/dev/null || true
+    # Also dump the cluster's nodes/pods so a failure shows what did/didn't come up.
+    gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" 2>/dev/null || true
   fi
   if [ "$KEEP_VM" = "1" ]; then
     log "KEEP_VM=1 — leaving VMs up (master: ssh -p $(ssh_port master) -i $WORKDIR/id_ed25519 root@127.0.0.1)"
@@ -318,15 +322,29 @@ generate_keys() {
   "$WORKDIR/mock-magnum" -gen-ca -ca-cert "$WORKDIR/ca.crt" -ca-key "$WORKDIR/ca.key" >/dev/null
 }
 
+# download_fcos — resolve + cache the FCoS qcow2. By default it pulls the latest
+# build of FCOS_STREAM. Set FCOS_VERSION to pin a specific older build, e.g.
+# FCOS_VERSION=38.20231027.3.2 — an old, PRE-composefs FCoS whose /usr is a
+# normal writable tree (no read-only overlay), which is the layout production
+# Magnum nodes run and which exercises the v1 cri-containerd bundle path (extract
+# straight to /) instead of the composefs /var/usrlocal copy path. Pinning is how
+# the tier covers "old FCoS + old containerd" alongside the default modern image.
 download_fcos() {
-  local meta url xz img="$CACHE_DIR/fcos-${FCOS_STREAM}.qcow2"
+  local meta url xz tag img
+  tag="${FCOS_VERSION:-$FCOS_STREAM}"
+  img="$CACHE_DIR/fcos-${tag}.qcow2"
   if [ -f "$img" ]; then echo "$img"; return; fi
-  log "resolving Fedora CoreOS ${FCOS_STREAM} qcow2"
-  meta="$(curl -fsSL "https://builds.coreos.fedoraproject.org/streams/${FCOS_STREAM}.json")"
-  url="$(echo "$meta" | jq -r '.architectures.x86_64.artifacts.qemu.formats["qcow2.xz"].disk.location')"
+  if [ -n "${FCOS_VERSION:-}" ]; then
+    log "resolving pinned Fedora CoreOS ${FCOS_STREAM} build ${FCOS_VERSION} qcow2"
+    url="https://builds.coreos.fedoraproject.org/prod/streams/${FCOS_STREAM}/builds/${FCOS_VERSION}/x86_64/fedora-coreos-${FCOS_VERSION}-qemu.x86_64.qcow2.xz"
+  else
+    log "resolving Fedora CoreOS ${FCOS_STREAM} qcow2 (latest)"
+    meta="$(curl -fsSL "https://builds.coreos.fedoraproject.org/streams/${FCOS_STREAM}.json")"
+    url="$(echo "$meta" | jq -r '.architectures.x86_64.artifacts.qemu.formats["qcow2.xz"].disk.location')"
+  fi
   [ -n "$url" ] && [ "$url" != "null" ] || die "could not resolve FCoS qcow2 url"
   xz="$CACHE_DIR/$(basename "$url")"
-  log "downloading $url"; curl -fsSL "$url" -o "$xz"
+  log "downloading $url"; curl -fsSL "$url" -o "$xz" || die "FCoS download failed (pinned FCOS_VERSION=${FCOS_VERSION:-<none>} may not exist for stream ${FCOS_STREAM})"
   log "decompressing image"; xz -dkc "$xz" > "$img.tmp" && mv "$img.tmp" "$img"
   echo "$img"
 }
@@ -833,6 +851,10 @@ main() {
       *) die "unknown scenario: $s" ;;
     esac
   done
+  # Show the final cluster state (nodes + pods + helm releases) so a passing run
+  # makes visible what came up, not just that the asserts passed.
+  log "=== final cluster state ==="
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" || true
   log "ALL SCENARIOS PASSED ✅"
 }
 
