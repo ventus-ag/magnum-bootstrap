@@ -286,6 +286,39 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 
 				retryUp("up (force retry)")
 			}
+			// A release can be referenced in Pulumi state while Helm has no
+			// deployed revision for it (e.g. an earlier failure-cleanup
+			// uninstalled it). `helm upgrade` then fails with "has no deployed
+			// releases" on every run — a permanent wedge no other branch
+			// matches. Recover by clearing markers + purging orphaned storage,
+			// then refreshing so Pulumi drops the stale resource and recreates
+			// it fresh on retry.
+			if err != nil {
+				if names := clusterhelm.ParseHelmNoDeployedReleases(err.Error()); len(names) > 0 {
+					recovered := make([]string, 0, len(names))
+					for _, name := range names {
+						ns := "kube-system"
+						if rel, ok := clusterhelm.ManagedReleaseByName(name); ok {
+							ns = rel.Namespace
+						}
+						clusterhelm.ResetDesyncedRelease(executor, name, ns)
+						recovered = append(recovered, ns+"/"+name)
+					}
+					if req.Logger != nil {
+						req.Logger.Warnf("helm release(s) %v present in Pulumi state but not deployed in Helm, refreshing state and recreating", recovered)
+					}
+					if _, refreshErr := stack.Refresh(ctx,
+						optrefresh.SuppressProgress(),
+						optrefresh.ProgressStreams(progressWriters...),
+						optrefresh.ErrorProgressStreams(errorProgressWriters...),
+					); refreshErr != nil {
+						if req.Logger != nil {
+							req.Logger.Warnf("refresh before helm recreate failed stack=%s err=%v; retrying up anyway", cfg.StackName(), refreshErr)
+						}
+					}
+					retryUp("up (helm recreate retry)")
+				}
+			}
 			// Some legacy clusters have Helm release resources whose objects exist
 			// in the cluster without the Helm ownership labels/annotations. Patch
 			// the expected metadata onto those live resources and keep retrying

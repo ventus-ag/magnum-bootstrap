@@ -468,6 +468,57 @@ func HasHelmNameReuseConflict(errMsg string) bool {
 	return strings.Contains(errMsg, "cannot re-use a name that is still in use")
 }
 
+// helmNoDeployedReleasesRe matches the release name in a Helm "has no deployed
+// releases" upgrade error, e.g. `"coredns" has no deployed releases`.
+var helmNoDeployedReleasesRe = regexp.MustCompile(`"([a-z0-9-]+)" has no deployed releases`)
+
+// ParseHelmNoDeployedReleases extracts release names from "has no deployed
+// releases" errors. Helm reports only the name (no namespace) for this error;
+// callers map names back to namespaces via the managed-release markers.
+//
+// This error means the release is referenced in Pulumi state but Helm has no
+// deployed revision for it — typically because an earlier failure-cleanup
+// uninstalled the release while Pulumi state still tracked it. `helm upgrade`
+// then fails on every subsequent run (a permanent wedge) until Pulumi state is
+// refreshed so the stale resource is dropped and recreated fresh.
+func ParseHelmNoDeployedReleases(errMsg string) []string {
+	matches := helmNoDeployedReleasesRe.FindAllStringSubmatch(errMsg, -1)
+	seen := make(map[string]bool, len(matches))
+	var names []string
+	for _, m := range matches {
+		if seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		names = append(names, m[1])
+	}
+	return names
+}
+
+// ManagedReleaseByName returns the managed release pair matching the given
+// release name, if bootstrap recorded one. Used to recover the namespace for
+// Helm errors that report only the release name.
+func ManagedReleaseByName(name string) (HelmReleasePair, bool) {
+	for _, rel := range ManagedReleases() {
+		if rel.Name == name {
+			return rel, true
+		}
+	}
+	return HelmReleasePair{}, false
+}
+
+// ResetDesyncedRelease prepares a release that Pulumi state references but Helm
+// no longer has deployed for clean recreation: it clears the force-update marker
+// (force does a `helm upgrade`, which cannot recover a non-deployed release) and
+// purges any orphaned Helm storage so a post-refresh `pulumi up` recreates the
+// release with a fresh install.
+func ResetDesyncedRelease(executor *host.Executor, name, namespace string) {
+	ClearForceUpdate(name, namespace)
+	if executor != nil {
+		_ = executor.Run("helm", "uninstall", name, "-n", namespace)
+	}
+}
+
 // ParseHelmOwnershipConflicts extracts resources that block a Helm release
 // update because they exist without the expected Helm ownership metadata.
 func ParseHelmOwnershipConflicts(errMsg string) []HelmOwnershipConflict {
