@@ -150,7 +150,9 @@ run_reconcile() {
 
 result_status() {
   [ -s "$RESULT_FILE" ] || { echo missing; return; }
-  grep -o '"status":"[^"]*"' "$RESULT_FILE" 2>/dev/null | head -1 | cut -d'"' -f4
+  # The reconciler writes pretty-printed JSON (`"status": "succeeded"`), so the
+  # extraction must tolerate whitespace after the colon.
+  grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESULT_FILE" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/'
 }
 
 cmd_apply() {
@@ -164,8 +166,8 @@ cmd_apply() {
   fi
   local status; status="$(result_status)"
   log "scenario '${name}': result status = ${status}"
-  if [ "$status" != "success" ]; then
-    err "scenario '${name}': expected success, got '${status}'"
+  if [ "$status" != "succeeded" ]; then
+    err "scenario '${name}': expected succeeded, got '${status}'"
     [ -s "$RESULT_FILE" ] && { echo '--- reconciler-last-run.json ---' >&2; cat "$RESULT_FILE" >&2; }
     echo '--- last 80 log lines ---' >&2
     tail -80 /var/log/magnum-reconcile.log 2>/dev/null >&2 || true
@@ -175,8 +177,9 @@ cmd_apply() {
 
 cmd_assert_ready() {
   log "asserting single-node cluster readiness"
-  local node; node="$(kc get nodes -o name 2>/dev/null | head -1 || true)"
-  if [ -z "$node" ]; then err "no nodes registered"; kc get nodes || true; return 1; fi
+  # The kubelet registers the node a few seconds after the reconcile returns
+  # (longer under TCG), so do NOT bail early when no node is registered yet — the
+  # wait loop below tolerates an empty node list and keeps polling for Ready.
   for _ in $(seq 1 "$(scaled 60)"); do
     if kc get nodes --no-headers 2>/dev/null | grep -qw Ready; then
       log "node Ready: $(kc get nodes --no-headers | tr -s ' ')"
@@ -184,13 +187,17 @@ cmd_assert_ready() {
     fi
     sleep 5
   done
-  kc get nodes --no-headers 2>/dev/null | grep -qw Ready || { err "node never became Ready"; kc describe nodes | tail -40 >&2 || true; return 1; }
+  kc get nodes --no-headers 2>/dev/null | grep -qw Ready || { err "node never registered/became Ready"; kc get nodes >&2 || true; kc describe nodes | tail -40 >&2 || true; return 1; }
 
   log "waiting for core system pods (coredns / flannel)"
   for _ in $(seq 1 "$(scaled 60)"); do
     local cd fl
-    cd="$(kc -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c Running || true)"
-    fl="$(kc -n kube-system get pods --no-headers 2>/dev/null | grep -i flannel | grep -c Running || true)"
+    # coredns + flannel are deployed by Helm charts: coredns lands in kube-system
+    # but without the legacy k8s-app=kube-dns label, and flannel lands in the
+    # kube-flannel namespace. Match by pod name across all namespaces rather than
+    # by a namespace/label that the charts do not set.
+    cd="$(kc get pods -A --no-headers 2>/dev/null | grep -i coredns | grep -c Running || true)"
+    fl="$(kc get pods -A --no-headers 2>/dev/null | grep -i flannel | grep -c Running || true)"
     if [ "${cd:-0}" -ge 1 ] && [ "${fl:-0}" -ge 1 ]; then
       log "core pods Running (coredns=$cd flannel=$fl)"; kc -n kube-system get pods --no-headers | tr -s ' '; return 0
     fi
@@ -223,15 +230,16 @@ cmd_assert_noop() {
   log "scenario '${name}': idempotency re-run"
   install -m 600 "$hp" /etc/sysconfig/heat-params
   run_reconcile || { err "idempotency re-run failed"; return 1; }
-  local summary; summary="$(grep -o '"summary":"[^"]*"' "$RESULT_FILE" | head -1 | cut -d'"' -f4 || true)"
+  local summary; summary="$(grep -oE '"summary"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESULT_FILE" | head -1 | sed -E 's/.*"([^"]*)"$/\1/' || true)"
   log "scenario '${name}': re-run summary = ${summary:-<none>}"
-  [ "$(result_status)" = "success" ] || { err "idempotency re-run not success"; return 1; }
+  [ "$(result_status)" = "succeeded" ] || { err "idempotency re-run not succeeded"; return 1; }
   # Strict idempotency: a converged node must report ZERO host changes. The
   # result's "changed" array is omitempty, so its presence means real changes
-  # happened on a re-apply of identical input — a drift/idempotency bug.
-  if grep -q '"changed":\[' "$RESULT_FILE" 2>/dev/null; then
+  # happened on a re-apply of identical input — a drift/idempotency bug. The JSON
+  # is pretty-printed (`"changed": [`), so match whitespace after the colon.
+  if grep -qE '"changed"[[:space:]]*:[[:space:]]*\[' "$RESULT_FILE" 2>/dev/null; then
     err "scenario '${name}': idempotency re-run reported host changes (expected none):"
-    grep -o '"changed":\[[^]]*\]' "$RESULT_FILE" >&2 || true
+    grep -oE '"changed"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$RESULT_FILE" >&2 || true
     return 1
   fi
   log "scenario '${name}': zero host changes ✅"
