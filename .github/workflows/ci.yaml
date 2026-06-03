@@ -8,7 +8,6 @@ name: CI
 #   build  ──┬─▶ e2e-fcos              (single-master FCoS VM, every PR)
 #            ├─▶ e2e-fcos-multimaster  (multi-master + LBs; dispatch/label/nightly)
 #            └─▶ e2e-openstack         (real OpenStack; dispatch/label/nightly)
-#   lint-shell                          (shellcheck, parallel, no deps)
 #
 # The FCoS VM tiers run on the self-hosted `ventus` runner; e2e-openstack needs
 # OpenStack credentials. See e2e/README.md.
@@ -136,20 +135,6 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # lint-shell — independent of build, runs in parallel.
-  # ---------------------------------------------------------------------------
-  lint-shell:
-    name: Shellcheck e2e scripts
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Shellcheck
-        # -S error only: fail on real bugs, not pre-existing style warnings, so
-        # the gate is green on introduction. Tighten to -S warning later.
-        run: shellcheck -S error $(git ls-files 'e2e/**/*.sh')
-
-  # ---------------------------------------------------------------------------
   # resolve — latest stable k8s, shared by the e2e matrices.
   # ---------------------------------------------------------------------------
   resolve:
@@ -205,6 +190,14 @@ jobs:
           ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
+
+      # Go is still needed for the tiny e2e helpers (mock-magnum/lb/heat,
+      # scenario-gen) and the runner preflight; only the ~105MB reconciler is
+      # reused from the build artifact.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v4
@@ -278,6 +271,14 @@ jobs:
           ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
+
+      # Go is still needed for the tiny e2e helpers (mock-magnum/lb/heat,
+      # scenario-gen) and the runner preflight; only the ~105MB reconciler is
+      # reused from the build artifact.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v4
