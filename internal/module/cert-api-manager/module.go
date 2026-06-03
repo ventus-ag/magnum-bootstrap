@@ -45,6 +45,19 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, fileResult.Changes...)
 
+	// ca.key sits alongside the master certs, which master-certificates owns
+	// recursively as kube:kube_etcd. FileSpec writes as root, so match that
+	// ownership here. Otherwise master-certificates finds this root-owned file on
+	// the next reconcile, re-chowns the whole cert dir, reports it as changed
+	// certificate material and needlessly restarts the entire control plane — i.e.
+	// the reconcile never converges to zero changes (idempotency break, and a
+	// control-plane restart on every periodic run in production).
+	ownResult, err := (hostresource.OwnershipSpec{Path: caKeyPath, Owner: "kube", Group: "kube_etcd"}).Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
+	changes = append(changes, ownResult.Changes...)
+
 	return moduleapi.Result{
 		Changes: changes,
 		Outputs: map[string]string{"certManagerApi": "true"},
