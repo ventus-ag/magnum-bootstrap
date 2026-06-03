@@ -111,6 +111,24 @@ systemd:
         ExecStart=/usr/sbin/setenforce 0
         [Install]
         WantedBy=multi-user.target
+    # Stub for heat-container-agent.service. On a real Magnum node the driver's
+    # fcct-config.yaml ships this unit (a podman container that talks to Heat); the
+    # reconciler's heat-container-agent phase enables + starts it and waits for it
+    # to become active. The mock e2e tier has no Heat and cannot run that image, so
+    # provide a no-op unit with the same name that goes active immediately — the
+    # reconciler's enable/start/wait then succeeds without weakening its prod
+    # behaviour (where the unit is always present).
+    - name: heat-container-agent.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=e2e stub for heat-container-agent (real one is Heat/podman infra, absent on the mock tier)
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/bin/true
+        [Install]
+        WantedBy=multi-user.target
 # NOTE: no kernel_arguments here — this config mirrors the real Magnum
 # `fcct-config.yaml`, which carries none. The nested AMD-V (Zen1) workaround kargs
 # (idle=poll/nox2apic/no-kvmclock/tsc=reliable/pci=nomsi) are injected by the
