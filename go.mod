@@ -3,6 +3,7 @@ module github.com/ventus-ag/magnum-bootstrap
 go 1.25.6
 
 require (
+	github.com/gophercloud/gophercloud/v2 v2.12.0
 	github.com/pulumi/pulumi-go-provider v1.3.1
 	github.com/pulumi/pulumi-kubernetes/sdk/v4 v4.28.0
 	github.com/pulumi/pulumi/sdk/v3 v3.226.0

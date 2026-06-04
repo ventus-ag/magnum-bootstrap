@@ -464,10 +464,13 @@ per-workdir key `<workdir>/id_ed25519` on the hostfwd port printed in the log),
 
 ### CI path
 
-`e2e-fcos.yaml` runs on **every PR** (`opened`/`synchronize`/`reopened`) on this
-runner; pushing to a PR branch re-triggers it. Requires the runner's GHA agent to be
-up (`Runner.Listener`/`Runner.Worker` processes). `e2e-fcos-multimaster.yaml` and
-`e2e-openstack.yaml` are label-gated.
+The `e2e-fcos` job (in `.github/workflows/ci.yaml`) runs on **every PR**
+(`opened`/`synchronize`/`reopened`) on this runner; pushing to a PR branch
+re-triggers it. Requires the runner's GHA agent to be up
+(`Runner.Listener`/`Runner.Worker` processes). The `e2e-fcos-multimaster` and
+`e2e-openstack` jobs are label-gated. `e2e-openstack` drives real OpenStack via
+the prebuilt `e2e/cmd/magnum-e2e` Go binary (gophercloud + client-go, standard
+`OS_*` env auth) — no `openstack`/`kubectl` CLIs or `clouds.yaml` on the runner.
 
 ## Remaining Work
 

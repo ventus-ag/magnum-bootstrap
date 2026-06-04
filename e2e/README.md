@@ -23,7 +23,7 @@ heat-params (ca-rotate) CA_ROTATION_ID=<new value>
 |------|----------|----------------|-------|---------|
 | Unit | `e2e/scenario`, `e2e/cmd/mock-magnum` | Fixtures trigger the intended op via the **real** parser; the mock is faithful to the **real** `magnum.Client` | none | every PR (`go test`) |
 | FCoS VM | `e2e/vm/` + `.github/workflows/e2e-fcos.yaml` | A real single-node FCoS cluster comes up and converges through create → ca-rotate → upgrade, idempotently | `self-hosted` runner w/ KVM | nightly + manual |
-| Real OpenStack | `e2e/openstack/` + `.github/workflows/e2e-openstack.yaml` | Full Magnum lifecycle **including OCCM LoadBalancer + Cinder CSI** | `self-hosted` runner + OpenStack creds | nightly + manual |
+| Real OpenStack | `e2e/cmd/magnum-e2e/` (ci.yaml `e2e-openstack` job) | Full Magnum lifecycle **including OCCM LoadBalancer + Cinder CSI** | `self-hosted` runner + OpenStack creds (`OS_*` env) | nightly + label |
 
 ### Why two "real" tiers — the mock boundary
 
@@ -50,7 +50,7 @@ CSI are validated only on the real-OpenStack tier.**
 | `e2e/vm/butane.yaml` | Minimal Ignition for the FCoS test node (SSH only — the reconciler installs everything else). |
 | `e2e/vm/guest-run.sh` | Runs inside the VM: self-ssh + mock + launcher/units install + apply + assertions. |
 | `e2e/vm/run-fcos-e2e.sh` | Host orchestrator: build → fetch FCoS → boot QEMU → provision → walk scenarios. |
-| `e2e/openstack/run-magnum-e2e.sh` | Drives a real Magnum cluster through the full lifecycle via the `openstack` CLI. |
+| `e2e/cmd/magnum-e2e/` | Drives a real Magnum cluster through the full lifecycle via the gophercloud SDK + client-go (no `openstack`/`kubectl` CLIs; one static binary). |
 
 ## Running locally
 
@@ -213,16 +213,56 @@ reconciler binary are all real. Note: the idempotency re-run is `direct`-only �
 Heat re-runs only on a *new* deployment id, and `55-heat-config` skips an
 already-deployed id, so a same-id replay isn't a meaningful agent test.
 
-Real-OpenStack tier (needs OpenStack creds + a Magnum template running the forked driver):
+Real-OpenStack tier — a single static Go binary (`e2e/cmd/magnum-e2e`); needs
+OpenStack creds + a Magnum template running the forked driver, but **no**
+`openstack`/`kubectl` CLIs:
+
+The tool reads the **full standard OpenStack RC** (its own auth reader, not
+gophercloud's narrow `AuthOptionsFromEnv` — so split-domain RC files work):
 
 ```bash
-export OS_CLOUD=e2e            # or OS_AUTH_URL + app credential
-export CLUSTER_TEMPLATE=...    # existing Magnum template (forked driver)
-export KEYPAIR=...
-./e2e/openstack/run-magnum-e2e.sh
-# knobs: KUBE_TAG, KUBE_TAG_UPGRADE, NODE_COUNT, NODE_COUNT_RESIZE,
-#        KEEP_CLUSTER=1, SKIP_CA_ROTATE=1, RECONCILER_BINARY_URL=...
+# Application credential (preferred): OS_AUTH_URL + OS_REGION_NAME +
+#   OS_APPLICATION_CREDENTIAL_ID / OS_APPLICATION_CREDENTIAL_SECRET
+# …or user/password: OS_USERNAME / OS_PASSWORD / OS_USER_DOMAIN_NAME +
+#   OS_PROJECT_ID  (or OS_PROJECT_NAME + OS_PROJECT_DOMAIN_ID/NAME)
+source ./your-openrc.sh        # a normal `openstack` RC file works as-is
+
+# Deliver the CURRENT build to the nodes by staging it into the cloud's own
+# Swift store (public-read, auto-set reconciler_version/url, deleted at the end):
+make build                      # current tree -> dist/bootstrap
+go run ./e2e/cmd/magnum-e2e \
+  -template v1.30.10 -upgrade-template v1.31.6 \
+  -bootstrap-binary dist/bootstrap          # <- nodes fetch THIS exact build
+  # (KEYPAIR optional — an ephemeral keypair is auto-created/destroyed)
+
+# Alternative delivery: skip -bootstrap-binary and point at a hosted binary
+#   -reconciler-version <ver> -reconciler-binary-url https://.../bootstrap
+
+# Modes:
+#   -list           list cluster templates (+ reconciler labels) and keypairs
+#   -preflight      auth + template check + keypair create→delete round-trip
+#   -stage-selftest stage -bootstrap-binary, fetch it back anonymously, verify, unstage
+#   -teardown       delete the named cluster (+ ephemeral keypair + staged binary)
+# Flags default from env: CLUSTER_TEMPLATE, UPGRADE_TEMPLATE, KEYPAIR, KUBE_TAG,
+#   NODE_COUNT, NODE_COUNT_RESIZE, MASTER_COUNT, EXTRA_LABELS, TIMEOUT_MIN,
+#   KEEP_CLUSTER, SKIP_CA_ROTATE, RECONCILER_VERSION, RECONCILER_BINARY_URL,
+#   BOOTSTRAP_BINARY.
 ```
+
+It walks: create → smoke (nodes Ready) → cloud-integration (Cinder CSI PVC binds
++ OCCM LoadBalancer Service gets an Octavia external IP) → upgrade → resize →
+ca-rotate → delete. The admin kubeconfig is built in-process from the Magnum cert
+API (CSR signed against the cluster CA, `CN=admin O=system:masters`); the
+cloud-integration checks are the payoff that the FCoS mock tier cannot fake.
+
+> **Reconciler binary delivery.** The node launcher skips entirely unless *both*
+> `reconciler_version` and `reconciler_binary_url` resolve. `-bootstrap-binary`
+> is the easy path: it uploads the binary (+ `.sha256`) to a per-run public-read
+> Swift container, sets both labels to the in-cloud URL, and deletes the
+> container at teardown — so nodes always test the exact local build with no
+> release or external host to maintain. (Version-pinned templates keep their own
+> `kube_tag`, so leave `-kube-tag` unset; the create/upgrade versions come from
+> `-template`/`-upgrade-template`.)
 
 ## Runner virtualization: KVM vs TCG
 
@@ -293,8 +333,11 @@ not tens of minutes.
 ## Preparing the self-hosted runner
 
 The FCoS-VM tier needs **nested KVM** (fast) **or** falls back to TCG (slow but
-works anywhere) plus qemu/jq/xz/podman; the OpenStack tier needs the `openstack`
-CLI + kubectl.
+works anywhere) plus qemu/jq/xz/podman. The OpenStack tier needs **nothing** on
+the runner beyond the prebuilt `magnum-e2e` static binary (downloaded from the
+build artifact) and `OS_*` auth env — no `openstack`/`kubectl` CLIs. (The legacy
+`runner-setup.sh --openstack` / `runner-preflight.sh --openstack` helpers remain
+for anyone who still wants the CLIs locally, but CI no longer uses them.)
 
 **Curl install (one shot — clones both repos + provisions):** the repos are
 private, so pass a PAT:
@@ -372,9 +415,22 @@ Checkout of the two repos:
   `magnum_ref` dispatch input or `vars.MAGNUM_REF`), checked out to
   `magnum_victoria/`, using `secrets.RW_PAT_TOKEN` for cross-repo private access.
 
-- `e2e-fcos.yaml` — checks out both repos, self-provisions, runs `run-fcos-e2e.sh`.
-- `e2e-openstack.yaml` — needs `secrets.OS_CLOUDS_YAML`,
-  `vars.MAGNUM_CLUSTER_TEMPLATE`, `vars.MAGNUM_KEYPAIR`.
+- `e2e-fcos` job — checks out both repos, self-provisions, runs `run-fcos-e2e.sh`.
+- `e2e-openstack` job — downloads the prebuilt `magnum-e2e` binary and runs it
+  against real OpenStack. Configure via repo **secrets** and **vars**:
+
+  | Setting | Kind | Purpose |
+  |---------|------|---------|
+  | `OS_AUTH_URL` | secret | Keystone v3 endpoint |
+  | `OS_APPLICATION_CREDENTIAL_ID` / `OS_APPLICATION_CREDENTIAL_SECRET` | secret | app-credential auth (preferred) |
+  | `OS_USERNAME` / `OS_PASSWORD` | secret | user/password auth (fallback) |
+  | `OS_REGION_NAME`, `OS_INTERFACE`, `OS_PROJECT_ID` (or `OS_PROJECT_NAME` + `OS_PROJECT_DOMAIN_ID/NAME`), `OS_USER_DOMAIN_NAME/ID` | var | scope/endpoint selection (full split-domain RC honoured; `OS_PROJECT_ID` is used alone) |
+  | `MAGNUM_CLUSTER_TEMPLATE` | var | create-time template name/UUID (forked driver); version-pinned templates carry their own `kube_tag` |
+  | `MAGNUM_UPGRADE_TEMPLATE` | var | upgrade-target template (a distinct version-pinned template) |
+  | `MAGNUM_KEYPAIR` | var | nova keypair name — **optional**; an ephemeral keypair is auto-created/destroyed if unset |
+  | `RECONCILER_VERSION` + `RECONCILER_BINARY_URL` | var | reconciler binary delivery (both required unless baked into the template) |
+
+  No `clouds.yaml`, no OpenStack/kubectl CLIs on the runner.
 
 ## How the shared CA fits together
 

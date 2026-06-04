@@ -49,6 +49,10 @@ on:
       masters:
         description: Multi-master node count (multimaster tier)
         default: "3"
+      keep_cluster:
+        description: Leave the OpenStack cluster in place after the run (debug)
+        type: boolean
+        default: false
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
 
@@ -118,15 +122,20 @@ jobs:
           fi
           go test ./...
 
-      - name: Build release binaries (reconciler + magnumhost provider)
+      - name: Build release binaries (reconciler + magnumhost provider + openstack e2e)
         run: |
           # `make build` builds BOTH dist/bootstrap and the Pulumi host provider
           # plugin dist/pulumi-resource-magnumhost. Both are uploaded so the e2e
           # jobs reuse them (provider path is opt-in via USE_HOST_PROVIDER).
           make build VERSION=ci REPOSITORY=${{ github.repository }}
+          # The real-OpenStack tier is a single static Go binary (gophercloud +
+          # client-go, no openstack/kubectl CLIs); build it here and ship it in
+          # the same artifact so e2e-openstack needs no toolchain on the runner.
+          CGO_ENABLED=0 go build -trimpath -o dist/magnum-e2e ./e2e/cmd/magnum-e2e
           ls -lh dist/
           test -x dist/bootstrap
           test -x dist/pulumi-resource-magnumhost
+          test -x dist/magnum-e2e
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -135,6 +144,7 @@ jobs:
           path: |
             dist/bootstrap
             dist/pulumi-resource-magnumhost
+            dist/magnum-e2e
           retention-days: 3
           if-no-files-found: error
 
@@ -338,70 +348,88 @@ jobs:
   # ---------------------------------------------------------------------------
   # e2e-openstack — real Magnum cluster. Opt-in: dispatch with run_openstack,
   # the `e2e-openstack` PR label, or nightly. Provisions billed cloud resources.
-  # The node binary is delivered via RECONCILER_BINARY_URL (not the artifact).
+  #
+  # Driven by the prebuilt `magnum-e2e` Go binary (gophercloud + client-go) from
+  # the build artifact — no openstack/kubectl CLIs or clouds.yaml on the runner.
+  # Auth is standard OS_* env (application credential preferred; user/password
+  # also supported). The reconciler node binary itself is delivered to the nodes
+  # via the reconciler_version/reconciler_binary_url labels (or the template
+  # defaults), NOT this artifact.
   # ---------------------------------------------------------------------------
   e2e-openstack:
-    name: e2e-openstack (${{ matrix.name }})
-    needs: [build, resolve]
+    name: e2e-openstack
+    needs: [build]
     runs-on: self-hosted
     if: >-
       (github.event_name == 'workflow_dispatch' && github.event.inputs.run_openstack == 'true') ||
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: pinned
-            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
-            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
-          - name: latest
-            kube_tag: v1.31.4
-            kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
+    # Standard OpenStack RC env, shared by the run and teardown steps. The tool's
+    # own auth reader honours the full split-domain RC (OS_USER_DOMAIN_* vs
+    # OS_PROJECT_DOMAIN_*), and prefers an application credential when its vars
+    # are set, else user/password. Unset values resolve to empty and are ignored.
+    # Auth secrets live in repo Secrets; non-sensitive scope/config in Variables.
+    env:
+      OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+      OS_REGION_NAME: ${{ vars.OS_REGION_NAME }}
+      OS_INTERFACE: ${{ vars.OS_INTERFACE || 'public' }}
+      OS_IDENTITY_API_VERSION: "3"
+      # Application credential (preferred) …
+      OS_APPLICATION_CREDENTIAL_ID: ${{ secrets.OS_APPLICATION_CREDENTIAL_ID }}
+      OS_APPLICATION_CREDENTIAL_SECRET: ${{ secrets.OS_APPLICATION_CREDENTIAL_SECRET }}
+      # … or user/password.
+      OS_USERNAME: ${{ secrets.OS_USERNAME }}
+      OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+      OS_USER_DOMAIN_NAME: ${{ vars.OS_USER_DOMAIN_NAME }}
+      OS_USER_DOMAIN_ID: ${{ vars.OS_USER_DOMAIN_ID }}
+      # Project scope — OS_PROJECT_ID is preferred (used alone); name+domain is
+      # the fallback when only a project name is known.
+      OS_PROJECT_ID: ${{ vars.OS_PROJECT_ID }}
+      OS_PROJECT_NAME: ${{ vars.OS_PROJECT_NAME }}
+      OS_PROJECT_DOMAIN_ID: ${{ vars.OS_PROJECT_DOMAIN_ID }}
+      OS_PROJECT_DOMAIN_NAME: ${{ vars.OS_PROJECT_DOMAIN_NAME }}
+      # Magnum run config. Templates are version-pinned (template name == k8s
+      # version), so the version comes from the template, not a kube_tag label.
+      CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
+      UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
+      # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.
+      KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
+      CLUSTER_NAME: recon-e2e-${{ github.run_id }}
+      # Reconciler binary delivery. Default: BOOTSTRAP_BINARY (set per-step
+      # below) stages the EXACT prebuilt binary into the cloud's Swift store
+      # (public-read, deleted at teardown) and sets reconciler_version/url
+      # automatically — so the node tests this build, with no release/host to
+      # maintain. RECONCILER_VERSION/URL are an optional override (e.g. pin a
+      # published release instead of staging); leave unset to use staging.
+      RECONCILER_VERSION: ${{ vars.RECONCILER_VERSION }}
+      RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
+      KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster == 'true' && '1' || '0' }}
     steps:
-      - name: Checkout magnum-bootstrap
-        uses: actions/checkout@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: ${{ runner.temp }}/prebuilt
 
-      - name: Provision runner (idempotent self-config)
-        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
-        run: sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh --no-vm --openstack
-
-      - name: Write clouds.yaml
+      - name: Preflight (auth + template reachable)
         run: |
-          mkdir -p ~/.config/openstack
-          printf '%s' "${{ secrets.OS_CLOUDS_YAML }}" > ~/.config/openstack/clouds.yaml
-          chmod 600 ~/.config/openstack/clouds.yaml
+          chmod +x "${{ runner.temp }}/prebuilt/magnum-e2e"
+          "${{ runner.temp }}/prebuilt/magnum-e2e" -preflight
 
-      - name: Runner preflight
+      - name: Run OpenStack Magnum e2e
+        # Stage the prebuilt reconciler into Swift unless an explicit
+        # RECONCILER_BINARY_URL override is configured.
         env:
-          OS_CLOUD: e2e
-        run: ./e2e/vm/runner-preflight.sh --openstack
+          BOOTSTRAP_BINARY: ${{ vars.RECONCILER_BINARY_URL == '' && format('{0}/prebuilt/bootstrap', runner.temp) || '' }}
+        run: "${{ runner.temp }}/prebuilt/magnum-e2e"
 
-      - name: Run OpenStack Magnum e2e (${{ matrix.name }})
-        env:
-          OS_CLOUD: e2e
-          CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
-          KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
-          CLUSTER_NAME: recon-e2e-${{ matrix.name }}-${{ github.run_id }}
-          KUBE_TAG: ${{ matrix.kube_tag }}
-          KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
-          RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
-          KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster || '0' }}
-          WORKDIR: ${{ runner.temp }}/magnum-e2e-${{ matrix.name }}
-        run: ./e2e/openstack/run-magnum-e2e.sh
-
-      - name: Tear down cluster + workdir
+      - name: Tear down cluster (safety net)
         if: always()
         env:
-          OS_CLOUD: e2e
+          BOOTSTRAP_BINARY: ${{ vars.RECONCILER_BINARY_URL == '' && format('{0}/prebuilt/bootstrap', runner.temp) || '' }}
         run: |
-          CN="recon-e2e-${{ matrix.name }}-${{ github.run_id }}"
-          if [ "${{ github.event.inputs.keep_cluster || '0' }}" = "1" ]; then
-            echo "keep_cluster=1 — leaving $CN in place"
-          elif openstack coe cluster show "$CN" >/dev/null 2>&1; then
-            echo "deleting leftover cluster $CN"
-            openstack coe cluster delete "$CN" || true
+          if [ "${KEEP_CLUSTER}" = "1" ]; then
+            echo "KEEP_CLUSTER=1 — leaving ${CLUSTER_NAME} in place"
           else
-            echo "no leftover cluster $CN"
+            "${{ runner.temp }}/prebuilt/magnum-e2e" -teardown || true
           fi
-          rm -rf "${{ runner.temp }}/magnum-e2e-${{ matrix.name }}" || true
