@@ -133,7 +133,6 @@ func Load(path string) (Config, error) {
 			NumberOfMasters:       parseInt(raw["NUMBER_OF_MASTERS"]),
 			KubeAPIPublicAddress:  raw["KUBE_API_PUBLIC_ADDRESS"],
 			KubeAPIPrivateAddress: raw["KUBE_API_PRIVATE_ADDRESS"],
-			EtcdDiscoveryURL:      raw["ETCD_DISCOVERY_URL"],
 			InitialCluster:        raw["ETCD_INITIAL_CLUSTER"],
 			MasterHostname:        raw["MASTER_HOSTNAME"],
 			EtcdLBVIP:             raw["ETCD_LB_VIP"],

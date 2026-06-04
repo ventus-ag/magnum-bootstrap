@@ -203,7 +203,6 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		outputs["numberOfMasters"] = pulumi.Int(cfg.Master.NumberOfMasters)
 		outputs["kubeApiPublicAddress"] = pulumi.String(cfg.Master.KubeAPIPublicAddress)
 		outputs["kubeApiPrivateAddress"] = pulumi.String(cfg.Master.KubeAPIPrivateAddress)
-		outputs["etcdDiscoveryUrl"] = pulumi.String(cfg.Master.EtcdDiscoveryURL)
 	}
 	if cfg.Worker != nil {
 		outputs["kubeMasterIp"] = pulumi.String(cfg.Worker.KubeMasterIP)

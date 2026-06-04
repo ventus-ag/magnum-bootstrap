@@ -169,11 +169,11 @@ type MasterConfig struct {
 	NumberOfMasters       int    `json:"numberOfMasters"`
 	KubeAPIPublicAddress  string `json:"kubeApiPublicAddress"`
 	KubeAPIPrivateAddress string `json:"kubeApiPrivateAddress"`
-	EtcdDiscoveryURL      string `json:"etcdDiscoveryUrl"`
 	// InitialCluster is the static etcd initial-cluster member list
 	// ("name0=https://ip0:2380,name1=https://ip1:2380,...") used to bootstrap a
-	// new cluster without the (deprecated) v2 discovery service. When empty, a
-	// first/single master bootstraps a one-node cluster from its own peer URL.
+	// new cluster. When empty, a first/single master bootstraps a one-node
+	// cluster from its own peer URL (which then grows via member-add as other
+	// masters join through the etcd LB).
 	InitialCluster string `json:"initialCluster"`
 	MasterHostname string `json:"masterHostname"`
 	EtcdLBVIP      string `json:"etcdLbVip"`

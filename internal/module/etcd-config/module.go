@@ -127,10 +127,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	if lbOK {
 		isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
 	}
-	discoveryOK := checkDiscoveryURL(executor, cfg.Master.EtcdDiscoveryURL)
 	if req.Logger != nil {
-		req.Logger.Infof("etcd: discoveryOK=%t lbOK=%t localOK=%t isMember=%t lbEndpoint=%s localEndpoint=%s",
-			discoveryOK, lbOK, localOK, isMember, lbEndpoint, localEndpoint)
+		req.Logger.Infof("etcd: lbOK=%t localOK=%t isMember=%t lbEndpoint=%s localEndpoint=%s",
+			lbOK, localOK, isMember, lbEndpoint, localEndpoint)
 	}
 
 	switch {
@@ -166,28 +165,14 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			return moduleapi.Result{}, err
 		}
 
-	case discoveryOK:
-		// New cluster via the (deprecated) v2 discovery URL. Retained for
-		// clusters that still set one; the static path below is preferred and
-		// is used whenever no discovery URL is provided.
-		cleanupEtcd(executor)
-		etcdConf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		waitForEndpointHealth := discoveryEndpointHealthRequired(cfg)
-		cs, err := writeAndStartEtcd(executor, etcdConf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, waitForEndpointHealth)
-		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		changes = append(changes, cs...)
-
 	default:
-		// No existing cluster to join and no discovery service: bootstrap a new
-		// cluster from a static initial-cluster member list. A first/single
-		// master uses its own peer URL (a one-node cluster that later grows by
-		// member-add); multi-master uses ETCD_INITIAL_CLUSTER when provided.
-		// This is the discovery-free bootstrap path.
+		// No existing cluster to join: bootstrap a new cluster from a static
+		// initial-cluster member list. A first/single master uses its own peer
+		// URL (a one-node cluster that later grows by member-add); multi-master
+		// uses ETCD_INITIAL_CLUSTER when provided.
 		initialCluster, ok := staticInitialClusterMembers(cfg, nodeIP, protocol)
 		if !ok {
-			return moduleapi.Result{}, fmt.Errorf("etcd: no healthy LB endpoint, no discovery URL, and cannot determine a static initial-cluster (multi-master needs ETCD_INITIAL_CLUSTER or an existing cluster to join)")
+			return moduleapi.Result{}, fmt.Errorf("etcd: no healthy LB endpoint and cannot determine a static initial-cluster (multi-master needs ETCD_INITIAL_CLUSTER or an existing cluster to join)")
 		}
 		cleanupEtcd(executor)
 		etcdConf := buildConfig(cfg, nodeIP, protocol, "new-static", initialCluster)
@@ -434,30 +419,8 @@ func checkMembership(executor *host.Executor, endpoint, certDir string, tlsDisab
 	return strings.Contains(out, instanceName) || strings.Contains(out, nodeIP)
 }
 
-func checkDiscoveryURL(executor *host.Executor, url string) bool {
-	if url == "" {
-		return false
-	}
-	out, err := executor.RunCapture("curl", "-sf", url)
-	if err != nil || out == "" {
-		return false
-	}
-	if strings.Contains(out, "unable to GET token") {
-		return false
-	}
-	// Validate that the response contains actual cluster data.
-	if !strings.Contains(out, `"nodes":[`) && !strings.Contains(out, `"dir":true`) {
-		return false
-	}
-	return true
-}
-
 func skipMembershipReconcile(cfg config.Config) bool {
 	return cfg.Operation() == config.OperationCARotate
-}
-
-func discoveryEndpointHealthRequired(cfg config.Config) bool {
-	return cfg.Master != nil && cfg.Master.NumberOfMasters == 1
 }
 
 // staticInitialClusterMembers returns the etcd initial-cluster member list used
@@ -690,15 +653,15 @@ func writeAndStartEtcd(executor *host.Executor, config, protocol, nodeIP, certDi
 		}
 		if !waitForEndpointHealth {
 			if executor.Logger != nil {
-				executor.Logger.Infof("etcd: service is active; skipping immediate endpoint health wait while discovery cluster forms")
+				executor.Logger.Infof("etcd: service is active; skipping immediate endpoint health wait while the multi-member cluster forms")
 			}
 			return changes, nil
 		}
 
 		// Wait for etcd to be functionally healthy after start when this node
 		// is joining an existing cluster or forming a single-master cluster.
-		// For multi-master discovery bootstrap, endpoint health may remain
-		// false until enough peer members have started to elect quorum.
+		// For a multi-master static bootstrap, endpoint health may remain false
+		// until enough peer members have started to elect quorum.
 		healthy := false
 		localEP := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 		for i := 0; i < 60; i++ {
@@ -723,23 +686,14 @@ func rebuildConfigIfNeeded(cfg config.Config, executor *host.Executor, nodeIP, p
 	}
 
 	needsTLS := !cfg.Shared.TLSDisabled && !strings.Contains(string(data), "client-transport-security")
-	needsProxy := cfg.Shared.HTTPProxy != "" && !strings.Contains(string(data), "discovery-proxy")
-
-	if !needsTLS && !needsProxy {
+	if !needsTLS {
 		return nil
 	}
 
 	// Determine mode and rebuild.
 	content := string(data)
 	configChanged := false
-	if strings.Contains(content, "discovery:") {
-		conf := buildConfig(cfg, nodeIP, protocol, "new", "")
-		result, err := (hostresource.FileSpec{Path: "/etc/etcd/etcd.conf.yaml", Content: []byte(conf), Mode: 0o644}).Apply(executor)
-		if err != nil {
-			return fmt.Errorf("rebuild etcd config (discovery mode): %w", err)
-		}
-		configChanged = result.Changed
-	} else if strings.Contains(content, "initial-cluster:") {
+	if strings.Contains(content, "initial-cluster:") {
 		// Extract initial-cluster value.
 		for _, line := range strings.Split(content, "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "initial-cluster:") {
@@ -775,9 +729,6 @@ func buildConfig(cfg config.Config, nodeIP, protocol, mode, initialCluster strin
 	fmt.Fprintf(&b, "initial-advertise-peer-urls: \"%s://%s:2380\"\n", protocol, nodeIP)
 
 	switch mode {
-	case "new":
-		// Legacy v2 discovery bootstrap.
-		fmt.Fprintf(&b, "discovery: \"%s\"\n", cfg.Master.EtcdDiscoveryURL)
 	case "new-static":
 		// Discovery-free bootstrap of a brand-new cluster from a known member
 		// list. initial-cluster-state "new" and a shared token form one cluster.
@@ -807,11 +758,6 @@ func buildConfig(cfg config.Config, nodeIP, protocol, mode, initialCluster strin
 		fmt.Fprintf(&b, "  key-file: \"%s/server.key\"\n", certDir)
 		fmt.Fprintf(&b, "  client-cert-auth: true\n")
 		fmt.Fprintf(&b, "  trusted-ca-file: \"%s/ca.crt\"\n", certDir)
-	}
-
-	// Proxy configuration.
-	if cfg.Shared.HTTPProxy != "" {
-		fmt.Fprintf(&b, "discovery-proxy: %s\n", cfg.Shared.HTTPProxy)
 	}
 
 	return b.String()
@@ -984,7 +930,6 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	if cfg.Master != nil {
 		outputs["etcdTag"] = pulumi.String(etcdTag(cfg))
-		outputs["etcdDiscoveryUrl"] = pulumi.String(cfg.Master.EtcdDiscoveryURL)
 	}
 	if err := ctx.RegisterResourceOutputs(res, outputs); err != nil {
 		return nil, err

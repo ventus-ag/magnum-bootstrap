@@ -291,7 +291,6 @@ func (c Config) pairs() []KV {
 		put("KUBE_API_PRIVATE_ADDRESS", c.APIIP)
 		put("KUBE_API_PUBLIC_ADDRESS", c.APIIP)
 		put("ETCD_LB_VIP", c.EtcdLBVIP)
-		put("ETCD_DISCOVERY_URL", "")
 		put("ETCD_INITIAL_CLUSTER", c.InitialCluster)
 		put("ETCD_VOLUME", "")
 		put("ETCD_VOLUME_SIZE", "0")

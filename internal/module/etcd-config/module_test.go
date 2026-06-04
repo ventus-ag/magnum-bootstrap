@@ -131,28 +131,3 @@ func TestEtcdClusterToken(t *testing.T) {
 		t.Fatalf("token without uuid = %q, want magnum-etcd-cluster", got)
 	}
 }
-
-func TestDiscoveryEndpointHealthRequired(t *testing.T) {
-	tests := []struct {
-		name            string
-		numberOfMasters int
-		want            bool
-	}{
-		{name: "unknown", numberOfMasters: 0, want: false},
-		{name: "single master", numberOfMasters: 1, want: true},
-		{name: "multi master", numberOfMasters: 3, want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := config.Config{
-				Master: &config.MasterConfig{
-					NumberOfMasters: tt.numberOfMasters,
-				},
-			}
-			if got := discoveryEndpointHealthRequired(cfg); got != tt.want {
-				t.Fatalf("expected %t, got %t", tt.want, got)
-			}
-		})
-	}
-}
