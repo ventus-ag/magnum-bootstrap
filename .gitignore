@@ -1,3 +1,6 @@
 /dist/
 /bootstrap
 /bootstrap.sha256
+/magnum-e2e
+# Local OpenStack credentials for the e2e tool — never commit (see .env.example).
+.env

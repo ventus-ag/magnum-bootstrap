@@ -58,6 +58,43 @@ func TestHasHelmNameReuseConflict(t *testing.T) {
 	}
 }
 
+func TestParseHelmNoDeployedReleases(t *testing.T) {
+	errMsg := `code: 1
+ ~  kubernetes:helm.sh/v3:Release node-e2e-master-0-cluster-coredns-chart updating (2s) [diff: ~forceUpdate]; error: "coredns" has no deployed releases`
+
+	names := ParseHelmNoDeployedReleases(errMsg)
+	if len(names) != 1 || names[0] != "coredns" {
+		t.Fatalf("ParseHelmNoDeployedReleases() = %v, want [coredns]", names)
+	}
+
+	// Multiple releases, deduped.
+	multi := `"coredns" has no deployed releases` + "\n" + `"flannel" has no deployed releases` + "\n" + `"coredns" has no deployed releases`
+	names = ParseHelmNoDeployedReleases(multi)
+	if len(names) != 2 {
+		t.Fatalf("ParseHelmNoDeployedReleases() returned %d names, want 2: %v", len(names), names)
+	}
+
+	if got := ParseHelmNoDeployedReleases("error: update failed"); got != nil {
+		t.Fatalf("ParseHelmNoDeployedReleases() on unrelated error = %v, want nil", got)
+	}
+}
+
+func TestManagedReleaseByName(t *testing.T) {
+	oldRoot := helmMarkerRootDir
+	helmMarkerRootDir = t.TempDir()
+	defer func() { helmMarkerRootDir = oldRoot }()
+
+	MarkManaged("coredns", "kube-system")
+
+	rel, ok := ManagedReleaseByName("coredns")
+	if !ok || rel.Namespace != "kube-system" || rel.Name != "coredns" {
+		t.Fatalf("ManagedReleaseByName(coredns) = %+v, %t; want {kube-system coredns}, true", rel, ok)
+	}
+	if _, ok := ManagedReleaseByName("nonexistent"); ok {
+		t.Fatal("ManagedReleaseByName(nonexistent) returned ok=true, want false")
+	}
+}
+
 func TestParseHelmOwnershipConflicts(t *testing.T) {
 	errMsg := `error: Unable to continue with update: ServiceAccount "cloud-controller-manager" in namespace "kube-system" exists and cannot be imported into the current release: invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by": must be set to "Helm"; annotation validation error: missing key "meta.helm.sh/release-name": must be set to "openstack-ccm"; annotation validation error: missing key "meta.helm.sh/release-namespace": must be set to "kube-system"`
 

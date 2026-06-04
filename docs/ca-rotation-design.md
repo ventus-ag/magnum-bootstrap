@@ -1,632 +1,460 @@
-# CA Rotation Design
+# CA Rotation Design (Dual-CA, Kubernetes-coordinated)
 
 ## Summary
 
-This document describes a production-grade CA rotation design for `magnum-bootstrap`.
-The current implementation rotates certificates independently on each node, which can
-leave the cluster in a mixed old/new trust state while services are restarting. The
-new design introduces a durable multi-step rotation protocol, cluster coordination,
-and dual-trust rollout before leaf certificate cutover.
+This document describes the production CA rotation design for `magnum-bootstrap`.
 
-The most important compatibility requirement is preserved:
+The previous implementation performed a **hard certificate swap** on every node
+(fetch new CA → generate new leaf certs → overwrite live cert dir → restart all
+services). Because all nodes are updated in one Heat batch and every service
+restarts at once, a node briefly trusts only the new CA while peers still
+present old-CA certs, causing a short total outage and, in unlucky orderings,
+quorum loss.
 
-1. Live certificate file names stay exactly the same as today.
-2. Consumers continue reading the same canonical paths under `/etc/kubernetes/certs`
-   and `/etc/etcd/certs`.
-3. Temporary names exist only in the staging area under
+The new design replaces the hard swap with a **dual-CA, three-barrier rolling
+protocol** coordinated through the **Kubernetes API** (etcd-backed), with a
+cluster-wide restart **Lease** so the control plane never goes fully offline.
+Heat is unchanged: it still fires a single all-at-once `ca_rotation_id` update.
+All coordination and convergence logic lives in the reconciler.
+
+### Compatibility (unchanged from before)
+
+1. Live certificate **file names never change**.
+2. Consumers keep reading the same canonical paths under
+   `/etc/kubernetes/certs` and `/etc/etcd/certs`.
+3. Dual trust is achieved by changing **file content** (`ca.crt`,
+   `service_account.key`), never by adding new file names that services read.
+4. Temporary material lives only under
    `/var/lib/magnum/ca-rotation/<rotation-id>/`.
 
-## Current Problem
+## Background: what Magnum actually does on rotation
 
-Today the `ca-rotation` module performs a local staged swap:
+Tracing `magnum_victoria`:
 
-1. Fetch new CA material from Magnum.
-2. Generate new leaf certificates.
-3. Copy the staged files over the live certificate directory.
-4. Restart local services.
-5. Record the applied rotation ID.
+1. `conductor/handlers/ca_conductor.rotate_ca_certificate`
+   - keeps `old_ca_cert_ref` only in a local variable (synchronous rollback),
+   - calls `generate_certificates_to_cluster()` which **mints a brand-new CA**
+     and **overwrites `cluster.ca_cert_ref`**,
+   - deletes client files, then calls the driver.
+2. `drivers/heat/driver.rotate_ca_certificate`
+   - mints one `ca_rotation_id`, new service-account keys, optional `ca_key`,
+   - sets `update_max_batch_size = largest nodegroup` (**all-at-once**),
+   - directly updates **every** child stack so masters and workers rotate
+     simultaneously (bypassing the ResourceGroup rolling update).
+3. `ca_rotation_id` flows `kubecluster → kubemaster/kubeminion →
+   write-heat-params*.sh → /etc/sysconfig/heat-params`.
 
-This works for a single node, but it is not safe for a multi-node cluster.
+**Decisive constraint:** after step 1, Magnum serves **only the new CA**
+(`GET /certificates/{uuid}` → `FetchCACert`) and signs every new CSR with the
+new CA. **The old CA survives only on each node's disk**
+(`/etc/kubernetes/certs/ca.crt`). Therefore the dual-trust bundle must be built
+from:
 
-Problems in the current design:
+- **new CA** — fetched from Magnum, and
+- **old CA** — read from the node's existing live `ca.crt`.
 
-1. There is no cluster-wide barrier before nodes switch trust or leaf certificates.
-2. Masters can restart while peers still trust only the old CA.
-3. Workers can move to the new CA before all control-plane nodes are prepared.
-4. `LastCARotationID` and the marker file model only a fully-complete rotation, not
-   an in-progress distributed protocol.
-5. Interrupted run recovery marks a run as interrupted, but it does not resume a
-   CA rotation from an internal protocol step.
+Magnum can never give the old CA back. This is why the reconciler — the only
+component that still holds the old CA — must own the rotation.
 
-## Goals
+## Why coordinate through the Kubernetes API
 
-1. Make CA rotation safe for multi-master and multi-worker clusters.
-2. Preserve live certificate paths and file names exactly as they are today.
-3. Roll out dual trust before switching live leaf certificates to the new CA.
-4. Support interrupted and resumed runs without losing cluster progress.
-5. Keep the design modular so the same coordination layer can be reused for future
-   distributed workflows.
-6. Prefer conservative safety over aggressive completion.
+The barriers below require a cluster-wide "may I advance?" signal that **both
+masters and workers** can reach. Options considered:
 
-## Non-Goals
+| Substrate | Reachable by workers? | New surface | Notes |
+|-----------|----------------------|-------------|-------|
+| Node-to-node mesh + election + HMAC | yes | high (new port, auth, election) | the rejected heavyweight design |
+| etcd directly | **no** (workers have no etcd access) | medium | masters only |
+| **Kubernetes API (etcd-backed)** | **yes** (apiserver proxies etcd) | low (reuses auth + RBAC) | chosen |
+| Heat / Magnum | n/a | — | explicitly kept out of node-local logic |
 
-1. Do not redesign the entire PKI layout.
-2. Do not rename existing live certificate files.
-3. Do not introduce a LAN scan or gossip mesh in the first version.
-4. Do not support mixed upgrade plus CA rotation in one protocol. The design still
-   targets pure CA rotation.
-5. Do not rely on Pulumi state alone as the source of truth for distributed
-   protocol progress.
+The Kubernetes API is the only consistent, HA store **all** nodes can already
+reach with existing credentials. Masters use `admin.conf` (`system:masters`);
+workers use the node-identity `admin.conf` (`system:node:<name>`). It is
+etcd-backed, so all nodes effectively coordinate through etcd **via the
+apiserver**.
 
-## Compatibility Requirement
+### The reflexivity problem and why it is safe
 
-After CA rotation, the live certificate names must remain exactly as they are now.
+The coordination store is secured by the very certs being rotated. The protocol
+survives this because:
 
-Canonical live paths remain:
+1. **Prepare widens trust before anything else changes.** After prepare every
+   client (`kubectl`, `--client-ca-file`, etcd `--peer-trusted-ca-file`) trusts
+   **both** CAs, so the API and etcd quorum keep working when leaves swap.
+2. **Every phase boundary is a complete, working state.** The ConfigMap answers
+   only "may I advance?"; "where am I?" comes from local `state.json`. An API
+   blip therefore **pauses** the rotation at a safe phase — it never tears state
+   or loses progress. The node retries; the next periodic run resumes.
+3. **A cluster-wide Lease prevents a full API outage.** Masters acquire a
+   `coordination.k8s.io/v1` Lease before restarting control-plane services, so
+   only one master restarts at a time and ≥1 apiserver always serves.
+4. **Workers never touch etcd.** etcd rotation is entirely a master-stage
+   concern; workers only rotate kubelet/kube-proxy leaves and read desired
+   phase.
+5. **Escape hatch.** If the API never recovers, the node times out, signals
+   Heat, and stays in the last safe phase. A manual `--ca-rotation-phase`
+   override lets an operator step a wedged cluster by hand.
 
-1. `/etc/kubernetes/certs/ca.crt`
-2. `/etc/kubernetes/certs/server.crt`
-3. `/etc/kubernetes/certs/server.key`
-4. `/etc/kubernetes/certs/kubelet.crt`
-5. `/etc/kubernetes/certs/kubelet.key`
-6. `/etc/kubernetes/certs/admin.crt`
-7. `/etc/kubernetes/certs/admin.key`
-8. `/etc/kubernetes/certs/proxy.crt`
-9. `/etc/kubernetes/certs/proxy.key`
-10. `/etc/kubernetes/certs/controller.crt`
-11. `/etc/kubernetes/certs/controller.key`
-12. `/etc/kubernetes/certs/scheduler.crt`
-13. `/etc/kubernetes/certs/scheduler.key`
-14. `/etc/kubernetes/certs/service_account.key`
-15. `/etc/kubernetes/certs/service_account_private.key`
-16. `/etc/etcd/certs/ca.crt`
-17. `/etc/etcd/certs/server.crt`
-18. `/etc/etcd/certs/server.key`
+## Trust model: three barriers (and why two is not enough)
 
-Temporary files may use additional names, but only inside the staging directory.
-No extra certificate names should remain in the live certificate directories after
-the rotation is finalized.
+A naive "bundle + new leaf in one wave" is **not** rolling-safe: during the
+window, an updated node presents a new-CA leaf to a not-yet-updated node that
+still trusts only the old CA → TLS rejection. Safe rolling needs three barriers,
+each separating a trust change from a leaf change:
 
-## Existing Single-CA Assumptions
+| Stage | `ca.crt` content | live leaf certs | SA verify keys | SA signing key |
+|-------|------------------|-----------------|----------------|----------------|
+| (start) | old | old | old | old |
+| **prepare** | **new + old** (bundle) | old | **old + new** | old |
+| **cutover** | new + old (bundle) | **new** | old + new | **new** |
+| **finalize** | **new** | new | **new** | new |
 
-The current codebase assumes a single live `ca.crt` in many places. This is good
-for compatibility, but it means the dual-trust design must change file content,
-not live file names.
+Why each transition is rolling-safe:
 
-Important consumers include:
+- **prepare**: presenter still shows old leaf; every verifier always had old. ✔
+- **cutover**: presenter shows new (or old) leaf; every verifier trusts both
+  (requires **all** nodes finished prepare). ✔
+- **finalize**: all leaves are already new; dropping old trust is safe
+  (requires **all** nodes finished cutover). ✔
 
-1. API server flags in `internal/module/kube-master-config/kubeconfigs.go`
-2. Controller manager flags in `internal/module/kube-master-config/kubeconfigs.go`
-3. Worker and master kubeconfigs in `internal/module/kube-master-config` and
-   `internal/module/kube-worker-config`
-4. Kubelet config in `internal/module/kubecommon/kubelet.go`
-5. Etcd TLS config in `internal/module/etcd-config/module.go`
-6. Admin kubeconfig generation in `internal/module/admin-kubeconfig/module.go`
+Bundle order is `new` **then** `old`, so single-cert readers
+(`certutil.loadCertificate`, controller-manager `--cluster-signing-cert-file`)
+pick the new CA.
 
-This means the transition strategy should be:
+### Barrier strictness
 
-1. Keep `ca.crt` as the canonical live trust file.
-2. Change its contents from `old` to `old + new` during prepare.
-3. Change its contents from `old + new` to `new` during finalize.
+Both barriers are **strict for every node** (masters and workers): you cannot
+cut over until all nodes are prepared, and cannot finalize until all nodes have
+cut over. A dead node halts progress at a safe phase (bundle trust + correct
+leaf = fully functional). v1 does not batch or partial-finalize; finalizing
+while any node still presents an old leaf would break every peer.
 
-## High-Level Architecture
+## Service-Account key rotation (rides the same barriers)
 
-The new design has three main parts:
+Magnum rotates SA keys on every CA rotation, so they must phase identically or
+live SA tokens get rejected mid-rotation. SA keys are content-swapped on the
+canonical files (flags in `kube-master-config` already point at them):
 
-1. A local persistent rotation state on every node.
-2. A simple coordination service reachable on a private node port.
-3. A multi-phase CA rotation protocol.
+- `service_account.key` (verify, public): `old+new` through cutover → `new` at
+  finalize. kube-apiserver loads **all** keys from `--service-account-key-file`,
+  so a concatenated file means tokens signed by either key validate.
+- `service_account_private.key` (sign, private): `old` until cutover → `new` at
+  cutover. Switched together with the leaf cutover so newly minted tokens use
+  the new key only once everyone can verify it.
 
-### Coordination Model
+`old` SA material is the current on-disk content; `new` comes from heat-params
+(`KUBE_SERVICE_ACCOUNT_KEY` / `KUBE_SERVICE_ACCOUNT_PRIVATE_KEY`).
 
-The first version should use a coordinator pattern, not a mesh.
+## etcd (master-only)
 
-1. One master acts as coordinator.
-2. The coordinator exposes cluster desired state for the current rotation.
-3. Every node exposes local read-only rotation status.
-4. The coordinator advances the cluster phase only after required participants
-   report readiness.
+etcd uses the same cert dir, so it rotates with the masters:
 
-Coordinator selection:
+- `/etc/etcd/certs/ca.crt` carries the same bundle/new content as the kube CA.
+- etcd `trusted-ca-file` and `peer-trusted-ca-file` already point at
+  `…/ca.crt`, so they pick up the bundle automatically.
+- etcd server/peer **leaf** certs swap at cutover, serialized under the Lease so
+  quorum is preserved while masters restart one at a time.
 
-1. Prefer the lowest available master index.
-2. In normal cases this is `master-0`.
-3. If `master-0` is unavailable before rotation starts, the next eligible master
-   may take over.
+### Quorum safety across cluster sizes
 
-This design is simpler than a gossip system and easier to reason about when the
-control plane is unstable.
+A master is not considered healthy after restart — and therefore does not
+release the restart Lease — until its etcd has rejoined a working quorum. This
+is verified directly with `etcdctl endpoint health` against etcd's always-present
+local plaintext listener (`http://127.0.0.1:2379`), which performs a
+linearizable read and so only succeeds when quorum is present. The check needs
+no certs, so it is reliable even while TLS material is changing.
 
-### Node Inventory
+Combined with the Lease (only one master restarts at a time), this gives:
 
-The design should avoid blind LAN discovery.
+| Masters | One etcd restarting | Result |
+|---------|---------------------|--------|
+| 1 | quorum is just itself | brief API outage during its own restart (inherent to single-master) |
+| **2** | 1 of 2 up → no quorum | **brief** unavailability per restart; the quorum gate waits for rejoin before the next master, so the two restarts never overlap and no data is lost |
+| 3 / 5 | majority still up | quorum maintained throughout |
 
-Preferred inventory source:
+The 2-master window is inherent to a 2-node etcd (no fault tolerance) and lasts
+only as long as one etcd process restart; running pods are unaffected. The
+protocol handles it as safely as physically possible: serialized restarts plus a
+quorum-rejoin gate.
 
-1. Add an explicit heat-param carrying the node inventory.
-2. Include node name, role, private IP, master index, and optional labels.
+A **pre-flight quorum check** also runs before a *fresh* rotation begins on a
+master: if etcd is not already in a healthy quorum, the rotation refuses to
+start (before mutating anything) rather than risk a control plane that cannot
+converge. The check is skipped on resume so an in-progress rotation whose etcd
+is momentarily re-forming is not aborted.
 
-Fallback inventory source:
+### Restart Lease lifetime
 
-1. The coordinator snapshots the Kubernetes node set while the cluster is healthy.
-2. The frozen participant set becomes the expected rotation scope.
+The Lease deliberately has a long duration and no renewal loop. A master
+restarts the very apiserver its admin.conf points at (`127.0.0.1`), so it cannot
+renew the Lease through the API during its own restart; a renewal loop could let
+the Lease lapse mid-restart and allow a second master to restart too — breaking
+quorum. Erring long instead guarantees mutual exclusion can never be violated;
+the only cost is that a crashed holder is recovered after the duration elapses
+(the rotation simply pauses in a safe phase until then).
 
-Workers do not need cluster-wide discovery logic. The coordinator is responsible
-for building and freezing the participant set.
-
-## Live and Staging File Layout
-
-Live paths stay unchanged. All temporary material lives under the rotation staging
-directory.
-
-Per-node staging layout:
+## Per-node staging and state
 
 ```text
 /var/lib/magnum/ca-rotation/<rotation-id>/
-  state.json
-  participants.json
-  old/
-    ca.crt
-    server.crt
-    server.key
-    kubelet.crt
-    kubelet.key
-    ...
-  new/
-    ca.crt
-    server.crt
-    server.key
-    kubelet.crt
-    kubelet.key
-    ...
-  bundle/
-    ca.crt
+  state.json            # local protocol state (source of truth for "where am I")
+  old/   ca.crt service_account.key service_account_private.key <leaf certs…>
+  new/   ca.crt service_account.key service_account_private.key <leaf certs…>
+  bundle/ ca.crt        # new + old
 ```
 
-Rules:
-
-1. `old/` is a local snapshot of the currently active material.
-2. `new/` contains newly fetched or generated material.
-3. `bundle/ca.crt` contains `old CA + new CA` in PEM order.
-4. Only the live directories under `/etc/kubernetes/certs` and `/etc/etcd/certs`
-   are used by running services.
-
-## Rotation Protocol
-
-The protocol is split into four logical stages.
-
-### Stage 1: Snapshot
-
-The coordinator freezes the participant set before any trust changes happen.
-
-Actions:
-
-1. Confirm that a pure CA rotation is requested.
-2. Elect or confirm the coordinator.
-3. Build the participant inventory.
-4. Snapshot the expected master and worker sets.
-5. Persist the rotation policy and participants.
-
-Rules:
-
-1. Master participation is strict.
-2. If a required master is missing before rotation starts, the protocol does not
-   advance past the snapshot stage.
-3. Worker participation may be policy-driven, but the frozen set must still be
-   recorded explicitly.
-
-### Stage 2: Prepare
-
-Each node stages new material and prepares dual trust.
-
-Actions on each node:
-
-1. Snapshot current live certs into `old/`.
-2. Fetch the new CA from Magnum.
-3. Generate new leaf certs into `new/`.
-4. Write live `ca.crt` as `old + new`.
-5. Keep live leaf certs on the old active leafs.
-6. Restart only the services that must reload trust.
-7. Verify local health and report `prepared`.
-
-Important property:
-
-1. During prepare, nodes still present the old live leaf certificates.
-2. During prepare, peers trust both old and new CA.
-
-Master rollout during prepare:
-
-1. Roll masters one by one.
-2. After each master, verify etcd health and API readiness before continuing.
-
-Worker rollout during prepare:
-
-1. Workers may be rolled in batches.
-2. Batch size should be configurable.
-
-### Stage 3: Cutover
-
-After required participants are prepared, nodes switch live leaf certificates to
-the new certs.
-
-Actions on each node:
-
-1. Atomically replace live leaf cert files with the staged `new/` material.
-2. Keep live `ca.crt` as `old + new` during this stage.
-3. Restart local services that consume the leaf certificates.
-4. Verify health and report `cutover-complete`.
-
-Master rollout during cutover:
-
-1. Roll masters one by one.
-2. Check etcd quorum after each master.
-3. Check API health after each master.
-
-Worker rollout during cutover:
-
-1. Roll workers in batches.
-2. Require the coordinator policy to allow the next batch.
-
-### Stage 4: Finalize
-
-After required participants have cut over to the new leaf certs, old trust is
-removed.
-
-Actions on each node:
-
-1. Rewrite live `ca.crt` from bundle form to `new` only.
-2. Restart services that must reload trust.
-3. Verify health.
-4. Clean up staging data.
-5. Report `finalized`.
-
-Safety rule:
-
-1. `LastCARotationID` must be updated only after finalize succeeds.
-2. The legacy marker file must also be written only after finalize succeeds.
-
-## Readiness and Progress Policy
-
-The protocol should distinguish between Kubernetes readiness and rotation
-readiness.
-
-Kubernetes readiness is used for:
-
-1. Discovering the initial healthy participant set.
-2. Verifying post-restart health.
-
-Rotation readiness is used for:
-
-1. Determining whether a node has prepared dual trust.
-2. Determining whether a node has switched to new leaf certs.
-3. Determining whether old trust can be removed.
-
-This distinction is important because a node may be Kubernetes `Ready` while still
-using only the old CA or while it has not staged the new material yet.
-
-Recommended default policy:
-
-1. Require all frozen masters to reach `prepared` before any master leaf cutover.
-2. Require all frozen masters to reach `cutover-complete` before finalizing trust.
-3. Allow worker cutover in batches.
-4. Require all in-scope workers to reach `cutover-complete` before removing old
-   trust, unless an explicit override policy is configured.
-
-Possible future policy knobs:
-
-1. `workerBatchSize`
-2. `minPreparedWorkersPercent`
-3. `minCutoverWorkersPercent`
-4. `finalizeTimeout`
-5. `allowFinalizeWithMissingWorkers`
-
-The first version may keep finalization strict even if worker batching is allowed.
-
-## Persistent State
-
-Pulumi helps with idempotent resource application, but it is not enough to model
-the internal state of a distributed protocol. CA rotation needs its own durable
-state.
-
-### Local State
-
-Each node persists local state in:
-
-```text
-/var/lib/magnum/ca-rotation/<rotation-id>/state.json
-```
-
-Suggested schema:
+`state.json` schema:
 
 ```json
 {
   "rotationId": "rotate-123",
   "role": "master",
   "instance": "cluster-master-0",
-  "coordinator": true,
-  "coordinatorAddress": "10.0.0.10:10443",
-  "phase": "prepare",
-  "caMode": "bundle",
-  "leafMode": "old",
-  "health": "ok",
-  "participantsHash": "...",
-  "updatedAt": "2026-04-17T10:00:00Z"
+  "phase": "prepare|cutover|finalize|done",
+  "caMode": "old|bundle|new",
+  "leafMode": "old|new",
+  "saVerifyMode": "old|bundle|new",
+  "saSignMode": "old|new",
+  "updatedAt": "2026-05-21T10:00:00Z"
 }
 ```
-
-Important fields:
-
-1. `phase` is the local protocol step.
-2. `caMode` is one of `old`, `bundle`, `new`.
-3. `leafMode` is one of `old`, `new`.
-4. `participantsHash` protects against accidental reuse of stale participant data.
-
-### Cluster State
-
-The coordinator persists a cluster view in its own staging directory.
-
-Suggested files:
-
-1. `participants.json`
-2. `desired-state.json`
-3. `observed-status.json`
-
-The coordinator is the source of truth for desired cluster phase during a single
-rotation ID.
-
-### Existing Reconciler State
-
-The existing reconciler state should remain, but its meaning must change slightly.
 
 Rules:
 
-1. `LastCARotationID` means the rotation has been fully finalized.
-2. It must not be written at prepare or cutover.
-3. The existing marker file should follow the same rule.
+- `old/` is snapshotted from live certs **once**, at the start of prepare, and
+  reused by later phases (live `ca.crt` is already a bundle by cutover, so the
+  pure old/new copies must be preserved).
+- `LastCARotationID` (reconciler state) and the legacy
+  `/var/lib/magnum/last_ca_rotation_id` marker are written **only after
+  finalize** succeeds. Until then a re-run resumes from `state.json`.
 
-## Coordination API
+## Coordination objects (Kubernetes API)
 
-The node-to-node API should stay minimal in the first version.
+| Object | Holds | Writers | Readers |
+|--------|-------|---------|---------|
+| ConfigMap `kube-system/magnum-ca-rotation` | `{rotationId, desiredPhase}` | any master (forward-only, `RetryOnConflict`) | all nodes |
+| Node annotation `magnum.openstack.org/ca-rotation` | `<phase>@<rotationId>` per node | each node on **its own** Node | masters (list) |
+| Lease `kube-system/magnum-ca-rotation-restart` | control-plane restart mutex | masters | masters |
 
-### Node API
+- **Desired phase** advances `prepare → cutover → finalize` (monotonic).
+  Advancement is idempotent — concurrent identical patches by multiple masters
+  are harmless; `RetryOnConflict` handles `resourceVersion` races.
+- **Status reporting** is distributed: each node patches an annotation on its
+  own Node object (allowed by the Node authorizer / NodeRestriction), avoiding
+  contention on a single ConfigMap.
+- **RBAC:** the `cluster-rbac` module (master-0) grants `system:nodes` `get`/
+  `list`/`watch` on the single coordination ConfigMap. Self-Node annotation and
+  master Lease access need no extra rules.
 
-Each node exposes local read-only status.
+## Execution model
 
-Possible endpoint:
+Heat fires one all-at-once `ca_rotation_id` update; every node's `run-once`
+executes the protocol concurrently and **blocks at each barrier**:
 
-1. `GET /v1/ca-rotation/status`
+```
+prepare:
+  snapshot live → old/;  fetch new CA → new/;  write bundle/ca.crt
+  write live ca.crt = bundle (kube + etcd);  SA verify = old+new
+  (Lease) restart trust-reloading services in dependency order;  health
+  annotate Node "prepare@id"
+  [master] if all nodes report prepare@id → advance desiredPhase=cutover
+  wait until desiredPhase == cutover   (retry across transient API loss)
 
-Example response:
+cutover:
+  write live leaf certs = new/;  SA signing key = new
+  (Lease) restart leaf-consuming services in dependency order;  health
+  annotate Node "cutover@id"
+  [master] if all nodes report cutover@id → advance desiredPhase=finalize
+  wait until desiredPhase == finalize
 
-```json
-{
-  "rotationId": "rotate-123",
-  "instance": "cluster-worker-2",
-  "role": "worker",
-  "phase": "prepare",
-  "caMode": "bundle",
-  "leafMode": "old",
-  "health": "ok",
-  "updatedAt": "2026-04-17T10:00:00Z"
-}
+finalize:
+  write live ca.crt = new;  SA verify = new (kube + etcd)
+  (Lease) restart trust-reloading services;  health
+  annotate Node "finalize@id"
+  patch workloads (best-effort);  write LastCARotationID + legacy marker
+  clean staging
 ```
 
-### Coordinator API
+Barrier waits are bounded (`finalizeTimeout`, default generous). On timeout the
+node leaves the cluster in its current safe phase and reports failure to Heat.
 
-The coordinator exposes desired cluster phase.
+Heat's `update_timeout` (driver `_get_update_timeout`) must comfortably exceed a
+full three-barrier rotation across the slowest node; this is the only
+magnum_victoria-side consideration.
 
-Possible endpoint:
+## Module and phase changes
 
-1. `GET /v1/ca-rotation/plan`
+The single `ca-rotation` phase keeps its catalog slot (#2), but its `Run()` is
+rewritten to drive the staged protocol via a new coordination package:
 
-Example response:
-
-```json
-{
-  "rotationId": "rotate-123",
-  "desiredPhase": "prepare",
-  "participantsHash": "...",
-  "requiredMasters": ["cluster-master-0", "cluster-master-1", "cluster-master-2"],
-  "workerBatchSize": 5
-}
+```
+internal/carotation/
+  phase.go    # Phase/CAMode/LeafMode constants
+  state.go    # per-node state.json load/save, staging layout helpers
+  coord.go    # client-go coordinator: desiredPhase CAS, Node status, Lease,
+              # barrier wait, "all nodes reported" check
 ```
 
-### Authentication
+`--ca-rotation-phase <prepare|cutover|finalize>` (app flag) forces a single
+stage without coordination, for manual recovery.
 
-The first version should use a simple authenticated private API.
+Dependency note: modules that assume a single stable CA must not rewrite
+`ca.crt` or leaf certs while a rotation is in progress. `master-certificates`
+already skips a healthy `ca.crt` (`CertFileNeedsRefresh` only refetches when
+missing/expired), so a valid bundle is preserved across normal reconciles; the
+ca-rotation module owns all cert writes during an active rotation.
 
-Recommended approach:
+## Failure handling (fail-safe states)
 
-1. Bind only to node private addresses.
-2. Require a shared token or HMAC-based header derived from existing cluster
-   secret material.
-3. Reject unauthenticated requests.
+Safe states: `old/old`, `bundle/old`, `bundle/new`, `new/new`.
+Unsafe state (never entered): new leaf while any peer trusts only old CA.
 
-Mutual TLS can be added later, but it should not block the first implementation.
+- prepare fails on any node → stop; cluster is `old/old` or `bundle/old`.
+- cutover fails on a master → stop, do not finalize; cluster is `bundle/*`.
+- a node is unavailable → barrier blocks; cluster stays in dual-trust until it
+  returns or an operator intervenes.
+- coordinator/master churn → any master can advance via the idempotent,
+  forward-only ConfigMap CAS; no election to recover.
+- API unreachable → retry; resume from `state.json` on recovery / next run.
 
-## Module and Phase Changes
+## Implementation plan
 
-The current single `ca-rotation` phase should be split into explicit protocol
-steps.
+1. `internal/carotation` package: phases, state.json, client-go coordinator
+   (in-cluster config from `admin.conf`, ConfigMap CAS, Node annotations,
+   Lease, bounded barrier wait).
+2. Rewrite `ca-rotation/module.go`: prepare/cutover/finalize, staging snapshot,
+   bundle build, SA dual-key, etcd bundle, Lease-serialized restarts, per-stage
+   health.
+3. `cluster-rbac`: Role/RoleBinding for `system:nodes` on the coordination
+   ConfigMap.
+4. Reconciler/state: write `LastCARotationID` + legacy marker only after
+   finalize.
+5. `--ca-rotation-phase` manual override flag.
+6. go.mod: add `k8s.io/client-go` (already linked via pulumi-kubernetes).
+7. magnum_victoria: ensure `update_timeout` covers a full rotation.
+8. Tests: phase transitions, bundle ordering, resume-from-state, missing-node
+   barrier, "live file names unchanged".
 
-Recommended new phases:
-
-1. `coordination-agent`
-2. `ca-rotation-prepare`
-3. `ca-rotation-cutover`
-4. `ca-rotation-finalize`
-
-Why split the phase:
-
-1. It makes protocol progress explicit.
-2. It simplifies interrupted-run resume behavior.
-3. It prevents later phases from accidentally overwriting intermediate rotation
-   state.
-4. It gives clearer operator output and easier test coverage.
-
-Dependency updates:
-
-1. Modules that currently depend on `ca-rotation` should depend on
-   `ca-rotation-finalize` if they assume a single stable CA.
-2. Certificate reconciliation modules must not overwrite `ca.crt` or leaf certs
-   during prepare or cutover.
-3. The existing health checks should be reused by the new phases where possible.
-
-## Service Restart Strategy
-
-The restart strategy should be different for prepare, cutover, and finalize.
-
-Prepare restarts:
-
-1. Reload dual trust.
-2. Keep old leaf certs active.
-3. Restart in dependency order.
-
-Cutover restarts:
-
-1. Switch to new leaf certs.
-2. Keep dual trust in place.
-3. Restart in dependency order.
-
-Finalize restarts:
-
-1. Remove old trust.
-2. Restart only components that require trust reload.
-
-Masters must continue to use serialized restarts because etcd and the API server
-have strict dependency ordering.
-
-## Health Checks
-
-Local health checks should be performed after every disruptive step.
-
-Master checks:
-
-1. `etcd` is active.
-2. `kube-apiserver` is active.
-3. `kube-controller-manager` is active.
-4. `kube-scheduler` is active.
-5. `kubelet` is active.
-6. `/readyz` succeeds via admin kubeconfig.
-7. etcd endpoint health succeeds.
-
-Worker checks:
-
-1. `kubelet` is active.
-2. `kube-proxy` is active.
-3. Node registration remains visible from the coordinator.
-
-The coordinator should not advance the cluster phase based only on local service
-status. It must also require the correct reported rotation state.
-
-## Workload Rollout
-
-Workloads may also need trust updates.
-
-Current behavior patches Deployments and DaemonSets after CA rotation. The new
-design should keep that behavior but make the timing explicit.
-
-Recommended workload rollout points:
-
-1. After dual trust is prepared on the control plane, patch workloads so they can
-   consume the bundle trust if needed.
-2. After finalization, optionally patch workloads again if they need to drop old
-   trust.
-
-This should remain best-effort with warnings, not a hard blocker for core control
-plane safety.
-
-## Failure Handling
-
-The design should fail safe.
-
-Safe states:
-
-1. Old trust plus old leafs.
-2. Bundle trust plus old leafs.
-3. Bundle trust plus new leafs.
-
-Unsafe state:
-
-1. New leafs while required peers still trust only old CA.
-
-Failure rules:
-
-1. If prepare fails on a required master, stop the protocol.
-2. If cutover fails on a master, stop the protocol and do not finalize trust.
-3. If some workers are unavailable, the cluster may remain in dual-trust mode
-   until they rejoin or an explicit policy override is used.
-4. If the coordinator changes unexpectedly, the new coordinator must rebuild state
-   from persisted cluster and node status before advancing the phase.
-
-## Implementation Plan
-
-### Phase 1: State and Inventory
-
-1. Add a design-specific config model for rotation policy and node inventory.
-2. Add persistent local rotation state files.
-3. Change `LastCARotationID` semantics so it is written only after finalize.
-
-### Phase 2: Coordination Service
-
-1. Add a `bootstrap` subcommand for the node coordination agent.
-2. Add a systemd unit for the agent.
-3. Implement status and plan endpoints.
-4. Add request authentication.
-
-### Phase 3: Prepare Stage
-
-1. Refactor current `ca-rotation` logic into a reusable staging layer.
-2. Snapshot old material.
-3. Generate new material into staging.
-4. Write bundle trust to live `ca.crt`.
-5. Add serialized master prepare rollout and batched worker prepare rollout.
-
-### Phase 4: Cutover Stage
-
-1. Atomically replace live leaf certificates from staged `new/` material.
-2. Keep bundle trust active.
-3. Add coordinator gating before each batch.
-
-### Phase 5: Finalize Stage
-
-1. Rewrite live `ca.crt` to new-only trust.
-2. Clean staging directories.
-3. Write the final marker and reconciler state.
-
-### Phase 6: Hardening
-
-1. Add unit tests for state transitions.
-2. Add tests for interrupted runs.
-3. Add tests for missing worker and missing master scenarios.
-4. Add tests that verify live certificate paths remain unchanged.
-5. Add integration tests for rolling master cutover order.
-
-## Open Questions
-
-1. Can Magnum provide a full node inventory directly in heat-params, or must the
-   coordinator always snapshot nodes from Kubernetes?
-2. Which secret should be used to derive the node API authentication token?
-3. Should worker finalization allow a configurable threshold, or should the first
-   version stay strict?
-4. Should the coordinator run as a long-lived agent only, or can the `bootstrap`
-   process temporarily assume coordinator responsibilities while the agent exposes
-   status?
-5. Which services truly require restart at prepare versus finalize, and which can
-   tolerate a simple reload?
-
-## Final Recommendation
-
-Implement CA rotation as a resumable coordinator-driven protocol with explicit
-prepare, cutover, and finalize stages.
-
-The key invariants are:
+## Invariants
 
 1. Live certificate file names never change.
-2. Old and new CA trust overlap before any live leaf cutover.
-3. Masters rotate serially.
-4. Workers rotate in controlled batches.
-5. Final rotation completion is recorded only after old trust is removed safely.
+2. New + old CA trust overlaps before any leaf cutover, and persists until every
+   node has cut over.
+3. Masters restart serially under a cluster-wide Lease; quorum is preserved.
+4. Coordination is through the Kubernetes API; an outage pauses (never
+   corrupts) the rotation.
+5. Final completion is recorded only after old trust is safely removed.
 
-This keeps the deployment compatible with the existing file layout while making
-the rotation path safer, more observable, and suitable for production clusters.
+## Operational hardening (repeated-operation robustness)
+
+Background: a long sequence of operations (rotate × N, upgrade, rotate …) could
+make a node slow enough to blow a per-phase health wait. The node then failed to
+report its phase, the cluster barrier never advanced, Heat hit `update_timeout`,
+and — critically — *every later operation also timed out*, because a wedged run
+kept squatting the reconcile flock and the periodic timer kept re-running the
+stuck rotation. The cluster itself stayed functional (a stuck barrier is a safe
+dual-trust pause); the failure was that Heat could never make progress again.
+The following make the protocol survive any master count (1 → 2 → 3 → 4+) and
+keep a single timeout from becoming a permanent wedge.
+
+1. **Restart Lease is taken for any master count, not just `> 1`.** Deciding
+   whether to serialize from `NUMBER_OF_MASTERS` is fragile — a stale/zero value
+   on a real multi-master cluster would let every apiserver restart at once and
+   break quorum. The Lease is now always acquired on masters; on a genuine
+   single-master cluster it is uncontended (acquire/release are effectively
+   instant), so it is free there and correct everywhere else. (`runPhase`)
+
+2. **Heat-driven run timeout.** `RECONCILER_RUN_TIMEOUT_SECONDS` (heat-param,
+   default 4800s) is exported to the binary as
+   `MAGNUM_RECONCILE_RUN_TIMEOUT_SECONDS` and used as the `--timeout` default. It
+   is kept a safe margin below Heat's stack `update_timeout` (default 90 min) so
+   the reconciler self-cancels, reports a clean failure, and releases its flock
+   *before* Heat gives up — instead of running on (oneshot units have no start
+   timeout by default) and squatting the lock. All barrier/lease/health waits
+   already honour `ctx`, so this bounds the whole protocol to the Heat window
+   automatically. The reconciler also now traps SIGTERM/SIGINT and cancels its
+   context, so a systemd stop unwinds gracefully.
+
+3. **systemd backstop + no periodic restart loop.** `magnum-reconcile.service`
+   gains `TimeoutStartSec=5100` / `TimeoutStopSec=120` / `KillMode=mixed` so a
+   run that ignores its own context is still reaped and frees the lock.
+   `magnum-reconcile-periodic.service` drops `Restart=on-failure`: a failed
+   periodic run no longer immediately re-grabs the lock for a stuck rotation
+   (the timer re-fires on schedule), so it can never starve a Heat-triggered
+   `run-once`.
+
+4. **Workload rollout is content-gated.** `patchWorkloads` keys its annotation on
+   the SHA-256 fingerprint of the *new CA*, not the rotation id. A genuine CA
+   change rolls workloads exactly once; a resume / periodic re-finalize / repeat
+   that produces the same CA is a `kubectl patch` no-op and rolls nothing. This
+   removes the cluster-wide pod churn that previously accompanied *every*
+   rotation and dragged health waits toward their ceilings.
+
+5. **Pulumi local-backend history is pruned.** The DIY file backend writes a
+   history snapshot on every up/refresh and never prunes it, so each successive
+   operation paid a rising checkpoint cost. After a successful `up` the reconciler
+   trims `.pulumi/history/<stack>/` to the newest 20 versions (never touching the
+   live checkpoint).
+
+Net effect: each operation starts from a bounded, low-churn baseline; a node that
+still cannot converge pauses the rotation safely (as designed) *without* wedging
+Heat or the lock, so retries — and the next operation — make progress instead of
+failing identically forever.
+
+## Barrier robustness (any cluster size, 1 → N masters)
+
+The trust model above is the textbook-safe rotation (bundle-everywhere → leaf
+swap → drop-old, the same shape kubeadm and cert-manager use) and is left
+unchanged. The *coordination* layer that drives the barriers, however, had three
+weaknesses that made large or churning clusters fragile. All three are fixed in
+the coordinator (`internal/carotation/coord.go`); none change the trust model.
+
+1. **The run deadline is the single wait budget.** The barrier wait and the
+   restart-lock acquisition previously used fixed caps (20 min / 30 min) that
+   could fire *well inside* Heat's window — killing a rotation that was still
+   converging, especially with several masters whose control-plane restarts run
+   serially under the Lease and therefore add up. Both waits now derive their
+   deadline from the run context (the Heat-driven `RECONCILER_RUN_TIMEOUT_SECONDS`)
+   minus a short reserve (`barrierReserve`, 90 s) left for a clean failure
+   report. The whole protocol now uses the entire Heat window as one budget and
+   fails only when Heat itself is about to — so adding masters costs wall-clock,
+   not a false timeout. The fixed caps remain only as a fallback when the context
+   has no deadline (manual runs, tests). (`runDeadline`)
+
+2. **Barriers wait only on participants.** `AllNodesReached` previously required
+   *every* Node object in the cluster to report. A node created *after* the
+   rotation started (autoscaler scale-up, a resize add) is minted by Magnum with
+   the **new** CA and runs `create` — for which the rotation module is a no-op —
+   so it never annotates and would block the barrier until timeout. The
+   coordinator now snapshots the set of node names present when the rotation is
+   first established into the ConfigMap (`participants`), and the barriers wait
+   only on that set. The snapshot is exactly the nodes that hold the old CA — i.e.
+   exactly the nodes that must rotate — so this is both deadlock-proof against
+   later-joined nodes and trust-safe. A participant that has since *left* the
+   cluster (deleted and replaced) is likewise skipped, since its replacement
+   carries the new CA. When no snapshot is recorded (an older ConfigMap, or a
+   manually created one) the barrier falls back to "all current nodes", matching
+   the previous behaviour. (`keyParticipants`, `EnsureRotation`, `AllNodesReached`)
+
+3. **Pending nodes are classified, not just named.** While a barrier waits it now
+   logs each outstanding node with a readiness hint
+   (`node-2(NotReady 4m12s)`), so an operator can immediately tell a slow node
+   from a dead one without SSHing in — the difference between "wait" and
+   "intervene". (`notReadyHint`, `formatPending`)
+
+### Still operator-owned
+
+A genuinely dead node that is *not* replaced still halts the rotation at a safe
+dual-trust phase (this is correct: finalizing while it still presents an old leaf
+would break every peer once it returns). With the changes above the rotation now
+*uses the full Heat window* before giving up and *says which node* is the
+holdout; recovery is unchanged — replace the node (its replacement gets the new
+CA and drops out of the participant set) or step the cluster by hand with
+`MAGNUM_CA_ROTATION_PHASE`.
+
+Heat's stack `update_timeout` (a global `cluster_heat.update_timeout`, not
+per-cluster) bounds everything; `RECONCILER_RUN_TIMEOUT_SECONDS` is held a margin
+below it. On very large master counts (serial restarts dominate wall-clock),
+raise both together — they are the one knob that scales the protocol to cluster
+size.

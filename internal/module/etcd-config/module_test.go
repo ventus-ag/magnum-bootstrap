@@ -2,6 +2,7 @@ package etcdconfig
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
@@ -48,27 +49,85 @@ func TestSkipMembershipReconcileIgnoresAlreadyAppliedCARotation(t *testing.T) {
 	}
 }
 
-func TestDiscoveryEndpointHealthRequired(t *testing.T) {
-	tests := []struct {
-		name            string
-		numberOfMasters int
-		want            bool
-	}{
-		{name: "unknown", numberOfMasters: 0, want: false},
-		{name: "single master", numberOfMasters: 1, want: true},
-		{name: "multi master", numberOfMasters: 3, want: false},
+func TestStaticInitialClusterMembers(t *testing.T) {
+	master := func(instance, initial string, n int) config.Config {
+		return config.Config{
+			Shared: config.SharedConfig{InstanceName: instance, NodegroupRole: "master"},
+			Master: &config.MasterConfig{NumberOfMasters: n, InitialCluster: initial},
+		}
 	}
-
+	tests := []struct {
+		name     string
+		cfg      config.Config
+		wantOK   bool
+		wantList string
+	}{
+		{
+			name:     "explicit ETCD_INITIAL_CLUSTER wins",
+			cfg:      master("kube-x-master-1", "a=https://10.0.0.1:2380,b=https://10.0.0.2:2380", 3),
+			wantOK:   true,
+			wantList: "a=https://10.0.0.1:2380,b=https://10.0.0.2:2380",
+		},
+		{
+			name:     "single master self-bootstraps",
+			cfg:      master("kube-x-master-0", "", 1),
+			wantOK:   true,
+			wantList: "kube-x-master-0=https://10.9.9.9:2380",
+		},
+		{
+			name:     "first master (master-0) self-bootstraps in multi-master",
+			cfg:      master("kube-x-master-0", "", 3),
+			wantOK:   true,
+			wantList: "kube-x-master-0=https://10.9.9.9:2380",
+		},
+		{
+			name:   "non-first master without a list cannot bootstrap",
+			cfg:    master("kube-x-master-2", "", 3),
+			wantOK: false,
+		},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := config.Config{
-				Master: &config.MasterConfig{
-					NumberOfMasters: tt.numberOfMasters,
-				},
+			got, ok := staticInitialClusterMembers(tt.cfg, "10.9.9.9", "https")
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %t, want %t (list=%q)", ok, tt.wantOK, got)
 			}
-			if got := discoveryEndpointHealthRequired(cfg); got != tt.want {
-				t.Fatalf("expected %t, got %t", tt.want, got)
+			if ok && got != tt.wantList {
+				t.Fatalf("list = %q, want %q", got, tt.wantList)
 			}
 		})
+	}
+}
+
+func TestBuildConfigNewStatic(t *testing.T) {
+	cfg := config.Config{
+		Shared: config.SharedConfig{InstanceName: "kube-x-master-0", ClusterUUID: "uuid-123", TLSDisabled: true},
+		Master: &config.MasterConfig{NumberOfMasters: 1},
+	}
+	members := "kube-x-master-0=http://10.9.9.9:2380"
+	conf := buildConfig(cfg, "10.9.9.9", "http", "new-static", members)
+
+	for _, want := range []string{
+		"initial-cluster: \"" + members + "\"",
+		"initial-cluster-state: \"new\"",
+		"initial-cluster-token: \"etcd-uuid-123\"",
+	} {
+		if !strings.Contains(conf, want) {
+			t.Fatalf("new-static config missing %q\n---\n%s", want, conf)
+		}
+	}
+	if strings.Contains(conf, "discovery:") {
+		t.Fatalf("new-static config must not contain a discovery URL\n---\n%s", conf)
+	}
+}
+
+func TestEtcdClusterToken(t *testing.T) {
+	withUUID := config.Config{Shared: config.SharedConfig{ClusterUUID: "abc"}}
+	if got := etcdClusterToken(withUUID); got != "etcd-abc" {
+		t.Fatalf("token with uuid = %q, want etcd-abc", got)
+	}
+	none := config.Config{}
+	if got := etcdClusterToken(none); got != "magnum-etcd-cluster" {
+		t.Fatalf("token without uuid = %q, want magnum-etcd-cluster", got)
 	}
 }

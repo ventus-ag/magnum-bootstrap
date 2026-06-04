@@ -414,6 +414,64 @@ The periodic reconciler runs via `magnum-reconcile.timer`:
 
 The timer is started AFTER the synchronous Heat-triggered run to avoid racing.
 
+## E2E Test Runner
+
+The FCoS-VM e2e tier (`e2e/vm/`) runs on a **self-hosted GitHub Actions runner**.
+Read this before testing so you don't rediscover its quirks.
+
+- **Host:** `ssh ubuntu@185.226.43.12` (runner `magnum-actions01`, 8 vCPU / 31 GB).
+  Key-based SSH; passwordless sudo. No `gh` CLI; no libguestfs; no `butane`/`docker`
+  (only **`podman`** — the harness uses it as the butane renderer).
+- **Virtualization — TCG only, SLOW.** The runner is itself a nested AMD-V (Zen1)
+  L1 guest; KVM is unusable (AVIC is mutually exclusive with nesting → L2 boots
+  freeze after `basic.target`). `run-fcos-e2e.sh` auto-selects **TCG** (pure
+  emulation, ~4.5 min FCoS boot; a full `create` reaches the containerd phase
+  ~12 min in). Force KVM with `ALLOW_KVM_ON_NESTED_AMD=1` (it will hang). For fast
+  e2e use an Intel-nested / AMD-with-AVIC / bare-metal runner instead.
+- **Go:** not in the default PATH — at
+  `/home/ubuntu/actions-runner/_work/_tool/go/<ver>/x64/bin` (currently 1.25.6).
+  Add it to PATH for manual runs.
+- **Cached FCoS image:** `~/.cache/fcos-e2e/fcos-stable.qcow2` (currently **FCoS 44**,
+  composefs/read-only `/usr` — see the `--keep-directory-symlink` containerd note).
+  Prod runs an older pre-composefs FCoS; the reconciler must work on both.
+
+### Run a scenario manually (when the GHA agent is idle)
+
+The harness builds the binary from `$REPO_ROOT` (the script's repo), so sync your
+working tree to the runner and run it there — no commit/push required:
+
+```bash
+# from a local checkout of both repos:
+rsync -az --mkpath -e ssh --delete --exclude=.git --exclude=dist --exclude='*.qcow2' \
+  magnum-bootstrap/  ubuntu@185.226.43.12:/home/ubuntu/e2e-validate/magnum-bootstrap/
+rsync -az --mkpath -e ssh --delete --exclude=.git \
+  magnum_victoria/   ubuntu@185.226.43.12:/home/ubuntu/e2e-validate/magnum_victoria/
+
+ssh ubuntu@185.226.43.12 '
+  cd /home/ubuntu/e2e-validate/magnum-bootstrap
+  export PATH=/home/ubuntu/actions-runner/_work/_tool/go/1.25.6/x64/bin:$PATH
+  setsid env SCENARIOS=create MASTERS=1 KEEP_VM=0 \
+    VICTORIA_DIR=/home/ubuntu/e2e-validate/magnum_victoria FCOS_STREAM=stable \
+    bash ./e2e/vm/run-fcos-e2e.sh > /home/ubuntu/e2e-validate/run-create.log 2>&1 </dev/null &
+'
+# then poll /home/ubuntu/e2e-validate/run-create.log
+```
+
+Key env knobs: `SCENARIOS` (`create ca-rotate upgrade`), `MASTERS` (>=2 → multi-master
++ 2 LBs, TCG-slow), `WORKERS`, `KEEP_VM=1` (leave VMs up — SSH the master via the
+per-workdir key `<workdir>/id_ed25519` on the hostfwd port printed in the log),
+`VICTORIA_DIR` (required). Reconcile output is streamed into the harness log.
+
+### CI path
+
+The `e2e-fcos` job (in `.github/workflows/ci.yaml`) runs on **every PR**
+(`opened`/`synchronize`/`reopened`) on this runner; pushing to a PR branch
+re-triggers it. Requires the runner's GHA agent to be up
+(`Runner.Listener`/`Runner.Worker` processes). The `e2e-fcos-multimaster` and
+`e2e-openstack` jobs are label-gated. `e2e-openstack` drives real OpenStack via
+the prebuilt `e2e/cmd/magnum-e2e` Go binary (gophercloud + client-go, standard
+`OS_*` env auth) — no `openstack`/`kubectl` CLIs or `clouds.yaml` on the runner.
+
 ## Remaining Work
 
 - [ ] Add `make test` and `make lint` targets to Makefile
