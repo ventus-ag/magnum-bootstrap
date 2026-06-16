@@ -1,0 +1,192 @@
+name: e2e-openstack
+
+# Real-OpenStack e2e tier (provisions billed cloud resources). Two entrypoints
+# for ONE job definition:
+#
+#   * workflow_call   — invoked by ci.yaml after its `build` job. Reuses the
+#                       `bootstrap-dist` artifact (use_prebuilt=true), exactly as
+#                       this tier ran when it was an inline ci.yaml job.
+#   * workflow_dispatch — run the OpenStack tier on its own, decoupled from a
+#                       full CI run. No upstream `build`, so it compiles its own
+#                       `bootstrap` + `magnum-e2e` first (use_prebuilt is unset →
+#                       falsy → build path).
+#
+# Driven by the `magnum-e2e` Go binary (gophercloud + client-go) — no
+# openstack/kubectl CLIs or clouds.yaml on the runner. Auth is standard OS_* env
+# (application credential preferred; user/password also supported). The reconciler
+# node binary is delivered to nodes by staging the freshly-built `bootstrap` into
+# the cloud's Swift store (BOOTSTRAP_BINARY, public-read, deleted at teardown),
+# unless a RECONCILER_BINARY_URL override is configured.
+
+on:
+  workflow_call:
+    inputs:
+      # ci.yaml passes true so this reuses the parent run's build artifact.
+      # Standalone workflow_dispatch leaves it undefined (falsy) → build path.
+      use_prebuilt:
+        description: Reuse the bootstrap-dist artifact from the calling run instead of building
+        type: boolean
+        default: false
+      keep_cluster:
+        description: Leave the OpenStack cluster in place after the run (debug)
+        type: boolean
+        default: false
+      os_master_count_resize:
+        description: "Post-rotation master target (1->N). 0/empty = add a worker instead"
+        type: string
+        default: "2"
+      os_skip_upgrade:
+        description: Skip the upgrade step (faster run)
+        type: boolean
+        default: false
+      os_skip_resize:
+        description: Skip the pre-rotation worker resize step (faster run)
+        type: boolean
+        default: false
+      os_skip_post_rotate:
+        description: Skip the post-rotation add-node + SA-consistency check
+        type: boolean
+        default: false
+    # Auth secrets are forwarded by the caller via `secrets: inherit`, so they
+    # need no explicit redeclaration here.
+  workflow_dispatch:
+    inputs:
+      keep_cluster:
+        description: Leave the OpenStack cluster in place after the run (debug)
+        type: boolean
+        default: false
+      os_master_count_resize:
+        description: "Post-rotation master target (1->N). 0/empty = add a worker instead"
+        type: string
+        default: "2"
+      os_skip_upgrade:
+        description: Skip the upgrade step (faster run)
+        type: boolean
+        default: false
+      os_skip_resize:
+        description: Skip the pre-rotation worker resize step (faster run)
+        type: boolean
+        default: false
+      os_skip_post_rotate:
+        description: Skip the post-rotation add-node + SA-consistency check
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never run two billed cloud clusters concurrently. Queue rather than cancel:
+# teardown is an `always()` step, and cancelling mid-run could orphan billed
+# resources before it gets a chance to clean up.
+concurrency:
+  group: e2e-openstack
+  cancel-in-progress: false
+
+jobs:
+  e2e-openstack:
+    name: e2e-openstack
+    runs-on: self-hosted
+    # Standard OpenStack RC env, shared by the run and teardown steps. The tool's
+    # own auth reader honours the full split-domain RC (OS_USER_DOMAIN_* vs
+    # OS_PROJECT_DOMAIN_*), and prefers an application credential when its vars
+    # are set, else user/password. Unset values resolve to empty and are ignored.
+    # Auth secrets live in repo Secrets; non-sensitive scope/config in Variables.
+    env:
+      OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+      OS_REGION_NAME: ${{ vars.OS_REGION_NAME }}
+      OS_INTERFACE: ${{ vars.OS_INTERFACE || 'public' }}
+      OS_IDENTITY_API_VERSION: "3"
+      # Application credential (preferred) …
+      OS_APPLICATION_CREDENTIAL_ID: ${{ secrets.OS_APPLICATION_CREDENTIAL_ID }}
+      OS_APPLICATION_CREDENTIAL_SECRET: ${{ secrets.OS_APPLICATION_CREDENTIAL_SECRET }}
+      # … or user/password.
+      OS_USERNAME: ${{ secrets.OS_USERNAME }}
+      OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+      OS_USER_DOMAIN_NAME: ${{ vars.OS_USER_DOMAIN_NAME }}
+      OS_USER_DOMAIN_ID: ${{ vars.OS_USER_DOMAIN_ID }}
+      # Project scope — OS_PROJECT_ID is preferred (used alone); name+domain is
+      # the fallback when only a project name is known.
+      OS_PROJECT_ID: ${{ vars.OS_PROJECT_ID }}
+      OS_PROJECT_NAME: ${{ vars.OS_PROJECT_NAME }}
+      OS_PROJECT_DOMAIN_ID: ${{ vars.OS_PROJECT_DOMAIN_ID }}
+      OS_PROJECT_DOMAIN_NAME: ${{ vars.OS_PROJECT_DOMAIN_NAME }}
+      # Magnum run config. Templates are version-pinned (template name == k8s
+      # version), so the version comes from the template, not a kube_tag label.
+      CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
+      UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
+      # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.
+      KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
+      CLUSTER_NAME: recon-e2e-${{ github.run_id }}
+      # Reconciler binary delivery. Default: BOOTSTRAP_BINARY (set per-step
+      # below) stages the EXACT prebuilt binary into the cloud's Swift store
+      # (public-read, deleted at teardown) and sets reconciler_version/url
+      # automatically — so the node tests this build, with no release/host to
+      # maintain. RECONCILER_VERSION/URL are an optional override (e.g. pin a
+      # published release instead of staging); leave unset to use staging.
+      RECONCILER_VERSION: ${{ vars.RECONCILER_VERSION }}
+      RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
+      # Tier knobs come from inputs so they resolve identically for both
+      # workflow_call (from ci.yaml) and standalone workflow_dispatch.
+      KEEP_CLUSTER: ${{ inputs.keep_cluster && '1' || '0' }}
+      # Reproduce the rotate→master-resize incident: after ca-rotate the suite
+      # adds a 2nd master (1→2) and asserts service-account token trust stays
+      # consistent across masters. Overridable on dispatch; defaults to "2".
+      MASTER_COUNT_RESIZE: ${{ inputs.os_master_count_resize || '2' }}
+      SKIP_UPGRADE: ${{ inputs.os_skip_upgrade && '1' || '' }}
+      SKIP_RESIZE: ${{ inputs.os_skip_resize && '1' || '' }}
+      SKIP_POST_ROTATE: ${{ inputs.os_skip_post_rotate && '1' || '' }}
+    steps:
+      # ── Build path (standalone dispatch only). No upstream `build` job to reuse,
+      #    so compile both binaries into the same dir the artifact path uses, so
+      #    every downstream step is path-identical. Only `bootstrap` (staged into
+      #    Swift) + `magnum-e2e` (the driver) are needed; the OpenStack tier does
+      #    not use the magnumhost provider plugin, so no full `make build`.
+      - name: Checkout
+        if: ${{ !inputs.use_prebuilt }}
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: ${{ !inputs.use_prebuilt }}
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        if: ${{ !inputs.use_prebuilt }}
+        run: |
+          mkdir -p "${{ runner.temp }}/prebuilt"
+          CGO_ENABLED=0 go build -trimpath -o "${{ runner.temp }}/prebuilt/bootstrap"  ./cmd/bootstrap
+          CGO_ENABLED=0 go build -trimpath -o "${{ runner.temp }}/prebuilt/magnum-e2e" ./e2e/cmd/magnum-e2e
+          ls -lh "${{ runner.temp }}/prebuilt"
+
+      # ── Artifact path (called from ci.yaml). Reuses the binaries the parent
+      #    run's `build` job already produced and uploaded.
+      - name: Download prebuilt binaries
+        if: ${{ inputs.use_prebuilt }}
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: ${{ runner.temp }}/prebuilt
+
+      - name: Preflight (auth + template reachable)
+        run: |
+          chmod +x "${{ runner.temp }}/prebuilt/magnum-e2e"
+          "${{ runner.temp }}/prebuilt/magnum-e2e" -preflight
+
+      - name: Run OpenStack Magnum e2e
+        # Stage the prebuilt reconciler into Swift unless an explicit
+        # RECONCILER_BINARY_URL override is configured.
+        env:
+          BOOTSTRAP_BINARY: ${{ vars.RECONCILER_BINARY_URL == '' && format('{0}/prebuilt/bootstrap', runner.temp) || '' }}
+        run: "${{ runner.temp }}/prebuilt/magnum-e2e"
+
+      - name: Tear down cluster (safety net)
+        if: always()
+        env:
+          BOOTSTRAP_BINARY: ${{ vars.RECONCILER_BINARY_URL == '' && format('{0}/prebuilt/bootstrap', runner.temp) || '' }}
+        run: |
+          if [ "${KEEP_CLUSTER}" = "1" ]; then
+            echo "KEEP_CLUSTER=1 — leaving ${CLUSTER_NAME} in place"
+          else
+            "${{ runner.temp }}/prebuilt/magnum-e2e" -teardown || true
+          fi
