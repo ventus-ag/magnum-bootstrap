@@ -59,6 +59,13 @@ type config struct {
 	skipResize        bool
 	skipCARotate      bool
 	skipPostRotate    bool
+
+	// scenario/ops drive the op-chain engine. Precedence: ops > scenario >
+	// legacy skip-flags. nodepool* configure the extra worker nodegroup.
+	scenario       string
+	ops            string
+	nodepoolName   string
+	nodepoolFlavor string
 }
 
 // mode flags
@@ -93,9 +100,15 @@ func envBool(key string) bool {
 
 func loadConfig() config {
 	var c config
-	// Cluster name default mirrors the old bash: recon-e2e-<timestamp>. This is
-	// a normal binary (not a Workflow script), so time.Now() is fine here.
-	defName := envOr("CLUSTER_NAME", "recon-e2e-"+time.Now().UTC().Format("20060102-150405"))
+	// Cluster name default mirrors the old bash: recon-e2e-[<scenario>-]<timestamp>.
+	// The scenario tag keeps sequential matrix runs + teardown from colliding.
+	// This is a normal binary (not a Workflow script), so time.Now() is fine here.
+	ts := time.Now().UTC().Format("20060102-150405")
+	defName := "recon-e2e-" + ts
+	if sc := envOr("SCENARIO", ""); sc != "" {
+		defName = "recon-e2e-" + sc + "-" + ts
+	}
+	defName = envOr("CLUSTER_NAME", defName)
 
 	flag.StringVar(&c.clusterName, "cluster-name", defName, "cluster name [CLUSTER_NAME]")
 	flag.StringVar(&c.template, "template", envOr("CLUSTER_TEMPLATE", ""), "Magnum cluster template name or UUID [CLUSTER_TEMPLATE]")
@@ -118,6 +131,10 @@ func loadConfig() config {
 	skipRz := flag.Bool("skip-resize", envBool("SKIP_RESIZE"), "skip the resize step [SKIP_RESIZE]")
 	skip := flag.Bool("skip-ca-rotate", envBool("SKIP_CA_ROTATE"), "skip the ca-rotate step [SKIP_CA_ROTATE]")
 	skipPR := flag.Bool("skip-post-rotate", envBool("SKIP_POST_ROTATE"), "skip the post-rotation add-node + SA-consistency stage [SKIP_POST_ROTATE]")
+	flag.StringVar(&c.scenario, "scenario", envOr("SCENARIO", ""), "scenario preset (smoke|multinode|chained-single|chained-multinode); sets shape + op chain. Use SCENARIO env so the cluster-name tag + shape defaults apply [SCENARIO]")
+	flag.StringVar(&c.ops, "ops", envOr("OPS", ""), "explicit comma op chain, overrides scenario, e.g. upgrade,ca-rotate,resize-workers=3,add-nodepool=2 [OPS]")
+	flag.StringVar(&c.nodepoolName, "nodepool-name", envOr("NODEPOOL_NAME", "e2e-np"), "name of the extra worker nodepool (nodegroup) [NODEPOOL_NAME]")
+	flag.StringVar(&c.nodepoolFlavor, "nodepool-flavor", envOr("NODEPOOL_FLAVOR", ""), "flavor for the extra nodepool (a different node size); empty = template default [NODEPOOL_FLAVOR]")
 
 	flag.Parse()
 
@@ -129,7 +146,26 @@ func loadConfig() config {
 	if c.upgradeTemplate == "" {
 		c.upgradeTemplate = c.template
 	}
+
+	// Apply the scenario's cluster shape for any count the user did NOT set
+	// explicitly (explicit flag OR env var always wins over the preset).
+	if sc, ok := scenarios[c.scenario]; ok {
+		set := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		if !set["master-count"] && !envPresent("MASTER_COUNT") {
+			c.masterCount = sc.masters
+		}
+		if !set["node-count"] && !envPresent("NODE_COUNT") {
+			c.nodeCount = sc.workers
+		}
+	}
 	return c
+}
+
+// envPresent reports whether an environment variable is set (even if empty).
+func envPresent(key string) bool {
+	_, ok := os.LookupEnv(key)
+	return ok
 }
 
 func main() {

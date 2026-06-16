@@ -22,6 +22,11 @@ type runner struct {
 	magnum   *gophercloud.ServiceClient
 	nova     *gophercloud.ServiceClient // compute client, built lazily
 	swift    *gophercloud.ServiceClient // object-store client, built lazily
+
+	// nodepoolActive tracks whether the extra worker nodepool currently exists
+	// (toggled by add-nodepool / del-nodepool ops). When true, the verify bundle
+	// also asserts the nodepool is schedulable.
+	nodepoolActive bool
 }
 
 // computeClient returns a lazily-built, cached Nova (compute v2) client.
@@ -216,9 +221,21 @@ func (r *runner) listResources(ctx context.Context) error {
 	return nil
 }
 
-// run executes the full lifecycle. Each step returns an error that aborts the
-// run; main() handles teardown.
+// run executes the full lifecycle: create the cluster in its configured shape,
+// run the baseline smoke + cloud integration, then drive the resolved op chain
+// (scenario preset, explicit OPS, or legacy SKIP_* flags). Each op settles the
+// cluster, triggers its Magnum action with busy/transient retry, waits for the
+// update to actually start and complete, then runs the verify bundle. main()
+// handles teardown.
 func (r *runner) run(ctx context.Context) error {
+	// Resolve (and validate) the op chain BEFORE creating any billed resource,
+	// so a bad scenario/op name fails fast.
+	ops, err := r.resolveOpList()
+	if err != nil {
+		return err
+	}
+	r.log("op chain (%d): %s", len(ops), formatOps(ops))
+
 	if err := r.preflight(ctx); err != nil {
 		return err
 	}
@@ -236,38 +253,87 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.smokeCore(ctx); err != nil {
 		return err
 	}
+	if err := r.verifyNodeCount(ctx); err != nil {
+		return err
+	}
 	if err := r.smokeCloudIntegration(ctx); err != nil {
 		return err
 	}
-	if r.cfg.skipUpgrade {
-		r.log("SKIP_UPGRADE set — skipping upgrade step")
-	} else if err := r.upgradeCluster(ctx); err != nil {
-		return err
-	}
-	if r.cfg.skipResize {
-		r.log("SKIP_RESIZE set — skipping resize step")
-	} else if err := r.resizeCluster(ctx); err != nil {
-		return err
-	}
-	if r.cfg.skipCARotate {
-		r.log("SKIP_CA_ROTATE set — skipping ca-rotate step")
-	} else if err := r.caRotateCluster(ctx); err != nil {
-		return err
-	}
-	// Post-rotation add-node: reproduces the incident class (a node added
-	// AFTER a CA rotation) and verifies SA-token trust stays consistent.
-	// Needs a rotation to have happened first.
-	switch {
-	case r.cfg.skipCARotate:
-		r.log("ca-rotate skipped — skipping post-rotation add-node + SA check")
-	case r.cfg.skipPostRotate:
-		r.log("SKIP_POST_ROTATE set — skipping post-rotation add-node + SA check")
-	default:
-		if err := r.postRotateScale(ctx); err != nil {
-			return err
+
+	for i, o := range ops {
+		r.log("──────── op %d/%d: %s ────────", i+1, len(ops), formatOp(o))
+		if err := r.execOp(ctx, o); err != nil {
+			return fmt.Errorf("op %s: %w", formatOp(o), err)
 		}
 	}
 	return nil
+}
+
+// execOp dispatches a single op to its Magnum trigger (via runMutation, which
+// owns settle/retry/wait/verify) or to a read-only verification.
+func (r *runner) execOp(ctx context.Context, o op) error {
+	switch o.name {
+	case "upgrade":
+		return r.runMutation(ctx, "upgrade", true, func() error { return r.triggerUpgrade(ctx) })
+
+	case "ca-rotate":
+		return r.runMutation(ctx, "ca-rotate", true, func() error { return r.triggerCARotate(ctx) })
+
+	case "resize-workers":
+		target := o.argOr(r.cfg.nodeCountResize)
+		return r.runMutation(ctx, fmt.Sprintf("resize-workers=%d", target), true, func() error {
+			return r.triggerWorkerResize(ctx, target)
+		})
+
+	case "resize-masters":
+		target := o.argOr(r.cfg.masterCountResize)
+		return r.runMutation(ctx, fmt.Sprintf("resize-masters=%d", target), true, func() error {
+			ng, err := r.resolveNodeGroup(ctx, "master")
+			if err != nil {
+				return err
+			}
+			return r.triggerNodeGroupResize(ctx, ng, target)
+		})
+
+	case "resize-nodepool":
+		target := o.argOr(1)
+		return r.runMutation(ctx, fmt.Sprintf("resize-nodepool=%d", target), true, func() error {
+			ng, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
+			if err != nil {
+				return err
+			}
+			return r.triggerNodeGroupResize(ctx, ng, target)
+		})
+
+	case "add-nodepool":
+		count := o.argOr(1)
+		if err := r.runMutation(ctx, fmt.Sprintf("add-nodepool=%d", count), true, func() error {
+			return r.triggerNodepoolCreate(ctx, count)
+		}); err != nil {
+			return err
+		}
+		r.nodepoolActive = true
+		return nil
+
+	case "del-nodepool":
+		if err := r.runMutation(ctx, "del-nodepool", true, func() error {
+			return r.triggerNodepoolDelete(ctx)
+		}); err != nil {
+			return err
+		}
+		r.nodepoolActive = false
+		return nil
+
+	case "post-rotate":
+		return r.postRotateScale(ctx)
+
+	case "cloud-smoke":
+		return r.smokeCloudIntegration(ctx)
+
+	case "verify-sa":
+		return r.verifySAConsistency(ctx)
+	}
+	return fmt.Errorf("unhandled op %q", o.name)
 }
 
 // preflight verifies auth works and that the configured template + keypair are
@@ -276,6 +342,14 @@ func (r *runner) preflight(ctx context.Context) error {
 	if r.cfg.template == "" {
 		return fmt.Errorf("CLUSTER_TEMPLATE (-template) is required")
 	}
+	// Resolve + print the cluster shape and op chain so a dry -preflight run
+	// shows exactly what a full run would do (and fails fast on a bad scenario).
+	ops, err := r.resolveOpList()
+	if err != nil {
+		return err
+	}
+	r.log("scenario=%q shape: %d master(s) / %d worker(s), nodepool=%q", r.cfg.scenario, r.cfg.masterCount, r.cfg.nodeCount, r.nodepoolName())
+	r.log("op chain (%d): %s", len(ops), formatOps(ops))
 	// KEYPAIR is optional — an ephemeral keypair is auto-created when unset.
 	ct, err := clustertemplates.Get(ctx, r.magnum, r.cfg.template).Extract()
 	if err != nil {
@@ -419,12 +493,13 @@ func (r *runner) createCluster(ctx context.Context) (string, error) {
 	return uuid, nil
 }
 
-func (r *runner) upgradeCluster(ctx context.Context) error {
-	r.log("=== upgrade cluster -> %s ===", r.cfg.kubeTagUpgrade)
-	// Magnum upgrade targets a template. Many deployments parameterise a single
-	// template by the kube_tag label, in which case -upgrade-template == -template
-	// and the version bump rides on the cluster's kube_tag; if you keep a distinct
-	// template per version, point -upgrade-template at it.
+// triggerUpgrade fires the Magnum upgrade action (no wait — runMutation owns
+// settle/wait/verify). Magnum upgrade targets a template; many deployments
+// parameterise a single template by the kube_tag label, in which case
+// -upgrade-template == -template and the version bump rides on the cluster's
+// kube_tag; if you keep a distinct template per version, point -upgrade-template
+// at it.
+func (r *runner) triggerUpgrade(ctx context.Context) error {
 	tmplID, err := r.resolveTemplateID(ctx, r.cfg.upgradeTemplate)
 	if err != nil {
 		return fmt.Errorf("resolve upgrade template: %w", err)
@@ -432,22 +507,16 @@ func (r *runner) upgradeCluster(ctx context.Context) error {
 	if _, err := clusters.Upgrade(ctx, r.magnum, r.cfg.clusterName, clusters.UpgradeOpts{ClusterTemplate: tmplID}).Extract(); err != nil {
 		return fmt.Errorf("upgrade: %w", err)
 	}
-	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
-		return err
-	}
-	return r.smokeCore(ctx)
+	return nil
 }
 
-func (r *runner) resizeCluster(ctx context.Context) error {
-	r.log("=== resize cluster workers -> %d ===", r.cfg.nodeCountResize)
-	n := r.cfg.nodeCountResize
+// triggerWorkerResize fires a resize of the default worker count (no wait).
+func (r *runner) triggerWorkerResize(ctx context.Context, target int) error {
+	n := target
 	if _, err := clusters.Resize(ctx, r.magnum, r.cfg.clusterName, clusters.ResizeOpts{NodeCount: &n}).Extract(); err != nil {
-		return fmt.Errorf("resize: %w", err)
+		return fmt.Errorf("resize workers -> %d: %w", target, err)
 	}
-	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
-		return err
-	}
-	return r.smokeCore(ctx)
+	return nil
 }
 
 // resolveNodeGroup returns the default nodegroup with the given role
@@ -481,25 +550,88 @@ func (r *runner) resolveNodeGroup(ctx context.Context, role string) (*nodegroups
 	return nil, fmt.Errorf("no %s nodegroup found for cluster %s", role, r.cfg.clusterName)
 }
 
-// resizeNodeGroup resizes a specific nodegroup (worker OR master) to target and
-// waits for the stack to settle. Master resize goes through the same Magnum
-// resize action with the nodegroup pinned by UUID.
-func (r *runner) resizeNodeGroup(ctx context.Context, ng *nodegroups.NodeGroup, target int) error {
+// resolveNodeGroupByName returns the nodegroup with the given name (used for the
+// extra nodepool, which is non-default).
+func (r *runner) resolveNodeGroupByName(ctx context.Context, name string) (*nodegroups.NodeGroup, error) {
+	pages, err := nodegroups.List(r.magnum, r.cfg.clusterName, nil).AllPages(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodegroups: %w", err)
+	}
+	ngs, err := nodegroups.ExtractNodeGroups(pages)
+	if err != nil {
+		return nil, fmt.Errorf("extract nodegroups: %w", err)
+	}
+	for i := range ngs {
+		if ngs[i].Name == name {
+			ng := ngs[i]
+			return &ng, nil
+		}
+	}
+	return nil, fmt.Errorf("nodegroup %q not found on cluster %s", name, r.cfg.clusterName)
+}
+
+// triggerNodeGroupResize resizes a specific nodegroup (worker/master/nodepool)
+// to target (no wait — runMutation owns settle/wait/verify). The Magnum resize
+// action is pinned to the nodegroup by UUID.
+func (r *runner) triggerNodeGroupResize(ctx context.Context, ng *nodegroups.NodeGroup, target int) error {
 	n := target
 	opts := clusters.ResizeOpts{NodeCount: &n, NodeGroup: ng.UUID}
 	if _, err := clusters.Resize(ctx, r.magnum, r.cfg.clusterName, opts).Extract(); err != nil {
 		return fmt.Errorf("resize nodegroup %s (%s) -> %d: %w", ng.Name, ng.Role, target, err)
 	}
-	return r.waitStatus(ctx, "UPDATE_COMPLETE")
+	return nil
+}
+
+// nodepoolName returns the configured extra-nodepool name (default "e2e-np").
+func (r *runner) nodepoolName() string {
+	if r.cfg.nodepoolName != "" {
+		return r.cfg.nodepoolName
+	}
+	return "e2e-np"
+}
+
+// triggerNodepoolCreate creates the extra worker nodegroup (no wait). It runs
+// with a distinct flavor when NODEPOOL_FLAVOR is set, so the cluster carries
+// heterogeneous node sizes through the op chain. MergeLabels keeps the
+// template's CNI/runtime/reconciler labels (see merge_labels gotcha).
+func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
+	n := count
+	merge := true
+	opts := nodegroups.CreateOpts{
+		Name:        r.nodepoolName(),
+		Role:        "worker",
+		NodeCount:   &n,
+		MergeLabels: &merge,
+	}
+	if r.cfg.nodepoolFlavor != "" {
+		opts.FlavorID = r.cfg.nodepoolFlavor
+	}
+	ng, err := nodegroups.Create(ctx, r.magnum, r.cfg.clusterName, opts).Extract()
+	if err != nil {
+		return fmt.Errorf("create nodepool %q: %w", r.nodepoolName(), err)
+	}
+	r.log("nodepool %q (uuid=%s, flavor=%q) creating with %d node(s)", ng.Name, ng.UUID, r.cfg.nodepoolFlavor, count)
+	return nil
+}
+
+// triggerNodepoolDelete deletes the extra worker nodegroup (no wait).
+func (r *runner) triggerNodepoolDelete(ctx context.Context) error {
+	ng, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
+	if err != nil {
+		return err
+	}
+	if err := nodegroups.Delete(ctx, r.magnum, r.cfg.clusterName, ng.UUID).ExtractErr(); err != nil {
+		return fmt.Errorf("delete nodepool %q: %w", ng.Name, err)
+	}
+	return nil
 }
 
 // postRotateScale reproduces the exact incident: a node ADDED after a CA
 // rotation. The fork rotates the service-account keys into the child node
 // stacks only; without the cluster-stack sync, a node created here would
 // render the PRE-rotation SA keys and split the cluster's SA-token trust. This
-// adds a node post-rotation and asserts (a) it joins Ready (CA path is fetched
-// live, so this catches CA breakage) and (b) SA tokens validate across every
-// master (SA-key path).
+// adds a node post-rotation; the verify bundle (run by runMutation) asserts it
+// joins Ready, the node count matches, and SA tokens validate across masters.
 //
 // It prefers adding a MASTER — the new apiserver is the SA-key surface — when
 // MASTER_COUNT_RESIZE > master count; otherwise it adds a worker.
@@ -516,15 +648,10 @@ func (r *runner) postRotateScale(ctx context.Context) error {
 	if role == "master" {
 		target = r.cfg.masterCountResize
 	}
-	r.log("=== post-rotate add %s: nodegroup %s %d -> %d (validates rotate→resize + SA keys) ===",
-		role, ng.Name, ng.NodeCount, target)
-	if err := r.resizeNodeGroup(ctx, ng, target); err != nil {
-		return err
-	}
-	if err := r.smokeCore(ctx); err != nil {
-		return err
-	}
-	return r.verifySAConsistency(ctx)
+	name := fmt.Sprintf("post-rotate add %s (%s %d->%d)", role, ng.Name, ng.NodeCount, target)
+	return r.runMutation(ctx, name, true, func() error {
+		return r.triggerNodeGroupResize(ctx, ng, target)
+	})
 }
 
 func (r *runner) deleteCluster(ctx context.Context) error {
@@ -598,6 +725,133 @@ func (r *runner) waitStatus(ctx context.Context, want string) error {
 		case <-time.After(20 * time.Second):
 		}
 	}
+}
+
+// getCluster fetches the current cluster object (status + updated_at snapshot).
+func (r *runner) getCluster(ctx context.Context) (*clusters.Cluster, error) {
+	return clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
+}
+
+// ensureSettled blocks until the cluster is in a terminal state (*_COMPLETE),
+// failing fast on *_FAILED. It is the pre-op gate: a mutating op must never be
+// triggered while a previous update is still in flight (Magnum would reject it
+// with 400 "Updating a cluster when status is UPDATE_IN_PROGRESS is not
+// supported").
+func (r *runner) ensureSettled(ctx context.Context) error {
+	deadline := time.Now().Add(time.Duration(r.cfg.timeoutMin) * time.Minute)
+	for {
+		c, err := r.getCluster(ctx)
+		if err == nil {
+			switch {
+			case strings.HasSuffix(c.Status, "_FAILED"):
+				return fmt.Errorf("cluster in %s: %s %v", c.Status, c.StatusReason, c.Faults)
+			case strings.HasSuffix(c.Status, "_COMPLETE"):
+				return nil
+			default:
+				r.log("waiting for cluster to settle (status %s)", c.Status)
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for cluster to settle")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Second):
+		}
+	}
+}
+
+// transitionWindow bounds how long waitTransition watches for an update to
+// visibly start before assuming the op was a no-op (or completed instantly) and
+// proceeding to waitStatus. Kept short so a genuine no-op doesn't stall.
+const transitionWindow = 3 * time.Minute
+
+// waitTransition confirms the just-triggered op actually started — i.e. the
+// status moved to *_IN_PROGRESS or updated_at advanced past the pre-trigger
+// snapshot. This defeats the stale-*_COMPLETE race: Magnum status lags a trigger
+// by a few seconds, so polling for UPDATE_COMPLETE immediately can match the
+// PREVIOUS completion and return before the op even began.
+func (r *runner) waitTransition(ctx context.Context, before *clusters.Cluster) error {
+	if before == nil {
+		return nil // no snapshot — skip straight to completion wait
+	}
+	deadline := time.Now().Add(transitionWindow)
+	for {
+		c, err := r.getCluster(ctx)
+		if err == nil {
+			switch {
+			case strings.HasSuffix(c.Status, "_FAILED"):
+				return fmt.Errorf("cluster entered %s: %s %v", c.Status, c.StatusReason, c.Faults)
+			case strings.HasSuffix(c.Status, "_IN_PROGRESS"):
+				return nil
+			case c.UpdatedAt.After(before.UpdatedAt):
+				return nil // already advanced (fast op)
+			}
+		}
+		if time.Now().After(deadline) {
+			r.log("update did not visibly transition within %s — proceeding to completion wait", transitionWindow)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// runMutation is the robust wrapper EVERY mutating op goes through:
+//
+//	ensureSettled → snapshot → trigger (retry on busy/transient) →
+//	waitTransition → waitStatus(UPDATE_COMPLETE) → verifyBundle
+//
+// disruptive controls whether the verify bundle also runs the SA-consistency
+// probe. The retry loop is what lets a chained op (e.g. ca-rotate right after an
+// upgrade) survive Magnum's lagging status instead of racing it into a 400.
+func (r *runner) runMutation(ctx context.Context, name string, disruptive bool, trigger func() error) error {
+	r.log("=== op: %s ===", name)
+	if err := r.ensureSettled(ctx); err != nil {
+		return fmt.Errorf("pre-op settle: %w", err)
+	}
+	before, _ := r.getCluster(ctx)
+
+	const maxAttempts = 5
+	triggered := false
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := trigger()
+		if err == nil {
+			triggered = true
+			break
+		}
+		if !retryableMutationErr(err) {
+			return fmt.Errorf("trigger: %w", err)
+		}
+		r.log("trigger attempt %d/%d not accepted (%v) — settling + retrying", attempt, maxAttempts, err)
+		if serr := r.ensureSettled(ctx); serr != nil {
+			return fmt.Errorf("settle before retry: %w", serr)
+		}
+		backoff := time.Duration(attempt) * 15 * time.Second
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	if !triggered {
+		return fmt.Errorf("trigger not accepted after %d attempts", maxAttempts)
+	}
+
+	if err := r.waitTransition(ctx, before); err != nil {
+		return fmt.Errorf("wait for update to start: %w", err)
+	}
+	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
+		return err
+	}
+	return r.verifyBundle(ctx, name, disruptive)
 }
 
 // listClusters prints every Magnum cluster in the project with its status —

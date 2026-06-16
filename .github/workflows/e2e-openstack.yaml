@@ -27,6 +27,14 @@ on:
         description: Reuse the bootstrap-dist artifact from the calling run instead of building
         type: boolean
         default: false
+      scenario:
+        description: "Scenario preset: smoke | multinode | chained-single | chained-multinode"
+        type: string
+        default: smoke
+      ops:
+        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
+        type: string
+        default: ""
       keep_cluster:
         description: Leave the OpenStack cluster in place after the run (debug)
         type: boolean
@@ -36,21 +44,34 @@ on:
         type: string
         default: "2"
       os_skip_upgrade:
-        description: Skip the upgrade step (faster run)
+        description: Skip the upgrade step (faster run; legacy, only when scenario/ops unset)
         type: boolean
         default: false
       os_skip_resize:
-        description: Skip the pre-rotation worker resize step (faster run)
+        description: Skip the pre-rotation worker resize step (legacy, only when scenario/ops unset)
         type: boolean
         default: false
       os_skip_post_rotate:
-        description: Skip the post-rotation add-node + SA-consistency check
+        description: Skip the post-rotation add-node + SA-consistency check (legacy)
         type: boolean
         default: false
     # Auth secrets are forwarded by the caller via `secrets: inherit`, so they
     # need no explicit redeclaration here.
   workflow_dispatch:
     inputs:
+      scenario:
+        description: Scenario preset to run
+        type: choice
+        default: smoke
+        options:
+          - smoke
+          - multinode
+          - chained-single
+          - chained-multinode
+      ops:
+        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
+        type: string
+        default: ""
       keep_cluster:
         description: Leave the OpenStack cluster in place after the run (debug)
         type: boolean
@@ -60,15 +81,15 @@ on:
         type: string
         default: "2"
       os_skip_upgrade:
-        description: Skip the upgrade step (faster run)
+        description: Skip the upgrade step (legacy, only when scenario/ops unset)
         type: boolean
         default: false
       os_skip_resize:
-        description: Skip the pre-rotation worker resize step (faster run)
+        description: Skip the pre-rotation worker resize step (legacy, only when scenario/ops unset)
         type: boolean
         default: false
       os_skip_post_rotate:
-        description: Skip the post-rotation add-node + SA-consistency check
+        description: Skip the post-rotation add-node + SA-consistency check (legacy)
         type: boolean
         default: false
 
@@ -116,7 +137,11 @@ jobs:
       UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
       # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.
       KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
-      CLUSTER_NAME: recon-e2e-${{ github.run_id }}
+      # Scenario-tagged name keeps sequential matrix runs + teardown isolated.
+      CLUSTER_NAME: recon-e2e-${{ inputs.scenario }}-${{ github.run_id }}
+      # Scenario preset (shape + op chain) and optional explicit op-chain override.
+      SCENARIO: ${{ inputs.scenario }}
+      OPS: ${{ inputs.ops }}
       # Reconciler binary delivery. Default: BOOTSTRAP_BINARY (set per-step
       # below) stages the EXACT prebuilt binary into the cloud's Swift store
       # (public-read, deleted at teardown) and sets reconciler_version/url

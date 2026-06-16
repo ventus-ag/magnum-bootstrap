@@ -12,6 +12,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/certificates"
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clusters"
+	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/nodegroups"
 	appsv1 "k8s.io/api/apps/v1"
 	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -240,11 +241,11 @@ func (r *runner) cleanupSmoke(ctx context.Context, kc *kubernetes.Clientset) {
 	_ = kc.CoreV1().PersistentVolumeClaims("default").Delete(ctx, "e2e-pvc", metav1.DeleteOptions{})
 }
 
-// caRotateCluster triggers a Magnum CA rotation (PATCH /certificates/{uuid}),
-// waits for the update to complete, then re-runs the core smoke with a client
-// built from the rotated CA — proving the new trust chain works end to end.
-func (r *runner) caRotateCluster(ctx context.Context) error {
-	r.log("=== ca-rotate cluster ===")
+// triggerCARotate fires a Magnum CA rotation (PATCH /certificates/{uuid}) with
+// no wait — runMutation owns settle/wait/verify. The verify bundle re-runs the
+// core smoke with a client rebuilt from the rotated CA, proving the new trust
+// chain works end to end.
+func (r *runner) triggerCARotate(ctx context.Context) error {
 	c, err := clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
 	if err != nil {
 		return fmt.Errorf("get cluster: %w", err)
@@ -252,10 +253,140 @@ func (r *runner) caRotateCluster(ctx context.Context) error {
 	if err := certificates.Update(ctx, r.magnum, c.UUID).ExtractErr(); err != nil {
 		return fmt.Errorf("trigger CA rotation: %w", err)
 	}
-	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
+	return nil
+}
+
+// verifyBundle is the post-op assertion suite run after every mutating op:
+//   - smokeCore           — all nodes Ready (client rebuilt from live/rotated CA)
+//   - verifyNodeCount     — k8s node count matches the sum of nodegroup desired
+//     counts, and control-plane count matches the master nodegroup (catches a
+//     resize/add/remove that didn't fully converge)
+//   - verifySAConsistency — (disruptive ops only) SA-token trust consistent
+//     across masters (split-trust regression)
+//   - verifyNodepoolSchedulable — (when the extra nodepool exists) a pod pinned
+//     to the nodepool actually schedules and runs
+//
+// Idempotency (a second reconcile = 0 changes) is NOT checked here — it needs
+// re-triggering the reconciler on a node, which this tier can't do without a
+// Heat op; it stays covered by the FCoS VM tier.
+func (r *runner) verifyBundle(ctx context.Context, name string, disruptive bool) error {
+	if err := r.smokeCore(ctx); err != nil {
+		return fmt.Errorf("verify %s: %w", name, err)
+	}
+	if err := r.verifyNodeCount(ctx); err != nil {
+		return fmt.Errorf("verify %s: %w", name, err)
+	}
+	if disruptive {
+		if err := r.verifySAConsistency(ctx); err != nil {
+			return fmt.Errorf("verify %s: %w", name, err)
+		}
+	}
+	if r.nodepoolActive {
+		if err := r.verifyNodepoolSchedulable(ctx); err != nil {
+			return fmt.Errorf("verify %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// verifyNodeCount asserts the live Kubernetes node count equals the sum of every
+// nodegroup's desired NodeCount, and the control-plane node count equals the
+// master nodegroup's. This is the general invariant that proves a resize (up OR
+// down), add-nodepool, or master add/remove fully converged — the removed node
+// actually left, the added node actually joined.
+func (r *runner) verifyNodeCount(ctx context.Context) error {
+	pages, err := nodegroups.List(r.magnum, r.cfg.clusterName, nil).AllPages(ctx)
+	if err != nil {
+		return fmt.Errorf("list nodegroups: %w", err)
+	}
+	ngs, err := nodegroups.ExtractNodeGroups(pages)
+	if err != nil {
+		return fmt.Errorf("extract nodegroups: %w", err)
+	}
+	wantTotal, wantCP := 0, 0
+	for _, ng := range ngs {
+		wantTotal += ng.NodeCount
+		if ng.Role == "master" {
+			wantCP += ng.NodeCount
+		}
+	}
+
+	kc, err := r.k8sClient(ctx)
+	if err != nil {
 		return err
 	}
-	return r.smokeCore(ctx)
+	nodes, err := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	gotTotal := len(nodes.Items)
+	gotCP := 0
+	for _, n := range nodes.Items {
+		if _, ok := n.Labels["node-role.kubernetes.io/control-plane"]; ok {
+			gotCP++
+		}
+	}
+	if gotTotal != wantTotal {
+		return fmt.Errorf("node count mismatch: nodegroups want %d, cluster has %d", wantTotal, gotTotal)
+	}
+	if gotCP != wantCP {
+		return fmt.Errorf("control-plane count mismatch: master nodegroup wants %d, cluster has %d", wantCP, gotCP)
+	}
+	r.log("node count OK: %d total (%d control-plane) matches nodegroups ✅", gotTotal, gotCP)
+	return nil
+}
+
+// verifyNodepoolSchedulable proves the extra nodepool's nodes are real, usable
+// workers: it schedules a pod pinned (nodeSelector) to the nodepool's node label
+// (magnum.openstack.org/nodegroup=<name>, set by the reconciler) and asserts it
+// reaches Running on a nodepool node.
+func (r *runner) verifyNodepoolSchedulable(ctx context.Context) error {
+	name := r.nodepoolName()
+	r.log("verify: nodepool %q schedulable", name)
+	kc, err := r.k8sClient(ctx)
+	if err != nil {
+		return err
+	}
+	const podName = "e2e-np-probe"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeSelector:  map[string]string{"magnum.openstack.org/nodegroup": name},
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:  "pause",
+				Image: "registry.k8s.io/pause:3.9",
+			}},
+		},
+	}
+	_ = kc.CoreV1().Pods("default").Delete(ctx, podName, metav1.DeleteOptions{})
+	if _, err := kc.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create nodepool probe pod: %w", err)
+	}
+	defer func() {
+		_ = kc.CoreV1().Pods("default").Delete(ctx, podName, metav1.DeleteOptions{})
+	}()
+
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		p, gerr := kc.CoreV1().Pods("default").Get(ctx, podName, metav1.GetOptions{})
+		if gerr == nil && p.Status.Phase == corev1.PodRunning {
+			r.log("nodepool %q probe pod Running on node %s ✅", name, p.Spec.NodeName)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			phase := "unknown"
+			if gerr == nil {
+				phase = string(p.Status.Phase)
+			}
+			return fmt.Errorf("nodepool %q probe pod did not reach Running (phase=%s) — nodepool not schedulable", name, phase)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
 }
 
 func allNodesReady(nodes []corev1.Node) bool {

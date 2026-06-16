@@ -472,6 +472,44 @@ re-triggers it. Requires the runner's GHA agent to be up
 the prebuilt `e2e/cmd/magnum-e2e` Go binary (gophercloud + client-go, standard
 `OS_*` env auth) — no `openstack`/`kubectl` CLIs or `clouds.yaml` on the runner.
 
+#### e2e-openstack: reusable workflow + scenario matrix
+
+`.github/workflows/e2e-openstack.yaml` is a **reusable workflow** with two
+entrypoints: `workflow_call` (invoked by `ci.yaml` after `build`, reusing the
+`bootstrap-dist` artifact via `use_prebuilt: true`) and `workflow_dispatch`
+(standalone — builds its own `bootstrap` + `magnum-e2e`, decoupled from CI).
+Concurrency group `e2e-openstack` (`cancel-in-progress: false`) so no two billed
+clusters ever run at once.
+
+The driver is an **op-engine**, not a fixed pipeline. `e2e/cmd/magnum-e2e`
+creates a cluster of a configured shape, then runs an ordered op chain
+(`internal` to the driver, file `e2e/cmd/magnum-e2e/ops.go`): `upgrade`,
+`ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
+`resize-nodepool=N`, `del-nodepool`, `post-rotate`, `cloud-smoke`, `verify-sa`.
+Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Presets
+(`SCENARIO`): `smoke` (1m/1w, back-compat), `multinode` (3m/2w + extra worker
+nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rotate),
+`chained-single` and `chained-multinode` (the wedge sequence
+`upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate`).
+
+**Robustness (`runMutation` in cluster.go):** every mutating op goes
+`ensureSettled` → snapshot → trigger (retry on busy/transient) → `waitTransition`
+→ `waitStatus(UPDATE_COMPLETE)` → `verifyBundle`. This fixes the chained-op race
+where `waitStatus` matched a *stale* `*_COMPLETE` and the next op hit a busy
+cluster (`400 "...status is UPDATE_IN_PROGRESS is not supported"`).
+`verifyBundle` = `smokeCore` + `verifyNodeCount` (k8s nodes == sum of nodegroup
+counts, control-plane == master ng) + `verifySAConsistency` (disruptive ops) +
+`verifyNodepoolSchedulable` (when a nodepool exists). Idempotency re-run stays
+FCoS-only (this tier can't re-trigger a node without a Heat op).
+
+`ci.yaml` runs the scenarios as a **sequential matrix** (`max-parallel: 1`,
+`fail-fast: false`): the `e2e-openstack-setup` job emits the scenario list
+(full set for schedule/label/`os_scenario=all`, single on dispatch). Nodepool
+nodes are ordinary workers to the reconciler, labeled
+`magnum.openstack.org/nodegroup=<name>`; master nodegroups are API-blocked so
+multi-master is `master_count` at create (gophercloud
+`nodegroups.Create/Resize/Delete`, v2.12.0).
+
 ## Remaining Work
 
 - [ ] Add `make test` and `make lint` targets to Makefile
