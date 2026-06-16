@@ -53,6 +53,21 @@ on:
         description: Leave the OpenStack cluster in place after the run (debug)
         type: boolean
         default: false
+      os_master_count_resize:
+        description: "OpenStack tier: post-rotation master target (1->N). 0/empty = add a worker instead"
+        default: "2"
+      os_skip_upgrade:
+        description: "OpenStack tier: skip the upgrade step (faster run)"
+        type: boolean
+        default: false
+      os_skip_resize:
+        description: "OpenStack tier: skip the pre-rotation worker resize step (faster run)"
+        type: boolean
+        default: false
+      os_skip_post_rotate:
+        description: "OpenStack tier: skip the post-rotation add-node + SA-consistency check"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
 
@@ -406,8 +421,12 @@ jobs:
       KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster == 'true' && '1' || '0' }}
       # Reproduce the rotate→master-resize incident: after ca-rotate the suite
       # adds a 2nd master (1→2) and asserts service-account token trust stays
-      # consistent across masters. Set to 0/empty to add a worker instead.
-      MASTER_COUNT_RESIZE: "2"
+      # consistent across masters. Overridable on manual dispatch; defaults to
+      # "2" for label/nightly runs.
+      MASTER_COUNT_RESIZE: ${{ github.event.inputs.os_master_count_resize || '2' }}
+      SKIP_UPGRADE: ${{ github.event.inputs.os_skip_upgrade == 'true' && '1' || '' }}
+      SKIP_RESIZE: ${{ github.event.inputs.os_skip_resize == 'true' && '1' || '' }}
+      SKIP_POST_ROTATE: ${{ github.event.inputs.os_skip_post_rotate == 'true' && '1' || '' }}
     steps:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v4
