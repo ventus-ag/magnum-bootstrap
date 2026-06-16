@@ -154,6 +154,11 @@ func newRunner(ctx context.Context, cfg config) (*runner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("locating Magnum (container-infra) endpoint: %w", err)
 	}
+	// Default Magnum microversion is 1.1, which predates the resize (1.7) and
+	// upgrade (1.8) cluster actions — calling them on 1.1 returns 406 Not
+	// Acceptable. Pin to the fork's CURRENT_MAX_VER (1.10) so the full
+	// create→upgrade→resize→ca-rotate flow is accepted.
+	magnum.Microversion = "1.10"
 	return &runner{cfg: cfg, provider: provider, magnum: magnum}, nil
 }
 
