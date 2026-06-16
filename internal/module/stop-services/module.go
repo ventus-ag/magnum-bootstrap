@@ -51,9 +51,20 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	if req.Apply {
 		summary, err := reconcileDrainState(cfg, executor, kubectl, kubeconfig)
 		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		if summary != "" {
+			// Drain/cordon is a best-effort courtesy before the disruptive
+			// service restart below — it must never fail the operation. A
+			// worker's /etc/kubernetes/admin.conf authenticates as
+			// system:node:<node> (Node authorizer + NodeRestriction), which is
+			// forbidden from draining (cannot list nodes or get other nodes'
+			// pods); the drain aborts after partial eviction. The kubelet /
+			// container-runtime restart disrupts pods regardless, so log and
+			// continue instead of wedging the upgrade.
+			if req.Logger != nil {
+				req.Logger.Warnf("stop-services: drain/cordon best-effort failed, continuing: %v", err)
+			}
+			changes = append(changes, host.Change{Action: host.ActionOther,
+				Summary: fmt.Sprintf("drain/cordon node %s skipped (best-effort): %v", cfg.Shared.InstanceName, err)})
+		} else if summary != "" {
 			changes = append(changes, host.Change{Action: host.ActionOther, Summary: summary})
 		}
 	} else {
@@ -220,23 +231,21 @@ func min(a, b int) int {
 // shouldDrain returns true if the node should be drained (not just cordoned).
 // Single-master or single-worker clusters should only be cordoned.
 func shouldDrain(cfg config.Config, executor *host.Executor, kubectl, kubeconfig string) bool {
-	if cfg.Role() == config.RoleMaster {
-		out, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig,
-			"get", "nodes", "--selector=magnum.openstack.org/role=master", "-o", "name")
-		if err == nil {
-			nodes := strings.Fields(out)
-			if len(nodes) <= 1 {
-				return false
-			}
-		}
-	} else {
-		out, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig,
-			"get", "nodes", "--selector=magnum.openstack.org/role!=master", "-o", "name")
-		if err == nil {
-			nodes := strings.Fields(out)
-			if len(nodes) <= 1 {
-				return false
-			}
+	// Workers authenticate via /etc/kubernetes/admin.conf as system:node:<node>
+	// (Node authorizer + NodeRestriction): they cannot list nodes or get other
+	// nodes' pods, so a cluster drain is forbidden and aborts mid-way. Cordon
+	// only for workers (best-effort, see reconcileDrainState caller).
+	if cfg.Role() != config.RoleMaster {
+		return false
+	}
+
+	// Single-master clusters: cordon only — there is nowhere to move the
+	// control plane, and draining the sole master is pointless.
+	out, err := executor.RunCapture(kubectl, "--kubeconfig="+kubeconfig,
+		"get", "nodes", "--selector=magnum.openstack.org/role=master", "-o", "name")
+	if err == nil {
+		if nodes := strings.Fields(out); len(nodes) <= 1 {
+			return false
 		}
 	}
 	return true

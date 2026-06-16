@@ -3,7 +3,21 @@ package stopservices
 import (
 	"strings"
 	"testing"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 )
+
+// TestShouldDrainWorkerCordonOnly locks in that workers are never drained:
+// their /etc/kubernetes/admin.conf authenticates as system:node:<node>, which
+// the Node authorizer forbids from performing a cluster drain. The worker path
+// must return false before touching the executor (nil here).
+func TestShouldDrainWorkerCordonOnly(t *testing.T) {
+	var cfg config.Config
+	cfg.Shared.NodegroupRole = "worker"
+	if shouldDrain(cfg, nil, "kubectl", "/etc/kubernetes/admin.conf") {
+		t.Fatal("worker must be cordon-only (cannot perform a cluster drain)")
+	}
+}
 
 func TestParseDrainBlockersSkipsDaemonSetsAndCompletedPods(t *testing.T) {
 	input := strings.Join([]string{
