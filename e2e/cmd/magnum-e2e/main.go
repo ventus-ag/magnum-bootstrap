@@ -47,6 +47,7 @@ type config struct {
 	nodeCount         int
 	nodeCountResize   int
 	masterCount       int
+	masterCountResize int
 	reconcilerVersion string
 	reconcilerURL     string
 	bootstrapBinary   string // local reconciler binary to stage into Swift (current build)
@@ -57,6 +58,7 @@ type config struct {
 	skipUpgrade       bool
 	skipResize        bool
 	skipCARotate      bool
+	skipPostRotate    bool
 }
 
 // mode flags
@@ -104,6 +106,7 @@ func loadConfig() config {
 	flag.IntVar(&c.nodeCount, "node-count", envIntOr("NODE_COUNT", 1), "initial worker count [NODE_COUNT]")
 	flag.IntVar(&c.nodeCountResize, "node-count-resize", envIntOr("NODE_COUNT_RESIZE", 2), "resize target worker count [NODE_COUNT_RESIZE]")
 	flag.IntVar(&c.masterCount, "master-count", envIntOr("MASTER_COUNT", 1), "master count [MASTER_COUNT]")
+	flag.IntVar(&c.masterCountResize, "master-count-resize", envIntOr("MASTER_COUNT_RESIZE", 0), "post-rotation master target; when > -master-count the post-rotate stage ADDS masters (reproduces rotate→master-resize); 0 = add a worker instead [MASTER_COUNT_RESIZE]")
 	flag.StringVar(&c.reconcilerVersion, "reconciler-version", envOr("RECONCILER_VERSION", ""), "reconciler_version label override [RECONCILER_VERSION]")
 	flag.StringVar(&c.reconcilerURL, "reconciler-binary-url", envOr("RECONCILER_BINARY_URL", ""), "reconciler_binary_url label override [RECONCILER_BINARY_URL]")
 	flag.StringVar(&c.bootstrapBinary, "bootstrap-binary", envOr("BOOTSTRAP_BINARY", ""), "path to a locally-built reconciler binary; staged into Swift (public-read) so nodes fetch this exact build [BOOTSTRAP_BINARY]")
@@ -114,6 +117,7 @@ func loadConfig() config {
 	skipUp := flag.Bool("skip-upgrade", envBool("SKIP_UPGRADE"), "skip the upgrade step [SKIP_UPGRADE]")
 	skipRz := flag.Bool("skip-resize", envBool("SKIP_RESIZE"), "skip the resize step [SKIP_RESIZE]")
 	skip := flag.Bool("skip-ca-rotate", envBool("SKIP_CA_ROTATE"), "skip the ca-rotate step [SKIP_CA_ROTATE]")
+	skipPR := flag.Bool("skip-post-rotate", envBool("SKIP_POST_ROTATE"), "skip the post-rotation add-node + SA-consistency stage [SKIP_POST_ROTATE]")
 
 	flag.Parse()
 
@@ -121,6 +125,7 @@ func loadConfig() config {
 	c.skipUpgrade = *skipUp
 	c.skipResize = *skipRz
 	c.skipCARotate = *skip
+	c.skipPostRotate = *skipPR
 	if c.upgradeTemplate == "" {
 		c.upgradeTemplate = c.template
 	}

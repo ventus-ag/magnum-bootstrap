@@ -404,6 +404,10 @@ jobs:
       RECONCILER_VERSION: ${{ vars.RECONCILER_VERSION }}
       RECONCILER_BINARY_URL: ${{ vars.RECONCILER_BINARY_URL }}
       KEEP_CLUSTER: ${{ github.event.inputs.keep_cluster == 'true' && '1' || '0' }}
+      # Reproduce the rotate→master-resize incident: after ca-rotate the suite
+      # adds a 2nd master (1→2) and asserts service-account token trust stays
+      # consistent across masters. Set to 0/empty to add a worker instead.
+      MASTER_COUNT_RESIZE: "2"
     steps:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v4

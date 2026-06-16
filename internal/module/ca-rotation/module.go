@@ -67,6 +67,25 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		return moduleapi.Result{}, nil
 	}
 
+	// A brand-new node has nothing to rotate FROM. The ca-rotation phase runs
+	// before the certificates phase, so on first boot there is no live ca.crt
+	// yet. This is reached when a node is ADDED (resize, autoscale,
+	// replacement) while the cluster stack still carries a current
+	// ca_rotation_id: the new node inherits that id but must NOT run the
+	// rotation protocol — it has no old material to stage, and no etcd
+	// quorum / API access yet. It provisions fresh certs against the
+	// already-current CA via the certificates phase. Record the rotation as
+	// applied so it is not retried on later runs.
+	if !nonEmpty(filepath.Join(certDir, "ca.crt")) {
+		logf(req, "skipping ca rotation rotationId=%s: fresh node with no live CA (provisioning against current CA)", rotationID)
+		if req.Apply {
+			if err := coord.WriteMarker(rotationID); err != nil {
+				return moduleapi.Result{}, fmt.Errorf("ca-rotation: mark rotation applied on fresh node: %w", err)
+			}
+		}
+		return moduleapi.Result{}, nil
+	}
+
 	// Dry-run: report the rotation as a planned replace and stop.
 	if !req.Apply {
 		return moduleapi.Result{Changes: []host.Change{{

@@ -12,6 +12,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/keypairs"
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clusters"
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clustertemplates"
+	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/nodegroups"
 )
 
 // runner holds the authenticated Magnum service client and run configuration.
@@ -253,6 +254,19 @@ func (r *runner) run(ctx context.Context) error {
 	} else if err := r.caRotateCluster(ctx); err != nil {
 		return err
 	}
+	// Post-rotation add-node: reproduces the incident class (a node added
+	// AFTER a CA rotation) and verifies SA-token trust stays consistent.
+	// Needs a rotation to have happened first.
+	switch {
+	case r.cfg.skipCARotate:
+		r.log("ca-rotate skipped — skipping post-rotation add-node + SA check")
+	case r.cfg.skipPostRotate:
+		r.log("SKIP_POST_ROTATE set — skipping post-rotation add-node + SA check")
+	default:
+		if err := r.postRotateScale(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -434,6 +448,83 @@ func (r *runner) resizeCluster(ctx context.Context) error {
 		return err
 	}
 	return r.smokeCore(ctx)
+}
+
+// resolveNodeGroup returns the default nodegroup with the given role
+// ("master" or "worker"), falling back to the first non-default one.
+func (r *runner) resolveNodeGroup(ctx context.Context, role string) (*nodegroups.NodeGroup, error) {
+	pages, err := nodegroups.List(r.magnum, r.cfg.clusterName, nil).AllPages(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodegroups: %w", err)
+	}
+	ngs, err := nodegroups.ExtractNodeGroups(pages)
+	if err != nil {
+		return nil, fmt.Errorf("extract nodegroups: %w", err)
+	}
+	var fallback *nodegroups.NodeGroup
+	for i := range ngs {
+		if ngs[i].Role != role {
+			continue
+		}
+		if ngs[i].IsDefault {
+			ng := ngs[i]
+			return &ng, nil
+		}
+		if fallback == nil {
+			ng := ngs[i]
+			fallback = &ng
+		}
+	}
+	if fallback != nil {
+		return fallback, nil
+	}
+	return nil, fmt.Errorf("no %s nodegroup found for cluster %s", role, r.cfg.clusterName)
+}
+
+// resizeNodeGroup resizes a specific nodegroup (worker OR master) to target and
+// waits for the stack to settle. Master resize goes through the same Magnum
+// resize action with the nodegroup pinned by UUID.
+func (r *runner) resizeNodeGroup(ctx context.Context, ng *nodegroups.NodeGroup, target int) error {
+	n := target
+	opts := clusters.ResizeOpts{NodeCount: &n, NodeGroup: ng.UUID}
+	if _, err := clusters.Resize(ctx, r.magnum, r.cfg.clusterName, opts).Extract(); err != nil {
+		return fmt.Errorf("resize nodegroup %s (%s) -> %d: %w", ng.Name, ng.Role, target, err)
+	}
+	return r.waitStatus(ctx, "UPDATE_COMPLETE")
+}
+
+// postRotateScale reproduces the exact incident: a node ADDED after a CA
+// rotation. The fork rotates the service-account keys into the child node
+// stacks only; without the cluster-stack sync, a node created here would
+// render the PRE-rotation SA keys and split the cluster's SA-token trust. This
+// adds a node post-rotation and asserts (a) it joins Ready (CA path is fetched
+// live, so this catches CA breakage) and (b) SA tokens validate across every
+// master (SA-key path).
+//
+// It prefers adding a MASTER — the new apiserver is the SA-key surface — when
+// MASTER_COUNT_RESIZE > master count; otherwise it adds a worker.
+func (r *runner) postRotateScale(ctx context.Context) error {
+	role := "worker"
+	if r.cfg.masterCountResize > r.cfg.masterCount {
+		role = "master"
+	}
+	ng, err := r.resolveNodeGroup(ctx, role)
+	if err != nil {
+		return err
+	}
+	target := ng.NodeCount + 1
+	if role == "master" {
+		target = r.cfg.masterCountResize
+	}
+	r.log("=== post-rotate add %s: nodegroup %s %d -> %d (validates rotate→resize + SA keys) ===",
+		role, ng.Name, ng.NodeCount, target)
+	if err := r.resizeNodeGroup(ctx, ng, target); err != nil {
+		return err
+	}
+	if err := r.smokeCore(ctx); err != nil {
+		return err
+	}
+	return r.verifySAConsistency(ctx)
 }
 
 func (r *runner) deleteCluster(ctx context.Context) error {

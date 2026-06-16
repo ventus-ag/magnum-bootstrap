@@ -13,7 +13,9 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/certificates"
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clusters"
 	appsv1 "k8s.io/api/apps/v1"
+	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -278,4 +280,79 @@ func nodeReadyStr(n corev1.Node) string {
 		}
 	}
 	return "Unknown"
+}
+
+// verifySAConsistency proves every apiserver shares the same service-account
+// keys after a rotation + node-add. It creates a throwaway ServiceAccount,
+// mints a bound token (signed by whichever apiserver answers the TokenRequest),
+// then makes many authenticated probes THROUGH the API load balancer, each on a
+// fresh connection so they spread across masters.
+//
+// A probe that returns 401 Unauthorized means an apiserver rejected the token —
+// i.e. it holds a different service-account key (the split-trust bug a
+// post-rotation node-add can introduce). 403 Forbidden (or 200) is success: the
+// token was accepted; only RBAC denied the request. Transient network errors
+// are ignored — only an explicit 401 fails the test.
+func (r *runner) verifySAConsistency(ctx context.Context) error {
+	r.log("verify: service-account token trust is consistent across masters")
+	kc, err := r.k8sClient(ctx)
+	if err != nil {
+		return err
+	}
+	c, err := clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
+	if err != nil {
+		return fmt.Errorf("get cluster: %w", err)
+	}
+	ca, err := certificates.Get(ctx, r.magnum, c.UUID).Extract()
+	if err != nil {
+		return fmt.Errorf("fetch cluster CA: %w", err)
+	}
+
+	const saName = "e2e-sa-check"
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: saName, Namespace: "default"},
+	}
+	if _, err := kc.CoreV1().ServiceAccounts("default").Create(ctx, sa, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create service account: %w", err)
+	}
+	defer func() {
+		_ = kc.CoreV1().ServiceAccounts("default").Delete(ctx, saName, metav1.DeleteOptions{})
+	}()
+
+	tok, err := kc.CoreV1().ServiceAccounts("default").CreateToken(ctx, saName, &authnv1.TokenRequest{}, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("mint SA token: %w", err)
+	}
+
+	const probes = 20
+	accepted := 0
+	for i := 0; i < probes; i++ {
+		// Fresh client per probe → fresh TLS connection → the API LB spreads
+		// probes across masters, so a single stale-keyed master gets hit.
+		probeKC, err := kubernetes.NewForConfig(&rest.Config{
+			Host:            c.APIAddress,
+			BearerToken:     tok.Status.Token,
+			TLSClientConfig: rest.TLSClientConfig{CAData: []byte(ca.PEM)},
+			Timeout:         15 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("build probe client: %w", err)
+		}
+		_, gerr := probeKC.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{})
+		switch {
+		case gerr == nil || apierrors.IsForbidden(gerr):
+			accepted++ // token authenticated; RBAC denial is fine
+		case apierrors.IsUnauthorized(gerr):
+			return fmt.Errorf("SA token rejected (401) on probe %d/%d — an apiserver holds a different service-account key (rotation/resize SA-key split)", i+1, probes)
+		default:
+			r.log("  probe %d/%d transient error (ignored): %v", i+1, probes, gerr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	r.log("SA token accepted on %d/%d probes across masters ✅", accepted, probes)
+	return nil
 }
