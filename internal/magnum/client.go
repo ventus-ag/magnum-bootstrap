@@ -11,10 +11,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client provides access to the Magnum certificate API via OpenStack Keystone
@@ -45,8 +47,49 @@ func NewClient(authURL, magnumURL, trusteeUID, trusteePwd, trustID, clusterUUID 
 		TrustID:     trustID,
 		ClusterUUID: clusterUUID,
 		VerifyCA:    verifyCA,
-		httpClient:  &http.Client{Transport: transport},
+		httpClient:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
 	}
+}
+
+const (
+	// retryAttempts/retryBaseDelay bound the backoff for transient OpenStack
+	// API failures. CA fetch / CSR signing run during the disruptive reconcile
+	// window (apiserver/etcd/kube-proxy restart) where the node's egress to the
+	// OpenStack API briefly drops; a single un-retried glitch on any one of the
+	// parallel CSR signs otherwise fails the whole cert generation.
+	retryAttempts  = 5
+	retryBaseDelay = 500 * time.Millisecond
+)
+
+// retryableStatus reports whether an HTTP status warrants a retry (transient
+// server-side / throttling errors only — 4xx client errors are terminal).
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// retry runs fn up to retryAttempts times with exponential backoff + jitter.
+// fn returns (value, retryable, err): on err==nil it returns immediately; on a
+// non-retryable error it returns immediately; otherwise it backs off and tries
+// again, returning the last error once attempts are exhausted.
+func retry[T any](label string, fn func() (T, bool, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for attempt := 0; attempt < retryAttempts; attempt++ {
+		if attempt > 0 {
+			delay := retryBaseDelay << (attempt - 1)
+			delay += time.Duration(mrand.Int63n(int64(retryBaseDelay)))
+			time.Sleep(delay)
+		}
+		v, retryable, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		lastErr = err
+		if !retryable {
+			return zero, err
+		}
+	}
+	return zero, fmt.Errorf("%s: after %d attempts: %w", label, retryAttempts, lastErr)
 }
 
 // GetToken authenticates to Keystone using trustee credentials and returns an
@@ -72,80 +115,86 @@ func (c *Client) GetToken() (string, error) {
 	}`, c.TrusteeUID, c.TrusteePwd, c.TrustID)
 
 	url := strings.TrimRight(c.AuthURL, "/") + "/auth/tokens"
-	resp, err := c.httpClient.Post(url, "application/json", strings.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("keystone auth: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("keystone auth: status %d: %s", resp.StatusCode, string(respBody))
-	}
-	token := resp.Header.Get("X-Subject-Token")
-	if token == "" {
-		return "", fmt.Errorf("keystone auth: no X-Subject-Token in response")
-	}
-	return token, nil
+	return retry("keystone auth", func() (string, bool, error) {
+		resp, err := c.httpClient.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			return "", true, fmt.Errorf("keystone auth: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			respBody, _ := io.ReadAll(resp.Body)
+			return "", retryableStatus(resp.StatusCode), fmt.Errorf("keystone auth: status %d: %s", resp.StatusCode, string(respBody))
+		}
+		token := resp.Header.Get("X-Subject-Token")
+		if token == "" {
+			return "", false, fmt.Errorf("keystone auth: no X-Subject-Token in response")
+		}
+		return token, false, nil
+	})
 }
 
 // FetchCACert retrieves the cluster CA certificate PEM from the Magnum API.
 func (c *Client) FetchCACert(token string) (string, error) {
 	url := strings.TrimRight(c.MagnumURL, "/") + "/certificates/" + c.ClusterUUID
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-Auth-Token", token)
-	req.Header.Set("OpenStack-API-Version", "container-infra latest")
+	return retry("fetch CA cert", func() (string, bool, error) {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return "", false, err
+		}
+		req.Header.Set("X-Auth-Token", token)
+		req.Header.Set("OpenStack-API-Version", "container-infra latest")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("fetch CA cert: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("fetch CA cert: status %d: %s", resp.StatusCode, string(body))
-	}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", true, fmt.Errorf("fetch CA cert: %w", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", retryableStatus(resp.StatusCode), fmt.Errorf("fetch CA cert: status %d: %s", resp.StatusCode, string(body))
+		}
 
-	var result struct {
-		PEM string `json:"pem"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("fetch CA cert: decode: %w", err)
-	}
-	return result.PEM, nil
+		var result struct {
+			PEM string `json:"pem"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", false, fmt.Errorf("fetch CA cert: decode: %w", err)
+		}
+		return result.PEM, false, nil
+	})
 }
 
 // SignCSR sends a CSR to Magnum for signing and returns the signed certificate PEM.
 func (c *Client) SignCSR(token string, csrPEM string) (string, error) {
 	payload := fmt.Sprintf(`{"cluster_uuid": %q, "csr": %q}`, c.ClusterUUID, csrPEM)
 	url := strings.TrimRight(c.MagnumURL, "/") + "/certificates"
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-Auth-Token", token)
-	req.Header.Set("OpenStack-API-Version", "container-infra latest")
-	req.Header.Set("Content-Type", "application/json")
+	return retry("sign CSR", func() (string, bool, error) {
+		req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+		if err != nil {
+			return "", false, err
+		}
+		req.Header.Set("X-Auth-Token", token)
+		req.Header.Set("OpenStack-API-Version", "container-infra latest")
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("sign CSR: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("sign CSR: status %d: %s", resp.StatusCode, string(body))
-	}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", true, fmt.Errorf("sign CSR: %w", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", retryableStatus(resp.StatusCode), fmt.Errorf("sign CSR: status %d: %s", resp.StatusCode, string(body))
+		}
 
-	var result struct {
-		PEM string `json:"pem"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("sign CSR: decode: %w", err)
-	}
-	return result.PEM, nil
+		var result struct {
+			PEM string `json:"pem"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", false, fmt.Errorf("sign CSR: decode: %w", err)
+		}
+		return result.PEM, false, nil
+	})
 }
 
 // CertSpec describes a certificate to generate and sign.
