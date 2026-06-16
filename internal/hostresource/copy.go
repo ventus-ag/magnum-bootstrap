@@ -1,6 +1,7 @@
 package hostresource
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
@@ -21,15 +22,31 @@ type CopyResource struct {
 
 func (spec CopySpec) Apply(executor *host.Executor) (ApplyResult, error) {
 	if !executor.Apply {
-		action := host.ActionCreate
-		summary := fmt.Sprintf("copy %s to %s", spec.Source, spec.Path)
-		if _, err := os.Stat(spec.Path); err == nil {
-			action = host.ActionReplace
-			summary = fmt.Sprintf("replace %s from %s", spec.Path, spec.Source)
-		} else if err != nil && !os.IsNotExist(err) {
-			return ApplyResult{}, err
+		// Dry-run: report a change only if the destination is actually out of
+		// sync with the source (content or mode). Mirror EnsureFile so preview
+		// matches what an apply would do — otherwise every preview falsely
+		// reports a replace even when dest already equals source.
+		content, err := os.ReadFile(spec.Source)
+		if err != nil {
+			// Source not present at plan time (may be produced later in the
+			// run): report a planned copy rather than erroring.
+			return ApplyResult{Changes: []host.Change{{Action: host.ActionCreate, Path: spec.Path,
+				Summary: fmt.Sprintf("copy %s to %s", spec.Source, spec.Path)}}, Changed: true}, nil
 		}
-		return ApplyResult{Changes: []host.Change{{Action: action, Path: spec.Path, Summary: summary}}, Changed: true}, nil
+		current, readErr := os.ReadFile(spec.Path)
+		if readErr != nil {
+			if !os.IsNotExist(readErr) {
+				return ApplyResult{}, readErr
+			}
+			return ApplyResult{Changes: []host.Change{{Action: host.ActionCreate, Path: spec.Path,
+				Summary: fmt.Sprintf("copy %s to %s", spec.Source, spec.Path)}}, Changed: true}, nil
+		}
+		if info, statErr := os.Stat(spec.Path); statErr == nil &&
+			bytes.Equal(current, content) && info.Mode().Perm() == spec.Mode.Perm() {
+			return ApplyResult{}, nil
+		}
+		return ApplyResult{Changes: []host.Change{{Action: host.ActionReplace, Path: spec.Path,
+			Summary: fmt.Sprintf("replace %s from %s", spec.Path, spec.Source)}}, Changed: true}, nil
 	}
 
 	change, err := executor.EnsureCopy(spec.Source, spec.Path, spec.Mode)
