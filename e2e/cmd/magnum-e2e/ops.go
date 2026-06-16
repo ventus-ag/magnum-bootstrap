@@ -132,6 +132,11 @@ var scenarios = map[string]scenarioDef{
 	},
 }
 
+// allScenarios is the ordered list run by the "all" meta-scenario (one cluster
+// per entry, sequentially, in a single invocation). Order matters: cheapest
+// first so a smoke break fails fast before the long multi-master chains.
+var allScenarios = []string{"smoke", "multinode", "chained-single", "chained-multinode"}
+
 func scenarioNames() string {
 	names := make([]string, 0, len(scenarios))
 	for n := range scenarios {

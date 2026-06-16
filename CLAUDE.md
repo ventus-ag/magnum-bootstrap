@@ -502,10 +502,17 @@ counts, control-plane == master ng) + `verifySAConsistency` (disruptive ops) +
 `verifyNodepoolSchedulable` (when a nodepool exists). Idempotency re-run stays
 FCoS-only (this tier can't re-trigger a node without a Heat op).
 
-`ci.yaml` runs the scenarios as a **sequential matrix** (`max-parallel: 1`,
-`fail-fast: false`): the `e2e-openstack-setup` job emits the scenario list
-(full set for schedule/label/`os_scenario=all`, single on dispatch). Nodepool
-nodes are ordinary workers to the reconciler, labeled
+`SCENARIO=all` is a meta-scenario: a **single `magnum-e2e` invocation** runs
+every scenario in `allScenarios` order (smoke → multinode → chained-single →
+chained-multinode) one-by-one, each its own cluster created + torn down before
+the next (one run, one log, `runAllScenarios` in main.go). It does NOT stop on
+first failure — all run, a per-scenario PASS/FAIL summary prints, exit is
+non-zero if any failed. `-teardown` + `SCENARIO=all` deletes every scenario's
+cluster (the always() safety net). `ci.yaml` `e2e-openstack` is now a **single
+job** calling the reusable with `scenario: all` (schedule/label) or a single
+scenario via the `os_scenario` dispatch choice.
+
+Nodepool nodes are ordinary workers to the reconciler, labeled
 `magnum.openstack.org/nodegroup=<name>`; master nodegroups are API-blocked so
 multi-master is `master_count` at create (gophercloud
 `nodegroups.Create/Resize/Delete`, v2.12.0).

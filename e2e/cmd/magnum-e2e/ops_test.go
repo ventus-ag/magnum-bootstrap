@@ -86,6 +86,35 @@ func TestScenariosParse(t *testing.T) {
 	}
 }
 
+// TestAllScenariosCoverMap ensures the "all" meta-scenario runs exactly the
+// scenarios defined in the catalog (no preset silently dropped, no dangling
+// name).
+func TestAllScenariosCoverMap(t *testing.T) {
+	if len(allScenarios) != len(scenarios) {
+		t.Fatalf("allScenarios has %d entries, scenarios map has %d", len(allScenarios), len(scenarios))
+	}
+	for _, scn := range allScenarios {
+		if _, ok := scenarios[scn]; !ok {
+			t.Errorf("allScenarios entry %q not in scenarios map", scn)
+		}
+	}
+}
+
+func TestPerScenarioName(t *testing.T) {
+	cases := []struct {
+		base, scn, want string
+	}{
+		{"recon-e2e-all-12345", "smoke", "recon-e2e-smoke-12345"},
+		{"recon-e2e-all-12345", "chained-multinode", "recon-e2e-chained-multinode-12345"},
+		{"my-cluster", "multinode", "my-cluster-multinode"},
+	}
+	for _, c := range cases {
+		if got := perScenarioName(c.base, c.scn); got != c.want {
+			t.Errorf("perScenarioName(%q,%q) = %q, want %q", c.base, c.scn, got, c.want)
+		}
+	}
+}
+
 // TestRetryableMutationErr pins the exact observed failure as retryable and a
 // genuine *_FAILED / 404 as not — this is the core of the chained-op robustness
 // fix (settle + retry instead of hard-fail + teardown).

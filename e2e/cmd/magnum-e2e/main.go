@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -198,16 +199,35 @@ func main() {
 		}
 		return
 	case *flagTeardown:
+		if cfg.scenario == "all" {
+			teardownAll(ctx, r)
+			return
+		}
 		if err := r.deleteCluster(ctx); err != nil {
 			die("teardown: %v", err)
 		}
 		r.log("teardown complete")
 		return
 	case *flagPreflight:
+		if cfg.scenario == "all" {
+			if err := preflightAll(ctx, r); err != nil {
+				die("preflight: %v", err)
+			}
+			r.log("preflight OK ✅")
+			return
+		}
 		if err := r.preflight(ctx); err != nil {
 			die("preflight: %v", err)
 		}
 		r.log("preflight OK ✅")
+		return
+	}
+
+	// "all" meta-scenario: run every scenario sequentially, each its own cluster,
+	// in this single invocation (one run, one log). runAllScenarios owns per-
+	// scenario teardown + the final summary and exits with the right code.
+	if cfg.scenario == "all" {
+		runAllScenarios(ctx, r)
 		return
 	}
 
@@ -228,7 +248,117 @@ func main() {
 	} else if err := r.deleteCluster(ctx); err != nil {
 		die("teardown: %v", err)
 	}
-	r.log("ALL OPENSTACK SCENARIOS PASSED ✅")
+	r.log("SCENARIO %q PASSED ✅", cfg.scenario)
+}
+
+// scenarioRunner clones r for one scenario: same authenticated clients, a fresh
+// cfg (scenario + preset shape + tagged name) and reset per-run state.
+func scenarioRunner(r *runner, scn string) *runner {
+	c := r.cfg
+	c.scenario = scn
+	c.ops = "" // scenario preset drives the chain
+	c.clusterName = perScenarioName(r.cfg.clusterName, scn)
+	if def, ok := scenarios[scn]; ok {
+		c.masterCount = def.masters
+		c.nodeCount = def.workers
+	}
+	r2 := *r
+	r2.cfg = c
+	r2.nodepoolActive = false
+	return &r2
+}
+
+// perScenarioName derives a per-scenario cluster name from the base name. The
+// "all" base (recon-e2e-all-<id>) becomes recon-e2e-<scn>-<id>; otherwise the
+// scenario is appended.
+func perScenarioName(base, scn string) string {
+	if strings.Contains(base, "all") {
+		return strings.Replace(base, "all", scn, 1)
+	}
+	return base + "-" + scn
+}
+
+// runAllScenarios runs every scenario in allScenarios sequentially, one cluster
+// at a time, tearing each down before the next (unless KEEP_CLUSTER). It does
+// NOT stop on the first failure — every scenario runs so one CI pass reports all
+// results. Exits non-zero if any scenario failed.
+func runAllScenarios(ctx context.Context, r *runner) {
+	type result struct {
+		scn string
+		ok  bool
+		dur time.Duration
+		err error
+	}
+	var results []result
+	r.log("=== running ALL scenarios sequentially: %s ===", strings.Join(allScenarios, ", "))
+
+	for _, scn := range allScenarios {
+		sr := scenarioRunner(r, scn)
+		start := time.Now()
+		r.log("════════════ scenario %q (cluster %s) ════════════", scn, sr.cfg.clusterName)
+		err := sr.run(ctx)
+		if err != nil {
+			sr.dumpClusterState(ctx)
+		}
+		// Teardown this scenario's cluster before moving on (unless -keep), so the
+		// cloud only ever holds one e2e cluster at a time.
+		if r.cfg.keepCluster {
+			sr.log("KEEP_CLUSTER set — leaving %s in place", sr.cfg.clusterName)
+		} else if derr := sr.deleteCluster(ctx); derr != nil {
+			sr.err("teardown of %s: %v", sr.cfg.clusterName, derr)
+		}
+		results = append(results, result{scn: scn, ok: err == nil, dur: time.Since(start), err: err})
+		if err != nil {
+			r.err("scenario %q FAILED: %v", scn, err)
+		} else {
+			r.log("scenario %q PASSED (%s)", scn, time.Since(start).Round(time.Second))
+		}
+		if ctx.Err() != nil {
+			r.err("context cancelled — stopping after %q", scn)
+			break
+		}
+	}
+
+	r.log("════════════ E2E SUMMARY ════════════")
+	failed := 0
+	for _, res := range results {
+		status := "PASS ✅"
+		if !res.ok {
+			status = "FAIL ❌"
+			failed++
+		}
+		r.log("  %-18s %s  (%s)", res.scn, status, res.dur.Round(time.Second))
+	}
+	if failed > 0 {
+		die("%d/%d scenario(s) failed", failed, len(results))
+	}
+	r.log("ALL %d SCENARIOS PASSED ✅", len(results))
+}
+
+// preflightAll validates every scenario (op chains parse, shapes sane) and runs
+// the shared auth/template/keypair preflight once.
+func preflightAll(ctx context.Context, r *runner) error {
+	for _, scn := range allScenarios {
+		ops, err := parseOps(scenarios[scn].ops)
+		if err != nil {
+			return fmt.Errorf("scenario %q: %w", scn, err)
+		}
+		r.log("scenario %q: %dm/%dw, ops: %s", scn, scenarios[scn].masters, scenarios[scn].workers, formatOps(ops))
+	}
+	// One real auth/template/keypair check (template + creds are scenario-agnostic).
+	return scenarioRunner(r, allScenarios[0]).preflight(ctx)
+}
+
+// teardownAll deletes every scenario's cluster (best-effort) — the all-mode
+// safety net for the workflow's always() teardown step.
+func teardownAll(ctx context.Context, r *runner) {
+	for _, scn := range allScenarios {
+		sr := scenarioRunner(r, scn)
+		if err := sr.deleteCluster(ctx); err != nil {
+			sr.err("teardown of %s: %v", sr.cfg.clusterName, err)
+		}
+	}
+	r.log("teardown-all complete")
 }
 
 func die(format string, a ...any) {

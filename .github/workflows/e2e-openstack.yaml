@@ -28,9 +28,9 @@ on:
         type: boolean
         default: false
       scenario:
-        description: "Scenario preset: smoke | multinode | chained-single | chained-multinode"
+        description: "Scenario: all (every scenario sequentially) | smoke | multinode | chained-single | chained-multinode"
         type: string
-        default: smoke
+        default: all
       ops:
         description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
         type: string
@@ -60,10 +60,11 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: Scenario preset to run
+        description: Scenario to run (all = every scenario, one by one, in this run)
         type: choice
-        default: smoke
+        default: all
         options:
+          - all
           - smoke
           - multinode
           - chained-single

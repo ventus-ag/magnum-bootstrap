@@ -383,53 +383,25 @@ jobs:
   # ---------------------------------------------------------------------------
   # Same gate as before (dispatch run_openstack / `e2e-openstack` label / nightly)
   # and still `needs: build` so it reuses this run's bootstrap-dist artifact
-  # (use_prebuilt: true). The tier itself lives in the reusable e2e-openstack
-  # workflow, which is ALSO independently runnable via its own workflow_dispatch
+  # (use_prebuilt: true). The tier lives in the reusable e2e-openstack workflow,
+  # which is ALSO independently runnable via its own workflow_dispatch
   # (Actions → e2e-openstack → Run workflow), decoupled from a full CI run.
   #
-  # setup resolves the scenario MATRIX: the full set for schedule/label/dispatch
-  # with os_scenario=all, or a single scenario when dispatch picks one.
-  e2e-openstack-setup:
-    name: e2e-openstack (resolve scenarios)
+  # A SINGLE job, ONE invocation: scenario=all makes the magnum-e2e binary run
+  # every scenario one-by-one in this one run (each its own cluster, torn down
+  # before the next). Dispatch can pick a single scenario via os_scenario.
+  e2e-openstack:
+    name: e2e-openstack
     needs: [build]
     if: >-
       (github.event_name == 'workflow_dispatch' && github.event.inputs.run_openstack == 'true') ||
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
-    runs-on: self-hosted
-    outputs:
-      scenarios: ${{ steps.set.outputs.scenarios }}
-    steps:
-      - id: set
-        env:
-          SCN: ${{ github.event.inputs.os_scenario }}
-        run: |
-          if [ -n "$SCN" ] && [ "$SCN" != "all" ]; then
-            echo "scenarios=[\"$SCN\"]" >> "$GITHUB_OUTPUT"
-          else
-            echo 'scenarios=["smoke","multinode","chained-single","chained-multinode"]' >> "$GITHUB_OUTPUT"
-          fi
-
-  # One billed cluster per scenario, run SEQUENTIALLY (max-parallel: 1) so the
-  # cloud never carries two e2e clusters at once. fail-fast: false so one
-  # scenario's failure still lets the others report.
-  e2e-openstack:
-    name: e2e-openstack (${{ matrix.scenario }})
-    needs: [build, e2e-openstack-setup]
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_openstack == 'true') ||
-      github.event_name == 'schedule' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        scenario: ${{ fromJSON(needs.e2e-openstack-setup.outputs.scenarios) }}
     uses: ./.github/workflows/e2e-openstack.yaml
     secrets: inherit
     with:
       use_prebuilt: true
-      scenario: ${{ matrix.scenario }}
+      scenario: ${{ github.event.inputs.os_scenario || 'all' }}
       keep_cluster: ${{ github.event.inputs.keep_cluster == 'true' }}
       os_master_count_resize: ${{ github.event.inputs.os_master_count_resize || '2' }}
       os_skip_upgrade: ${{ github.event.inputs.os_skip_upgrade == 'true' }}
