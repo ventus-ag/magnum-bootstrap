@@ -131,3 +131,41 @@ func TestEtcdClusterToken(t *testing.T) {
 		t.Fatalf("token without uuid = %q, want magnum-etcd-cluster", got)
 	}
 }
+
+func TestNeedsSeedWait(t *testing.T) {
+	base := func() config.Config {
+		return config.Config{
+			Shared: config.SharedConfig{InstanceName: "c-xyz-master-1", NodegroupRole: "master"},
+			Master: &config.MasterConfig{NumberOfMasters: 3},
+		}
+	}
+
+	// Non-first master, nothing reachable, no static list → must wait.
+	if !needsSeedWait(base(), false, false, false) {
+		t.Fatal("non-first master with no LB/local/member should wait for seed")
+	}
+	// First master never waits — it is the seed.
+	first := base()
+	first.Shared.InstanceName = "c-xyz-master-0"
+	if needsSeedWait(first, false, false, false) {
+		t.Fatal("first master must not wait (it bootstraps the seed)")
+	}
+	// LB already healthy → no wait, join directly.
+	if needsSeedWait(base(), true, false, false) {
+		t.Fatal("must not wait once the LB seed is reachable")
+	}
+	// Already a member → no wait.
+	if needsSeedWait(base(), false, false, true) {
+		t.Fatal("existing member must not wait")
+	}
+	// Local etcd healthy → no wait.
+	if needsSeedWait(base(), false, true, false) {
+		t.Fatal("node with healthy local etcd must not wait")
+	}
+	// Static ETCD_INITIAL_CLUSTER present → bootstrap statically, no wait.
+	static := base()
+	static.Master.InitialCluster = "m0=https://10.0.0.1:2380,m1=https://10.0.0.2:2380"
+	if needsSeedWait(static, false, false, false) {
+		t.Fatal("static initial-cluster must bootstrap without waiting")
+	}
+}

@@ -132,6 +132,22 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			lbOK, localOK, isMember, lbEndpoint, localEndpoint)
 	}
 
+	// Non-first master on a fresh multi-master create: master-0 forms the seed
+	// etcd cluster, and every master registers itself into the etcd LB pool
+	// (kubemaster.yaml etcd_pool_member). On a parallel Heat create this node can
+	// reach the etcd phase before master-0's etcd is healthy/routable, so a single
+	// LB probe sees lbOK=false. With no static ETCD_INITIAL_CLUSTER and no
+	// discovery URL, the only safe action is to wait for the seed to appear via
+	// the LB and then join — bootstrapping ourselves would split-brain the
+	// cluster. etcd's --strict-reconfig-check rejects any member-add that would
+	// break quorum, so concurrent non-first masters serialise their joins safely.
+	if needsSeedWait(cfg, lbOK, localOK, isMember) {
+		lbOK = waitForSeedEtcd(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+		if lbOK {
+			isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
+		}
+	}
+
 	switch {
 	case isMember && localOK:
 		// Already healthy member — rebuild config if needed for TLS/proxy.
@@ -439,6 +455,48 @@ func staticInitialClusterMembers(cfg config.Config, nodeIP, protocol string) (st
 		return fmt.Sprintf("%s=%s://%s:2380", cfg.Shared.InstanceName, protocol, nodeIP), true
 	}
 	return "", false
+}
+
+// needsSeedWait reports whether this node must wait for master-0's seed etcd to
+// appear via the LB before it can join. True only for a non-first master that
+// has no reachable LB cluster, no local etcd, is not already a member, and has
+// no static ETCD_INITIAL_CLUSTER to bootstrap from. In that state bootstrapping
+// locally would split-brain the cluster, so the only safe move is to wait.
+func needsSeedWait(cfg config.Config, lbOK, localOK, isMember bool) bool {
+	if cfg.Master == nil {
+		return false
+	}
+	return !lbOK && !localOK && !isMember &&
+		!cfg.IsFirstMaster() && strings.TrimSpace(cfg.Master.InitialCluster) == ""
+}
+
+// waitForSeedEtcd blocks until the etcd LB reports a healthy backend (master-0's
+// seed cluster) or the bound elapses, returning true once healthy. Used by
+// non-first masters on a fresh multi-master create where master-0 may still be
+// forming the seed cluster. The bound (~10min) stays within the Heat deployment
+// timeout; on exhaustion the caller falls through to the static-bootstrap branch
+// which fails with a clear "seed never appeared" error.
+func waitForSeedEtcd(executor *host.Executor, lbEndpoint, certDir string, tlsDisabled bool) bool {
+	const attempts = 60
+	const delay = 10 * time.Second
+	for i := 0; i < attempts; i++ {
+		if etcdHealthyOnce(executor, lbEndpoint, certDir, tlsDisabled, "5s") {
+			if executor.Logger != nil {
+				executor.Logger.Infof("etcd: seed cluster healthy via LB %s after %d wait attempt(s); proceeding to join", lbEndpoint, i+1)
+			}
+			return true
+		}
+		if executor.Logger != nil && i%6 == 0 {
+			executor.Logger.Infof("etcd: waiting for master-0 seed cluster via LB %s (attempt %d/%d)", lbEndpoint, i+1, attempts)
+		}
+		if executor.Apply {
+			time.Sleep(delay)
+		}
+	}
+	if executor.Logger != nil {
+		executor.Logger.Warnf("etcd: seed cluster did not appear via LB %s within bound; falling through to static bootstrap (will fail for a non-first master)", lbEndpoint)
+	}
+	return false
 }
 
 // etcdClusterToken returns a cluster-wide token so that every member of a
