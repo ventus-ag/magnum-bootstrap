@@ -233,6 +233,19 @@ func TestParseMemberList(t *testing.T) {
 	}
 }
 
+func TestMemberClientEndpoint(t *testing.T) {
+	cases := []struct{ peer, want string }{
+		{"https://10.0.0.207:2380", "https://10.0.0.207:2379"},
+		{"http://10.0.0.5:2380", "http://10.0.0.5:2379"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := memberClientEndpoint(c.peer); got != c.want {
+			t.Errorf("memberClientEndpoint(%q) = %q, want %q", c.peer, got, c.want)
+		}
+	}
+}
+
 type errString string
 
 func (e errString) Error() string { return string(e) }

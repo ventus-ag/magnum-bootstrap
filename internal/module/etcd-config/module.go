@@ -887,42 +887,65 @@ func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, 
 		return
 	}
 
-	members := strings.Split(strings.TrimSpace(out), "\n")
-	currentCount := len(members)
-	if currentCount <= cfg.Master.NumberOfMasters {
+	members := parseMemberList(out)
+	if len(members) <= cfg.Master.NumberOfMasters {
 		return
 	}
 
 	// Sort members by master index in reverse order (highest first) to maintain
 	// quorum safety by removing the highest-numbered master first.
 	type memberEntry struct {
-		line      string
-		memberID  string
+		member    etcdMember
 		masterIdx int
 	}
 	var candidates []memberEntry
-	for _, member := range members {
-		if strings.Contains(member, cfg.Shared.InstanceName) {
+	for _, m := range members {
+		if strings.Contains(m.name, cfg.Shared.InstanceName) {
 			continue
 		}
-		parts := strings.SplitN(member, ",", 2)
-		if len(parts) == 0 {
-			continue
-		}
-		id := strings.TrimSpace(parts[0])
-		idx := extractMasterIndex(member)
-		candidates = append(candidates, memberEntry{line: member, memberID: id, masterIdx: idx})
+		candidates = append(candidates, memberEntry{member: m, masterIdx: extractMasterIndex(m.name)})
 	}
 
-	// Sort by master index descending — remove highest-numbered first.
+	// Sort by master index descending — consider highest-numbered first.
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].masterIdx > candidates[j].masterIdx
 	})
 
-	// Remove one excess member at a time (quorum safety).
-	if len(candidates) > 0 {
-		runEtcdctl(executor, append(args, "member", "remove", candidates[0].memberID)...)
+	// Remove ONE excess member per reconcile (quorum safety) — but only a member
+	// that is genuinely gone. This function exists to evict the leftover member of
+	// a SCALED-DOWN master whose VM was deleted; that member's etcd is
+	// unreachable. It must NEVER evict a started, healthy member merely because
+	// the local node count says "excess": on a master scale-up the existing
+	// master-0 can carry a STALE NUMBER_OF_MASTERS (Heat does not always refresh
+	// the existing master's heat-params on resize), and a healthy, freshly-joined
+	// master would otherwise be culled — wedging it permanently (the removed
+	// member can never rejoin with its data; master-0 then logs "rejected stream
+	// ... because it was removed"). So probe each candidate's client endpoint and
+	// remove only the highest-indexed one that is NOT healthy.
+	for _, c := range candidates {
+		clientEndpoint := memberClientEndpoint(c.member.peerURL)
+		if clientEndpoint != "" && etcdHealthy(executor, clientEndpoint, certDir, cfg.Shared.TLSDisabled) {
+			if executor.Logger != nil {
+				executor.Logger.Infof("etcd: refusing to evict excess member %s (%s) — endpoint healthy; node count likely stale", c.member.name, c.member.id)
+			}
+			continue
+		}
+		if executor.Logger != nil {
+			executor.Logger.Infof("etcd: removing excess member %s (%s, peer %s) — endpoint unreachable, treating as scaled-down orphan", c.member.name, c.member.id, c.member.peerURL)
+		}
+		runEtcdctl(executor, append(args, "member", "remove", c.member.id)...)
+		return
 	}
+}
+
+// memberClientEndpoint derives a member's client URL (port 2379) from its peer
+// URL (port 2380), for health-probing a peer before deciding to evict it.
+// Returns "" when the peer URL is empty/unparseable.
+func memberClientEndpoint(peerURL string) string {
+	if peerURL == "" {
+		return ""
+	}
+	return strings.Replace(peerURL, ":2380", ":2379", 1)
 }
 
 // extractMasterIndex parses "master-N" from a member list line and returns N.

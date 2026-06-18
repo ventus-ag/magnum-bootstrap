@@ -521,6 +521,93 @@ Nodepool nodes are ordinary workers to the reconciler, labeled
 multi-master is `master_count` at create (gophercloud
 `nodegroups.Create/Resize/Delete`, v2.12.0).
 
+## Manual live-cluster test (real OpenStack, curl + SSH)
+
+Direct probe of a **pre-existing** Magnum cluster on the ventus cloud — no e2e
+driver, no teardown. Use when the user provisions a cluster and asks to exercise
+an op (ca-rotate, master/worker resize, upgrade) and root-cause it from node
+logs. Auth + SSH key come from `.env` and `~/.ssh/id_ed25519` (the `ed` keypair).
+The user provides the cluster UUID; they own create/recreate, you only mutate +
+diagnose. Never delete or "fix" the live cluster without asking.
+
+### Setup (token + endpoints)
+
+```bash
+cd magnum-bootstrap; set -a; . ./.env; set +a
+# scoped token → /tmp/os_token
+printf '{"auth":{"identity":{"methods":["password"],"password":{"user":{"name":"%s","domain":{"name":"%s"},"password":"%s"}}},"scope":{"project":{"id":"%s"}}}}' \
+  "$OS_USERNAME" "$OS_USER_DOMAIN_NAME" "$OS_PASSWORD" "$OS_PROJECT_ID" > /tmp/auth.json
+curl -s -D - -o /dev/null -X POST "$OS_AUTH_URL/auth/tokens" -H 'Content-Type: application/json' -d @/tmp/auth.json \
+  | awk 'BEGIN{IGNORECASE=1}/^x-subject-token:/{print $2}' | tr -d '\r' > /tmp/os_token
+TOKEN=$(cat /tmp/os_token)
+curl -s "$OS_AUTH_URL/auth/catalog" -H "X-Auth-Token: $TOKEN" -o /tmp/catalog.json   # find container-infra / orchestration / compute public URLs
+```
+
+Endpoints (ventus upper-austria-m1): Magnum `:9511/v1`, Heat `:8004/v1/<proj>`,
+Nova `:8774/v2.1`. Heat `GET /stacks/{id}` needs `-L` (redirects to
+`/stacks/{name}/{id}`). Nodegroup calls need header
+`OpenStack-API-Version: container-infra latest`. Token TTL ~1h — re-mint if calls
+start returning empty.
+
+### Triggers (mirror the gophercloud ops in `e2e/cmd/magnum-e2e`)
+
+```bash
+MAGNUM=https://upper-austria-m1.ventuscloud.eu:9511; CID=<cluster-uuid>
+# ca-rotate  (PATCH /certificates/{uuid}, empty body → 202)
+curl -s -o /dev/null -w '%{http_code}\n' -X PATCH "$MAGNUM/v1/certificates/$CID" -H "X-Auth-Token: $TOKEN"
+# master/worker resize  (POST actions/resize; nodegroup = master/worker ng UUID from /nodegroups)
+curl -s -X POST "$MAGNUM/v1/clusters/$CID/actions/resize" -H "X-Auth-Token: $TOKEN" \
+  -H 'OpenStack-API-Version: container-infra latest' -H 'Content-Type: application/json' \
+  -d '{"node_count":3,"nodegroup":"<master-ng-uuid>"}'
+```
+
+Poll `GET /v1/clusters/$CID` `.status` until terminal. **Guard the stale-status
+race** (Magnum reports the prior `*_COMPLETE` for seconds after a trigger): only
+accept `UPDATE_COMPLETE` *after* first seeing `UPDATE_IN_PROGRESS` (same logic as
+`runMutation` in the driver). On `*_FAILED`, read the real reason from Heat:
+`GET /stacks/{id}` `.stack_status_reason`, then walk failed nested resources
+(`/resources?nested_depth=2`, filter `*FAILED*`). `deploy_status_code: ... non-zero`
+on a `*_config_deployment` = the node's reconciler `run-once` exited non-zero.
+
+### SSH into nodes (find IPs via Nova, not just `master_addresses`)
+
+`master_addresses`/`node_addresses` only list *reported* nodes; on a failed
+resize the new VM exists but isn't listed. Get every VM + floating IP from Nova:
+
+```bash
+NOVA=https://upper-austria-m1.ventuscloud.eu:8774/v2.1
+curl -s "$NOVA/servers/detail?name=$STACKNAME-master" -H "X-Auth-Token: $TOKEN"   # parse addresses[].addr where type=floating
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 core@<floating-ip>
+```
+
+On-node diagnostics (run via `sudo`): `kubectl --kubeconfig=/etc/kubernetes/admin.conf
+get nodes -o wide`; reconciler log `/var/log/magnum-reconcile.log` (grep
+`ERROR|fail|not match`); last result `/var/lib/magnum/reconciler-last-run.json`;
+`crictl pods`; `systemctl is-active containerd kubelet etcd kube-apiserver
+kube-controller-manager`; `journalctl -u etcd|kube-controller-manager`. CA-pair
+sanity: `openssl x509 -in /etc/kubernetes/certs/ca.crt -noout -modulus | openssl md5`
+vs `openssl rsa -in .../ca.key -noout -modulus | openssl md5` (must match);
+fingerprint vs Barbican `GET /v1/certificates/$CID .pem`. etcd membership:
+`etcdctl --endpoints=https://<ip>:2379 --cacert/--cert/--key=/etc/etcd/certs/...
+member list -w table` + `endpoint health`. Compare `NUMBER_OF_MASTERS` in
+`/etc/sysconfig/heat-params` across masters (existing master often carries a
+**stale** count after resize — see below).
+
+### Known-good vs known-bad outcomes
+
+- **ca-rotate** (validated June 2026): Barbican CA fingerprint changes; every node
+  converges to the new `ca.crt` with a matching `ca.key`; workloads not recreated
+  (zero-downtime dual-CA). A new master added *after* a rotation must get the
+  refreshed `ca_key` (driver `_resize_stack` → `_fetch_ca_key`) or
+  kube-controller-manager crashes on `tls: private key does not match public key`.
+- **master resize 1→N**: existing master-0's `/etc/sysconfig/heat-params` stays at
+  the OLD `NUMBER_OF_MASTERS` (the params-only `existing:True` resize doesn't
+  re-fire its `CREATE,UPDATE` deployment when the update aborts on a failed new
+  member). The reconciler must therefore never trust that count destructively —
+  `etcd-config`'s `cleanupExcessMembers` only evicts **unreachable** members, never
+  a healthy one (else it nukes a freshly-joined master → "rejected stream … because
+  it was removed" wedge). See `[[project_etcd_bootstrap_stateful]]`.
+
 ## Remaining Work
 
 - [ ] Add `make test` and `make lint` targets to Makefile
