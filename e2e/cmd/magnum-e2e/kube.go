@@ -8,6 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/certificates"
@@ -88,12 +90,22 @@ func (r *runner) smokeCore(ctx context.Context) error {
 		nodes, lerr := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if lerr == nil && len(nodes.Items) > 0 && allNodesReady(nodes.Items) {
 			r.log("all %d node(s) Ready", len(nodes.Items))
-			for _, n := range nodes.Items {
-				r.log("  node %s: %s", n.Name, nodeReadyStr(n))
-			}
+			r.dumpNodes(nodes.Items)
 			break
 		}
 		if time.Now().After(deadline) {
+			// Dump what we have so the failure is self-explanatory: which
+			// nodes are NotReady and the kubelet's reason (e.g. CNI not
+			// initialized) instead of an opaque "timeout".
+			r.log("nodes NOT all Ready after timeout — last observed state:")
+			if lerr != nil {
+				r.log("  (node list error: %v)", lerr)
+			} else {
+				r.dumpNodes(nodes.Items)
+			}
+			if pods, perr := kc.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{}); perr == nil {
+				r.dumpPods("kube-system", pods.Items)
+			}
 			return fmt.Errorf("nodes not all Ready within timeout")
 		}
 		select {
@@ -106,11 +118,37 @@ func (r *runner) smokeCore(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list kube-system pods: %w", err)
 	}
-	r.log("kube-system pods (%d):", len(pods.Items))
-	for _, p := range pods.Items {
-		r.log("  %-50s %s", p.Name, p.Status.Phase)
-	}
+	r.dumpPods("kube-system", pods.Items)
 	return nil
+}
+
+// dumpNodes prints a wide, kubectl-style node table: status (with the kubelet
+// reason when NotReady), roles, kubelet version, and internal IP — enough to
+// diagnose a stuck node-add without a separate kubectl session.
+func (r *runner) dumpNodes(nodes []corev1.Node) {
+	r.log("  %-46s %-26s %-14s %-12s %s", "NODE", "STATUS", "ROLES", "VERSION", "INTERNAL-IP")
+	for _, n := range nodes {
+		r.log("  %-46s %-26s %-14s %-12s %s",
+			n.Name, nodeStatusStr(n), nodeRoles(n), n.Status.NodeInfo.KubeletVersion, nodeInternalIP(n))
+	}
+}
+
+// dumpPods prints a wide pod table with readiness (ready/total containers),
+// status, and restart count — restarts and not-Ready containers are the first
+// signal a pod is crash-looping (e.g. flannel 401ing on a split SA key).
+func (r *runner) dumpPods(ns string, pods []corev1.Pod) {
+	r.log("%s pods (%d):", ns, len(pods))
+	r.log("  %-56s %-7s %-22s %s", "NAME", "READY", "STATUS", "RESTARTS")
+	for _, p := range pods {
+		ready, total, restarts := 0, len(p.Spec.Containers), int32(0)
+		for _, cs := range p.Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+			restarts += cs.RestartCount
+		}
+		r.log("  %-56s %-7s %-22s %d", p.Name, fmt.Sprintf("%d/%d", ready, total), podStatusStr(p), restarts)
+	}
 }
 
 // smokeCloudIntegration is the payoff of the real-OpenStack tier: it proves the
@@ -315,25 +353,46 @@ func (r *runner) verifyNodeCount(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	nodes, err := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list nodes: %w", err)
-	}
-	gotTotal := len(nodes.Items)
-	gotCP := 0
-	for _, n := range nodes.Items {
-		if _, ok := n.Labels["node-role.kubernetes.io/control-plane"]; ok {
-			gotCP++
+
+	// Heat reaches UPDATE_COMPLETE when the OpenStack VM is gone, but on a
+	// scaledown the removed node's Kubernetes Node object lingers until the
+	// cloud-node-lifecycle controller (OCCM) deletes it — a lag of up to a
+	// minute or more. The nodegroup desired counts are already final, so poll
+	// the live node list until it converges instead of reading it once.
+	deadline := time.Now().Add(10 * time.Minute)
+	var lastErr error
+	for {
+		nodes, lerr := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if lerr != nil {
+			lastErr = fmt.Errorf("list nodes: %w", lerr)
+		} else {
+			gotTotal := len(nodes.Items)
+			gotCP := 0
+			for _, n := range nodes.Items {
+				if _, ok := n.Labels["node-role.kubernetes.io/control-plane"]; ok {
+					gotCP++
+				}
+			}
+			switch {
+			case gotTotal != wantTotal:
+				lastErr = fmt.Errorf("node count mismatch: nodegroups want %d, cluster has %d", wantTotal, gotTotal)
+			case gotCP != wantCP:
+				lastErr = fmt.Errorf("control-plane count mismatch: master nodegroup wants %d, cluster has %d", wantCP, gotCP)
+			default:
+				r.log("node count OK: %d total (%d control-plane) matches nodegroups ✅", gotTotal, gotCP)
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		r.log("node count not converged yet (%v) — waiting", lastErr)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
 		}
 	}
-	if gotTotal != wantTotal {
-		return fmt.Errorf("node count mismatch: nodegroups want %d, cluster has %d", wantTotal, gotTotal)
-	}
-	if gotCP != wantCP {
-		return fmt.Errorf("control-plane count mismatch: master nodegroup wants %d, cluster has %d", wantCP, gotCP)
-	}
-	r.log("node count OK: %d total (%d control-plane) matches nodegroups ✅", gotTotal, gotCP)
-	return nil
 }
 
 // verifyNodepoolSchedulable proves the extra nodepool's nodes are real, usable
@@ -404,13 +463,62 @@ func allNodesReady(nodes []corev1.Node) bool {
 	return true
 }
 
-func nodeReadyStr(n corev1.Node) string {
+// nodeStatusStr is "Ready", or "NotReady(<reason>)" carrying the kubelet's Ready
+// condition reason (e.g. KubeletNotReady) so a stuck node explains itself.
+func nodeStatusStr(n corev1.Node) string {
 	for _, cond := range n.Status.Conditions {
 		if cond.Type == corev1.NodeReady {
-			return string(cond.Status)
+			if cond.Status == corev1.ConditionTrue {
+				return "Ready"
+			}
+			if cond.Reason != "" {
+				return "NotReady(" + cond.Reason + ")"
+			}
+			return "NotReady"
 		}
 	}
 	return "Unknown"
+}
+
+// nodeRoles joins the node-role.kubernetes.io/<role> labels ("control-plane",
+// "worker"), matching kubectl's ROLES column.
+func nodeRoles(n corev1.Node) string {
+	const prefix = "node-role.kubernetes.io/"
+	var roles []string
+	for k := range n.Labels {
+		if role, ok := strings.CutPrefix(k, prefix); ok && role != "" {
+			roles = append(roles, role)
+		}
+	}
+	if len(roles) == 0 {
+		return "worker"
+	}
+	sort.Strings(roles)
+	return strings.Join(roles, ",")
+}
+
+func nodeInternalIP(n corev1.Node) string {
+	for _, a := range n.Status.Addresses {
+		if a.Type == corev1.NodeInternalIP {
+			return a.Address
+		}
+	}
+	return "-"
+}
+
+// podStatusStr mimics kubectl's STATUS column: a waiting/terminated container
+// reason (CrashLoopBackOff, CreateContainerError, …) surfaces ahead of the bare
+// pod phase, since that reason is the actual diagnostic.
+func podStatusStr(p corev1.Pod) string {
+	for _, cs := range p.Status.ContainerStatuses {
+		if w := cs.State.Waiting; w != nil && w.Reason != "" {
+			return w.Reason
+		}
+		if t := cs.State.Terminated; t != nil && t.Reason != "" {
+			return t.Reason
+		}
+	}
+	return string(p.Status.Phase)
 }
 
 // verifySAConsistency proves every apiserver shares the same service-account
