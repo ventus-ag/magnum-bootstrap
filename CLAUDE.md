@@ -53,7 +53,11 @@ bootstrap print-last-result # Print last result JSON
 1. Parse `heat-params` → typed `config.Config` (100+ typed fields)
 2. Load previous state → set `AppliedCARotationID` so completed rotations
    don't re-trigger on periodic runs
-3. Detect role (master/worker) and operation (create/upgrade/resize/ca-rotate)
+3. Detect role (master/worker) and operation. Operation is state-driven and only
+   distinguishes `ca-rotate` (active CA_ROTATION_ID token) from `create`; upgrade
+   and resize are NOT distinct operations — they are ordinary convergence (version
+   delta via KUBE_TAG, node add/remove via count). There are no IS_UPGRADE /
+   IS_RESIZE heat-params; drain intent comes from the PreviousKubeTag delta.
 4. Build ordered phase plan from unified catalog (same phases for all operations;
    each module decides internally whether to act)
 5. Recover interrupted runs (PID-based detection)

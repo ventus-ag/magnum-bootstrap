@@ -169,3 +169,70 @@ func TestNeedsSeedWait(t *testing.T) {
 		t.Fatal("static initial-cluster must bootstrap without waiting")
 	}
 }
+
+func TestIsTransientMemberAddErr(t *testing.T) {
+	// The error string carries etcd's stderr (see host.RunCapture), so we match
+	// on the real wire message that wedged a create.
+	transient := []string{
+		"/usr/local/bin/etcdctl member add: exit status 1 (stderr: etcdserver: re-configuration failed due to not enough started members)",
+		"member add: exit status 1 (stderr: etcdserver: unhealthy cluster)",
+		"member add: exit status 1 (stderr: context deadline exceeded)",
+		"member add: exit status 1 (stderr: etcdserver: request timed out)",
+		"member add: exit status 1 (stderr: rpc error: code = Unavailable: no leader)",
+	}
+	for _, m := range transient {
+		if !isTransientMemberAddErr(errString(m)) {
+			t.Errorf("expected transient (retryable): %q", m)
+		}
+	}
+	fatal := []string{
+		"member add: exit status 1 (stderr: etcdserver: bad peer url)",
+		"member add: exit status 1 (stderr: invalid certificate)",
+	}
+	for _, m := range fatal {
+		if isTransientMemberAddErr(errString(m)) {
+			t.Errorf("expected fatal (not retryable): %q", m)
+		}
+	}
+	if isTransientMemberAddErr(nil) {
+		t.Error("nil error must not be transient")
+	}
+}
+
+func TestIsAlreadyMemberErr(t *testing.T) {
+	yes := []string{
+		"member add: exit status 1 (stderr: Error: Peer URLs already exists)",
+		"member add: exit status 1 (stderr: etcdserver: member already exists)",
+	}
+	for _, m := range yes {
+		if !isAlreadyMemberErr(errString(m)) {
+			t.Errorf("expected already-exists: %q", m)
+		}
+	}
+	if isAlreadyMemberErr(errString("not enough started members")) {
+		t.Error("transient quorum error is not an already-exists error")
+	}
+}
+
+func TestParseMemberList(t *testing.T) {
+	out := strings.Join([]string{
+		" e89abea5794bf78, started, kube-x-master-0, https://10.0.0.93:2380, https://10.0.0.93:2379, false",
+		"f78f5dfdf2353870, started, kube-x-master-2, https://10.0.0.188:2380, https://10.0.0.188:2379, false",
+		"aaaa, unstarted, , https://10.0.0.50:2380, , false", // added-but-not-started: empty name
+		"garbage line with no commas",
+	}, "\n")
+	ms := parseMemberList(out)
+	if len(ms) != 3 {
+		t.Fatalf("expected 3 parsed members (garbage skipped), got %d: %+v", len(ms), ms)
+	}
+	if ms[0].name != "kube-x-master-0" || ms[0].peerURL != "https://10.0.0.93:2380" {
+		t.Fatalf("member[0] mis-parsed: %+v", ms[0])
+	}
+	if ms[2].name != "" {
+		t.Fatalf("expected empty name for unstarted member, got %q", ms[2].name)
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }

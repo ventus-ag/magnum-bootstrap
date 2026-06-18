@@ -30,8 +30,6 @@ func Load(path string) (Config, error) {
 			NodegroupRole:             raw["NODEGROUP_ROLE"],
 			NodegroupName:             raw["NODEGROUP_NAME"],
 			Arch:                      raw["ARCH"],
-			IsUpgrade:                 parseBool(raw["IS_UPGRADE"]),
-			IsResize:                  parseBool(raw["IS_RESIZE"]),
 			TLSDisabled:               parseBool(raw["TLS_DISABLED"]),
 			KubeTag:                   raw["KUBE_TAG"],
 			KubeVersion:               raw["KUBE_VERSION"],

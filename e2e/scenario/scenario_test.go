@@ -52,13 +52,16 @@ func TestScenariosTriggerIntendedOperation(t *testing.T) {
 		wantOp  config.Operation
 		wantRol config.Role
 	}{
+		// Upgrade and resize are NOT distinct reconciler operations anymore — both
+		// are ordinary state convergence, so Operation() reports create. Only an
+		// active CA rotation is a distinct operation.
 		{"master-create", RoleMaster, OpCreate, config.OperationCreate, config.RoleMaster},
-		{"master-upgrade", RoleMaster, OpUpgrade, config.OperationUpgrade, config.RoleMaster},
-		{"master-resize", RoleMaster, OpResize, config.OperationResize, config.RoleMaster},
+		{"master-upgrade", RoleMaster, OpUpgrade, config.OperationCreate, config.RoleMaster},
+		{"master-resize", RoleMaster, OpResize, config.OperationCreate, config.RoleMaster},
 		{"master-ca-rotate", RoleMaster, OpCARotate, config.OperationCARotate, config.RoleMaster},
 		{"worker-create", RoleWorker, OpCreate, config.OperationCreate, config.RoleWorker},
-		{"worker-upgrade", RoleWorker, OpUpgrade, config.OperationUpgrade, config.RoleWorker},
-		{"worker-resize", RoleWorker, OpResize, config.OperationResize, config.RoleWorker},
+		{"worker-upgrade", RoleWorker, OpUpgrade, config.OperationCreate, config.RoleWorker},
+		{"worker-resize", RoleWorker, OpResize, config.OperationCreate, config.RoleWorker},
 		{"worker-ca-rotate", RoleWorker, OpCARotate, config.OperationCARotate, config.RoleWorker},
 	}
 

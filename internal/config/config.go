@@ -27,8 +27,6 @@ type Operation string
 
 const (
 	OperationCreate   Operation = "create"
-	OperationUpgrade  Operation = "upgrade"
-	OperationResize   Operation = "resize"
 	OperationCARotate Operation = "ca-rotate"
 )
 
@@ -50,8 +48,6 @@ type SharedConfig struct {
 	NodegroupRole             string `json:"nodegroupRole"`
 	NodegroupName             string `json:"nodegroupName"`
 	Arch                      string `json:"arch"`
-	IsUpgrade                 bool   `json:"isUpgrade"`
-	IsResize                  bool   `json:"isResize"`
 	TLSDisabled               bool   `json:"tlsDisabled"`
 	KubeTag                   string `json:"kubeTag"`
 	KubeVersion               string `json:"kubeVersion"`
@@ -221,18 +217,19 @@ func (c Config) Role() Role {
 	}
 }
 
+// Operation classifies the reconcile from desired state alone. Upgrade and
+// resize are NOT distinct operations to the reconciler: every module converges
+// current host/cluster state to the desired heat-params, so a version bump or a
+// node add/remove is just ordinary convergence. Only an active CA rotation
+// (token-driven) needs a distinct disruptive code path; everything else is a
+// create/reconcile. (The former IS_UPGRADE/IS_RESIZE flags were removed — drain
+// intent now comes from the KUBE_TAG delta, see DisruptiveServiceCycleNeeded.)
 func (c Config) Operation() Operation {
-	switch {
-	case c.Shared.IsUpgrade:
-		return OperationUpgrade
-	case c.Shared.IsResize:
-		return OperationResize
-	case c.Trigger.CARotationID != "" &&
-		c.Trigger.CARotationID != c.Trigger.AppliedCARotationID:
+	if c.Trigger.CARotationID != "" &&
+		c.Trigger.CARotationID != c.Trigger.AppliedCARotationID {
 		return OperationCARotate
-	default:
-		return OperationCreate
 	}
+	return OperationCreate
 }
 
 func (c Config) StackName() string {
@@ -247,16 +244,12 @@ func (c Config) StackName() string {
 }
 
 func (c Config) GenerationToken() string {
-	switch c.Operation() {
-	case OperationCARotate:
+	if c.Operation() == OperationCARotate {
 		return "ca-rotate:" + c.Trigger.CARotationID
-	case OperationUpgrade:
-		return "upgrade:" + c.Shared.KubeTag
-	case OperationResize:
-		return "resize:" + c.Shared.KubeTag
-	default:
-		return "create:" + c.Shared.KubeTag
 	}
+	// Includes version upgrades: the token changes with KUBE_TAG, so state
+	// records the generation transition without a dedicated upgrade label.
+	return "create:" + c.Shared.KubeTag
 }
 
 // IsFirstMaster returns true when this node is master-0 (the first master
@@ -344,12 +337,14 @@ func isSystemdBooted() bool {
 	return err == nil && fi.IsDir()
 }
 
-// IsPureCARotation returns true when a CA rotation is active and neither an
-// upgrade nor a resize is in progress.  Many modules skip their normal work
-// during a pure CA rotation because the rotation module handles certs and
-// service restarts itself.
+// IsPureCARotation returns true when a CA rotation is active. Modules that defer
+// to the rotation module (which handles certs and service restarts itself) skip
+// their normal work while it is set. Completed rotations are filtered earlier by
+// the AppliedCARotationID check in Operation(), so a stale token does not keep
+// this true. (Formerly also required !IS_UPGRADE && !IS_RESIZE; those flags were
+// removed in favor of state-driven convergence.)
 func (c Config) IsPureCARotation() bool {
-	return c.Trigger.CARotationID != "" && !c.Shared.IsUpgrade && !c.Shared.IsResize
+	return c.Trigger.CARotationID != ""
 }
 
 func sanitizeIdentifier(v string) string {

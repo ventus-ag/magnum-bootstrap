@@ -100,47 +100,79 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{Changes: changes}, nil
 	}
 
-	// Resize operation: only cleanup excess members.
-	if cfg.Shared.IsResize {
-		cleanupExcessMembers(cfg, executor, protocol, certDir)
-		return moduleapi.Result{
-			Changes: changes,
-			Outputs: map[string]string{"etcdTag": etcdTag(cfg)},
-		}, nil
-	}
+	// Excess-member reconciliation (scale-down): master-0 evicts any etcd member
+	// beyond the desired master count. This is purely state-driven (live member
+	// count vs NumberOfMasters), idempotent, and a no-op once converged, so it
+	// runs on every reconcile regardless of operation. It used to be gated behind
+	// IS_RESIZE with an early return, which also wrongly skipped the join path —
+	// so a newly added master (scale-up) never joined etcd. The reconciler decides
+	// from cluster/node state, not from an operation flag.
+	cleanupExcessMembers(cfg, executor, protocol, certDir)
 
 	// Cluster join/creation logic.
 	lbEndpoint := fmt.Sprintf("%s://%s:2379", protocol, cfg.Master.EtcdLBVIP)
 	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 
-	// Always check the LB endpoint — an existing cluster may be running
-	// (e.g. scaling 1→2 masters) even if this node has never had etcd.
-	// Only skip the LOCAL endpoint check when there's no config — local
-	// etcd isn't running so the check just wastes time on retries.
+	// INVARIANT A — data-dir gate. A populated WAL means this node has persisted
+	// raft state and IS an existing cluster member. etcd ignores the
+	// initial-cluster* fields on restart and recovers membership from the WAL, so
+	// we must NEVER wipe the data dir or run a destructive rejoin here. This is the
+	// single most important safety property: it covers process restart, node reboot
+	// (etcd Cinder volume reattached), binary/etcd upgrade, periodic reconcile, and
+	// quorum loss (etcd starts but stays leaderless until peers return).
+	if walPresent() {
+		if req.Logger != nil {
+			req.Logger.Infof("etcd: persisted WAL present — starting with existing data, no wipe/rejoin")
+		}
+		lbOK := etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+		cs, err := startWithExistingData(cfg, executor, nodeIP, protocol, certDir, lbEndpoint, lbOK)
+		changes = append(changes, cs...)
+		if err != nil {
+			// Data present but etcd will not start. If the cluster is reachable and
+			// we are no longer a member, the data is orphaned (node removed while
+			// down) and unusable — wipe and rejoin. Otherwise fail safe: refuse to
+			// destroy data on a transient or quorum-loss condition.
+			if lbOK && !checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP) {
+				if req.Logger != nil {
+					req.Logger.Warnf("etcd: have data but not a member and etcd will not start — orphaned data, wiping and rejoining: %v", err)
+				}
+				cleanupEtcd(executor)
+				cs2, jerr := joinExistingCluster(cfg, executor, nodeIP, protocol, certDir, lbEndpoint)
+				changes = append(changes, cs2...)
+				if jerr != nil {
+					return moduleapi.Result{}, jerr
+				}
+			} else {
+				return moduleapi.Result{}, fmt.Errorf("etcd has persisted data but did not become active; cluster unreachable or still a member — refusing to destroy data (likely quorum loss, manual recovery required): %w", err)
+			}
+		}
+		return moduleapi.Result{Changes: changes, Outputs: map[string]string{"etcdTag": etcdTag(cfg)}}, nil
+	}
+
+	// No local etcd data — fresh node: initial create, resize-added master,
+	// auto-healed/recreated node, or disk-loss replacement. Always probe the LB
+	// (an existing cluster may be running) before deciding.
 	lbOK := etcdHealthy(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
 	localOK := false
 	isMember := false
-	_, configErr := os.Stat("/etc/etcd/etcd.conf.yaml")
-	if configErr == nil {
+	if _, configErr := os.Stat("/etc/etcd/etcd.conf.yaml"); configErr == nil {
 		localOK = etcdHealthy(executor, localEndpoint, certDir, cfg.Shared.TLSDisabled)
 	}
 	if lbOK {
 		isMember = checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
 	}
 	if req.Logger != nil {
-		req.Logger.Infof("etcd: lbOK=%t localOK=%t isMember=%t lbEndpoint=%s localEndpoint=%s",
+		req.Logger.Infof("etcd: hasData=false lbOK=%t localOK=%t isMember=%t lbEndpoint=%s localEndpoint=%s",
 			lbOK, localOK, isMember, lbEndpoint, localEndpoint)
 	}
 
 	// Non-first master on a fresh multi-master create: master-0 forms the seed
-	// etcd cluster, and every master registers itself into the etcd LB pool
-	// (kubemaster.yaml etcd_pool_member). On a parallel Heat create this node can
-	// reach the etcd phase before master-0's etcd is healthy/routable, so a single
-	// LB probe sees lbOK=false. With no static ETCD_INITIAL_CLUSTER and no
-	// discovery URL, the only safe action is to wait for the seed to appear via
-	// the LB and then join — bootstrapping ourselves would split-brain the
-	// cluster. etcd's --strict-reconfig-check rejects any member-add that would
-	// break quorum, so concurrent non-first masters serialise their joins safely.
+	// etcd cluster and the other masters join through the LB. On a parallel Heat
+	// create a non-first master can reach this phase before master-0's etcd is
+	// routable, so a single LB probe sees lbOK=false. Wait for the seed before
+	// deciding — bootstrapping ourselves would split-brain the cluster. The join
+	// itself (memberAddWithRetry) tolerates the transient strict-reconfig-check
+	// rejection that occurs while peers are still starting.
 	if needsSeedWait(cfg, lbOK, localOK, isMember) {
 		lbOK = waitForSeedEtcd(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
 		if lbOK {
@@ -150,21 +182,23 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	switch {
 	case isMember && localOK:
-		// Already healthy member — rebuild config if needed for TLS/proxy.
+		// Healthy member with config but no WAL (very unlikely past the gate).
+		// Rebuild config only for TLS/proxy drift.
 		if err := rebuildConfigIfNeeded(cfg, executor, nodeIP, protocol, certDir); err != nil {
 			return moduleapi.Result{}, err
 		}
 
 	case isMember && !localOK:
-		// Member but unhealthy — rejoin.
+		// Registered as a member (e.g. recreated node, same name, new IP) but no
+		// local etcd and no data — rejoin: remove the stale entry and re-add.
 		cs, err := rejoinCluster(cfg, executor, nodeIP, protocol, certDir, lbEndpoint)
 		if err != nil {
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, cs...)
 
-	case !isMember && lbOK:
-		// LB has cluster but we're not a member — join.
+	case lbOK:
+		// Cluster exists and we are not a member — join via runtime reconfig.
 		cleanupEtcd(executor)
 		cs, err := joinExistingCluster(cfg, executor, nodeIP, protocol, certDir, lbEndpoint)
 		if err != nil {
@@ -173,22 +207,30 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		changes = append(changes, cs...)
 
 	case localOK:
-		// Local etcd is healthy but not visible as an LB member (single-node
-		// cluster, or the LB is down). Treat it as an existing standalone node:
-		// only rebuild the config if TLS/proxy settings changed, never
-		// re-bootstrap (which would destroy data).
+		// Local etcd healthy but not an LB member and no WAL (single-node, LB
+		// down). Rebuild config only for TLS/proxy drift; never re-bootstrap.
 		if err := rebuildConfigIfNeeded(cfg, executor, nodeIP, protocol, certDir); err != nil {
 			return moduleapi.Result{}, err
 		}
 
 	default:
-		// No existing cluster to join: bootstrap a new cluster from a static
-		// initial-cluster member list. A first/single master uses its own peer
-		// URL (a one-node cluster that later grows by member-add); multi-master
-		// uses ETCD_INITIAL_CLUSTER when provided.
+		// No reachable cluster and no local data.
+		// INVARIANT B — split-brain guard (state-driven): a multi-master node that
+		// has previously converged (PreviousSuccessfulGeneration set) but now finds
+		// no data and no reachable cluster has lost quorum or is temporarily
+		// partitioned; fabricating a fresh cluster would split-brain it, so we
+		// refuse. A genuinely fresh node (no prior successful generation) falls
+		// through to bootstrap. Non-first masters are additionally protected by
+		// staticInitialClusterMembers below, which never self-bootstraps.
+		if req.PreviousSuccessfulGeneration != "" && cfg.Master.NumberOfMasters > 1 {
+			return moduleapi.Result{}, fmt.Errorf("etcd: no reachable cluster and no local data on a multi-master node that previously converged — refusing to bootstrap a new cluster (split-brain guard); cluster likely lost quorum or is temporarily unreachable, manual recovery required")
+		}
+		// Bootstrap a new cluster from a static initial-cluster member list. A
+		// first/single master uses its own peer URL (a one-node cluster that grows
+		// via member-add as other masters join through the LB).
 		initialCluster, ok := staticInitialClusterMembers(cfg, nodeIP, protocol)
 		if !ok {
-			return moduleapi.Result{}, fmt.Errorf("etcd: no healthy LB endpoint and cannot determine a static initial-cluster (multi-master needs ETCD_INITIAL_CLUSTER or an existing cluster to join)")
+			return moduleapi.Result{}, fmt.Errorf("etcd: no healthy LB endpoint and cannot determine an initial-cluster (non-first master with no reachable cluster to join)")
 		}
 		cleanupEtcd(executor)
 		etcdConf := buildConfig(cfg, nodeIP, protocol, "new-static", initialCluster)
@@ -525,26 +567,30 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 				if len(parts) > 0 {
 					memberID := strings.TrimSpace(parts[0])
 					if _, rmErr := runEtcdctl(executor, append(args, "member", "remove", memberID)...); rmErr != nil {
-						if cfg.Shared.IsResize {
-							executor.Logger.Errorf("etcd rejoin: member remove failed during resize (member %s): %v", memberID, rmErr)
-						} else {
-							executor.Logger.Warnf("etcd rejoin: member remove failed (member %s, may be transient): %v", memberID, rmErr)
-						}
+						executor.Logger.Warnf("etcd rejoin: member remove failed (member %s, may be transient): %v", memberID, rmErr)
 					}
 				}
 			}
 		}
 	}
 
-	// Add back.
-	addArgs := append(args, "member", "add", cfg.Shared.InstanceName,
-		"--peer-urls="+protocol+"://"+nodeIP+":2380")
-	addOut, err := runEtcdctl(executor, addArgs...)
+	// Add back, retrying the transient strict-reconfig-check rejection that
+	// occurs while the cluster is still forming quorum or other members are
+	// starting.
+	peerURL := protocol + "://" + nodeIP + ":2380"
+	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL)
 	if err != nil {
 		return nil, fmt.Errorf("rejoin etcd cluster: %w", err)
 	}
 
 	initialCluster := extractInitialCluster(addOut)
+	if initialCluster == "" {
+		// Member already existed (adopted slot) — derive the list from the cluster.
+		initialCluster = currentInitialCluster(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+	}
+	if initialCluster == "" {
+		return nil, fmt.Errorf("rejoin etcd cluster: could not determine initial-cluster after member add")
+	}
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
 	if err := clearEtcdData(executor); err != nil {
 		return nil, err
@@ -554,14 +600,31 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 
 func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
 	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
-	addArgs := append(args, "member", "add", cfg.Shared.InstanceName,
-		"--peer-urls="+protocol+"://"+nodeIP+":2380")
-	addOut, err := runEtcdctl(executor, addArgs...)
+	peerURL := protocol + "://" + nodeIP + ":2380"
+
+	// Remove any stale member that carries our name but a different peer URL.
+	// This happens when a node is recreated/auto-healed under the same name with
+	// a new IP, or rebuilt after disk loss: the old entry is a dead voter that
+	// degrades quorum and must go before we add ourselves afresh.
+	removeStaleSelfMembers(cfg, executor, args, nodeIP, protocol)
+
+	// Add ourselves, retrying the transient strict-reconfig-check rejection
+	// ("not enough started members") that occurs during a parallel create or a
+	// resize while peers are still starting.
+	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL)
 	if err != nil {
 		return nil, fmt.Errorf("join etcd cluster: %w", err)
 	}
 
 	initialCluster := extractInitialCluster(addOut)
+	if initialCluster == "" {
+		// Member already existed (pre-created/ghost slot) — derive the list from
+		// the live cluster and start with state=existing to consume that slot.
+		initialCluster = currentInitialCluster(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+	}
+	if initialCluster == "" {
+		return nil, fmt.Errorf("join etcd cluster: could not determine initial-cluster after member add")
+	}
 	conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
 	if err := clearEtcdData(executor); err != nil {
 		return nil, err
@@ -589,6 +652,224 @@ func clearEtcdData(executor *host.Executor) error {
 		return fmt.Errorf("clear stale etcd data dir: %w", err)
 	}
 	return nil
+}
+
+// walPresent reports whether etcd has a populated write-ahead log, i.e. real
+// persisted raft state. This is the authoritative signal that this node is an
+// existing cluster member whose data must never be wiped or re-bootstrapped.
+// Decisions key on this rather than on config-file/health probes, which can be
+// transiently misleading (e.g. a healthy node whose etcd is merely slow to
+// start after a reboot).
+func walPresent() bool {
+	entries, err := os.ReadDir("/var/lib/etcd/default.etcd/member/wal")
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".wal") {
+			return true
+		}
+	}
+	return false
+}
+
+// startWithExistingData starts etcd for a node that already has a populated WAL.
+// etcd ignores the initial-cluster* fields when a data dir is present and
+// recovers membership from the WAL, so this path never wipes data. It writes a
+// config only when one is missing (e.g. a rebuilt node whose etcd Cinder volume
+// was reattached but whose root filesystem is fresh); otherwise it just ensures
+// the service is active, leaving a healthy node untouched for idempotency.
+// A returned error means etcd has data but would not become active — the caller
+// decides whether the data is orphaned (wipe+rejoin) or this is a quorum-loss
+// situation to fail safe on.
+func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string, lbOK bool) ([]host.Change, error) {
+	if _, err := os.Stat("/etc/etcd/etcd.conf.yaml"); err != nil {
+		// Config missing but data present: regenerate an existing-mode config.
+		// The initial-cluster value is informational here (etcd loads membership
+		// from the WAL); prefer the live member list when reachable, else fall
+		// back to our own peer URL. Crucially, do NOT clear the data dir.
+		initialCluster := fmt.Sprintf("%s=%s://%s:2380", cfg.Shared.InstanceName, protocol, nodeIP)
+		if lbOK {
+			if live := currentInitialCluster(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled); live != "" {
+				initialCluster = live
+			}
+		}
+		conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
+		return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, false)
+	}
+
+	// Config present: rebuild only for TLS/proxy drift, then ensure active. Never
+	// rewrite the membership config on a healthy node — that would restart etcd
+	// on every periodic reconcile.
+	if err := rebuildConfigIfNeeded(cfg, executor, nodeIP, protocol, certDir); err != nil {
+		return nil, err
+	}
+	if executor.SystemctlIsActive("etcd") {
+		return nil, nil
+	}
+	res, err := (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true, Active: hostresource.BoolPtr(true)}).Apply(executor)
+	if err != nil {
+		return res.Changes, fmt.Errorf("start etcd with existing data: %w", err)
+	}
+	if executor.Apply && !executor.WaitForSystemctlActive("etcd", 2*time.Minute, 2*time.Second) {
+		return res.Changes, fmt.Errorf("etcd did not become active with existing data")
+	}
+	return res.Changes, nil
+}
+
+// memberAddWithRetry runs `etcdctl member add` for this node, retrying on the
+// transient errors seen during concurrent cluster formation and resize. The
+// canonical one is "etcdserver: re-configuration failed due to not enough
+// started members": with --strict-reconfig-check, adding the Nth voting member
+// is rejected until N-1 members are actually started. On a parallel create
+// several masters race to add themselves, so this is expected and self-clears
+// once peers finish booting — it must be retried, not treated as fatal. If the
+// member already exists (a pre-created/ghost slot, or a lost ack), that is
+// treated as success and an empty output is returned so the caller derives the
+// member list from the live cluster. The bound (~12 × 10s) stays well within
+// Heat's deployment timeout. RunCapture is called directly (not runEtcdctl) to
+// avoid runEtcdctl's inner retry re-issuing this non-idempotent command.
+func memberAddWithRetry(executor *host.Executor, args []string, instanceName, peerURL string) (string, error) {
+	addArgs := make([]string, 0, len(args)+4)
+	addArgs = append(addArgs, args...)
+	addArgs = append(addArgs, "member", "add", instanceName, "--peer-urls="+peerURL)
+
+	const attempts = 12
+	const delay = 10 * time.Second
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		out, err := executor.RunCapture("/usr/local/bin/etcdctl", addArgs...)
+		if err == nil {
+			return out, nil
+		}
+		if isAlreadyMemberErr(err) {
+			if executor.Logger != nil {
+				executor.Logger.Infof("etcd: member %s already present; adopting existing slot", instanceName)
+			}
+			return "", nil
+		}
+		lastErr = err
+		if !isTransientMemberAddErr(err) {
+			return "", err
+		}
+		if executor.Logger != nil {
+			executor.Logger.Warnf("etcd: member add for %s transient failure (attempt %d/%d), retrying in %s: %v", instanceName, i+1, attempts, delay, err)
+		}
+		if !executor.Apply {
+			break
+		}
+		time.Sleep(delay)
+	}
+	return "", fmt.Errorf("member add for %s did not succeed after %d attempts: %w", instanceName, attempts, lastErr)
+}
+
+// isTransientMemberAddErr reports whether a member-add failure is the kind that
+// clears once peers finish starting or a leader settles, and so should be
+// retried rather than failing the phase. RunCapture embeds etcd's stderr in the
+// error string, so substring matching is reliable.
+func isTransientMemberAddErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"not enough started members",
+		"unhealthy cluster",
+		"request timed out",
+		"context deadline exceeded",
+		"leader changed",
+		"no leader",
+		"connection refused",
+		"too many requests",
+		"rpc error",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlreadyMemberErr reports whether a member-add failed because the member (or
+// its peer URL) is already registered — meaning the add effectively took.
+func isAlreadyMemberErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "peer urls already exists") ||
+		strings.Contains(msg, "member already exists")
+}
+
+// removeStaleSelfMembers removes any etcd member that shares this node's name
+// but advertises a different peer URL — the leftover entry from a previous
+// incarnation of this master (recreated/auto-healed under the same name with a
+// new IP, or rebuilt after disk loss). Such an entry is an unreachable voter
+// that degrades quorum and must go before adding the fresh node. Best-effort:
+// failures are logged and tolerated so the subsequent add still proceeds.
+func removeStaleSelfMembers(cfg config.Config, executor *host.Executor, args []string, nodeIP, protocol string) {
+	myPeer := protocol + "://" + nodeIP + ":2380"
+	out, err := runEtcdctl(executor, append(append([]string{}, args...), "member", "list")...)
+	if err != nil {
+		return
+	}
+	for _, m := range parseMemberList(out) {
+		if m.name != cfg.Shared.InstanceName || m.peerURL == myPeer {
+			continue
+		}
+		if _, rmErr := runEtcdctl(executor, append(append([]string{}, args...), "member", "remove", m.id)...); rmErr != nil {
+			if executor.Logger != nil {
+				executor.Logger.Warnf("etcd: failed to remove stale self member %s (old peer %s); continuing: %v", m.id, m.peerURL, rmErr)
+			}
+		} else if executor.Logger != nil {
+			executor.Logger.Infof("etcd: removed stale self member %s (old peer %s) before rejoining as %s", m.id, m.peerURL, myPeer)
+		}
+	}
+}
+
+// currentInitialCluster builds a "name=peerURL,..." string from the live etcd
+// member list. Members not yet started (empty name) are skipped. Returns "" if
+// the list cannot be read or parsed.
+func currentInitialCluster(executor *host.Executor, endpoint, certDir string, tlsDisabled bool) string {
+	args := etcdctlArgs(endpoint, certDir, tlsDisabled)
+	out, err := runEtcdctl(executor, append(args, "member", "list")...)
+	if err != nil {
+		return ""
+	}
+	var entries []string
+	for _, m := range parseMemberList(out) {
+		if m.name == "" || m.peerURL == "" {
+			continue
+		}
+		entries = append(entries, m.name+"="+m.peerURL)
+	}
+	return strings.Join(entries, ",")
+}
+
+// etcdMember is one row of `etcdctl member list` default CSV output.
+type etcdMember struct {
+	id      string
+	name    string
+	peerURL string
+}
+
+// parseMemberList parses default `etcdctl member list` CSV output
+// (ID, status, name, peerURLs, clientURLs, isLearner) into members. Lines with
+// fewer than 4 fields are skipped.
+func parseMemberList(out string) []etcdMember {
+	var ms []etcdMember
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Split(line, ",")
+		if len(fields) < 4 {
+			continue
+		}
+		ms = append(ms, etcdMember{
+			id:      strings.TrimSpace(fields[0]),
+			name:    strings.TrimSpace(fields[2]),
+			peerURL: strings.TrimSpace(fields[3]),
+		})
+	}
+	return ms
 }
 
 func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, certDir string) {

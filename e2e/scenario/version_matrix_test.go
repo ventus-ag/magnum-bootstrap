@@ -60,13 +60,15 @@ func TestVersionMatrixRoleAndOperation(t *testing.T) {
 
 // TestVersionMatrixOperationsAcrossVersions confirms upgrade and ca-rotate are
 // detected at both ends of the supported range, not just the default v1.30.
+// Upgrade is no longer a distinct operation (state-driven via KUBE_TAG delta),
+// so an "upgrade" scenario resolves to create; only CA rotation is distinct.
 func TestVersionMatrixOperationsAcrossVersions(t *testing.T) {
 	for _, minor := range []int{20, 36} {
 		tag := tagFor(minor)
 		up := base(RoleMaster, OpUpgrade)
 		up.KubeTag = tag
-		if got := loadVia(t, up).Operation(); got != config.OperationUpgrade {
-			t.Errorf("%s upgrade: Operation() = %q, want upgrade", tag, got)
+		if got := loadVia(t, up).Operation(); got != config.OperationCreate {
+			t.Errorf("%s upgrade: Operation() = %q, want create (upgrade is not a distinct op)", tag, got)
 		}
 		rot := base(RoleMaster, OpCARotate)
 		rot.KubeTag = tag

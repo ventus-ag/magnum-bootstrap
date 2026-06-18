@@ -5,10 +5,13 @@
 //
 // The whole point is that an operation is just a different heat-params file:
 //
-//	create    -> IS_UPGRADE=false IS_RESIZE=false, no CA_ROTATION_ID
-//	upgrade   -> IS_UPGRADE=true  (+ bumped KUBE_TAG)
-//	resize    -> IS_RESIZE=true
+//	create    -> baseline heat-params, no CA_ROTATION_ID
+//	upgrade   -> bumped KUBE_TAG (detected by the reconciler as a version delta)
+//	resize    -> changed node count (no node-local flag; convergence is state-driven)
 //	ca-rotate -> CA_ROTATION_ID set to a new value
+//
+// There are no IS_UPGRADE / IS_RESIZE flags: the reconciler infers all intent
+// from desired state (KUBE_TAG, node count, rotation token) vs applied state.
 //
 // Role (master/worker) and operation are detected by internal/config from this
 // file alone, so the same Config drives the mock-VM tier and the real-OpenStack
@@ -190,8 +193,6 @@ func (c Config) Inputs() []KV { return c.pairs() }
 func (c Config) pairs() []KV {
 	c = c.withDefaults()
 
-	isUpgrade := c.Operation == OpUpgrade
-	isResize := c.Operation == OpResize
 	caRotationID := c.CARotationID
 	if c.Operation != OpCARotate {
 		caRotationID = ""
@@ -210,8 +211,6 @@ func (c Config) pairs() []KV {
 	put("INSTANCE_NAME", c.InstanceName())
 	put("NODEGROUP_ROLE", string(c.Role))
 	put("NODEGROUP_NAME", string(c.Role)+"-group")
-	put("IS_UPGRADE", b(isUpgrade))
-	put("IS_RESIZE", b(isResize))
 	put("KUBE_TAG", c.KubeTag)
 	put("KUBE_VERSION", c.KubeTag)
 	put("KUBE_NODE_IP", c.NodeIP)

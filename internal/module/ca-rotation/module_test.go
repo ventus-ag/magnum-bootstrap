@@ -39,13 +39,13 @@ func TestLatestAppliedCARotationIDFallsBackToState(t *testing.T) {
 	}
 }
 
-func TestModuleRunSkipsNonPureCARotation(t *testing.T) {
+func TestModuleRunSkipsWhenNoRotationActive(t *testing.T) {
+	// With no CA_ROTATION_ID set, there is no active rotation, so the module is a
+	// no-op. (Resize/upgrade no longer suppress rotation — the IS_RESIZE/IS_UPGRADE
+	// flags were removed; rotation is gated purely on the rotation token.)
 	cfg := config.Config{
-		Shared: config.SharedConfig{
-			IsResize: true,
-		},
 		Trigger: config.TriggerConfig{
-			CARotationID: "rotate-123",
+			CARotationID: "",
 		},
 	}
 
@@ -54,7 +54,7 @@ func TestModuleRunSkipsNonPureCARotation(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if len(res.Changes) != 0 {
-		t.Fatalf("expected no changes for non-pure ca rotation, got %d", len(res.Changes))
+		t.Fatalf("expected no changes when no rotation is active, got %d", len(res.Changes))
 	}
 }
 

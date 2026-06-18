@@ -48,7 +48,6 @@ func TestEffectiveCARotationStateIDReturnsMarkerWhenFinalized(t *testing.T) {
 func TestEffectiveCARotationStateIDPreservesPreviousForResize(t *testing.T) {
 	useTempMarker(t)
 	cfg := config.Config{
-		Shared:  config.SharedConfig{IsResize: true},
 		Trigger: config.TriggerConfig{CARotationID: "stale-rotate-id"},
 	}
 

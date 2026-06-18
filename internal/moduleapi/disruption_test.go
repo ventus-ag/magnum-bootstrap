@@ -14,45 +14,34 @@ func TestDisruptiveServiceCycleNeeded(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "no disruptive flags",
+			// Fresh node (create or scale-add): nothing converged before, nothing
+			// to drain — even though a desired tag is set.
+			name: "fresh node never drains",
 			cfg:  config.Config{Shared: config.SharedConfig{KubeTag: "v1.29.0"}},
-			req:  Request{PreviousSuccessfulGeneration: "create:v1.28.0"},
-			want: false,
-		},
-		{
-			name: "upgrade without previous success skips disruption",
-			cfg:  config.Config{Shared: config.SharedConfig{IsUpgrade: true, KubeTag: "v1.29.0"}},
 			req:  Request{},
 			want: false,
 		},
 		{
-			name: "upgrade with kube tag change triggers disruption",
-			cfg:  config.Config{Shared: config.SharedConfig{IsUpgrade: true, KubeTag: "v1.29.0"}},
+			// Converged node moving to a new version → drain/restart cycle.
+			name: "version change triggers disruption",
+			cfg:  config.Config{Shared: config.SharedConfig{KubeTag: "v1.29.0"}},
 			req:  Request{PreviousSuccessfulGeneration: "create:v1.28.0", PreviousKubeTag: "v1.28.0"},
 			want: true,
 		},
 		{
-			name: "same tag upgrade stays non disruptive",
-			cfg:  config.Config{Shared: config.SharedConfig{IsUpgrade: true, KubeTag: "v1.29.0"}},
+			// Same tag (periodic reconcile / re-apply): no version change → no drain.
+			name: "same tag stays non disruptive",
+			cfg:  config.Config{Shared: config.SharedConfig{KubeTag: "v1.29.0"}},
 			req:  Request{PreviousSuccessfulGeneration: "create:v1.29.0", PreviousKubeTag: "v1.29.0"},
 			want: false,
 		},
 		{
-			name: "stale upgrade flag does not retrigger disruption",
-			cfg:  config.Config{Shared: config.SharedConfig{IsUpgrade: true, KubeTag: "v1.29.0"}},
-			req:  Request{PreviousSuccessfulGeneration: "upgrade:v1.29.0", PreviousKubeTag: "v1.29.0"},
-			want: false,
-		},
-		{
-			name: "resize generation change triggers disruption",
-			cfg:  config.Config{Shared: config.SharedConfig{IsResize: true, KubeTag: "v1.29.0"}},
-			req:  Request{PreviousSuccessfulGeneration: "create:v1.29.0"},
-			want: true,
-		},
-		{
-			name: "stale resize flag does not retrigger disruption",
-			cfg:  config.Config{Shared: config.SharedConfig{IsResize: true, KubeTag: "v1.29.0"}},
-			req:  Request{PreviousSuccessfulGeneration: "resize:v1.29.0"},
+			// Resize touches an existing node at the SAME version — it keeps
+			// running, so no drain (improvement over the old IS_RESIZE behavior
+			// which drained existing nodes on every resize).
+			name: "resize without version change does not drain existing node",
+			cfg:  config.Config{Shared: config.SharedConfig{KubeTag: "v1.29.0"}},
+			req:  Request{PreviousSuccessfulGeneration: "create:v1.29.0", PreviousKubeTag: "v1.29.0"},
 			want: false,
 		},
 	}

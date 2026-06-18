@@ -20,14 +20,16 @@ type Request struct {
 	Paths        paths.Paths
 
 	// PreviousSuccessfulGeneration is the desired-generation token from the
-	// last successful reconcile run. stop-services/start-services use it to
-	// run disruptive upgrade/resize work only once per successful generation,
-	// even if IS_UPGRADE or IS_RESIZE remain stuck in heat-params.
+	// last successful reconcile run. It distinguishes a node that has converged
+	// before from a genuinely fresh one (empty == never succeeded), which the
+	// etcd module uses as a state-driven split-brain guard.
 	PreviousSuccessfulGeneration string
 
 	// PreviousKubeTag is the KUBE_TAG from the last successful reconcile run.
-	// Upgrade drain/restart work only runs when this differs from the current
-	// desired tag, so same-tag updates with IS_UPGRADE=true stay non-disruptive.
+	// The disruptive drain/restart cycle runs only when this differs from the
+	// current desired tag — i.e. an actual version change on a node that already
+	// converged. This is the sole signal for "upgrade in progress"; there is no
+	// IS_UPGRADE flag.
 	PreviousKubeTag string
 
 	// PreviousCARotationID is the last successfully applied CA rotation ID from
@@ -43,22 +45,15 @@ type Request struct {
 }
 
 // DisruptiveServiceCycleNeeded reports whether stop-services/start-services
-// should perform the disruptive node drain/stop/start cycle. Upgrade intent is
-// further gated by an actual KUBE_TAG change so same-tag updates with
-// IS_UPGRADE=true do not drain. Resize still relies on the last successful
-// generation to avoid re-triggering on later periodic runs.
+// should perform the disruptive node drain/stop/start cycle. This is fully
+// state-driven: the cycle is needed only when an already-converged node is
+// moving to a new Kubernetes version. A fresh node (PreviousKubeTag == "") has
+// no workloads to drain and nothing prior to disrupt; an unchanged tag means no
+// version change to apply. A resize never drains existing nodes (they keep
+// running), and a newly added node enters via the fresh-node branch — so no
+// IS_UPGRADE / IS_RESIZE flag is consulted.
 func DisruptiveServiceCycleNeeded(cfg config.Config, req Request) bool {
-	switch {
-	case cfg.Shared.IsUpgrade:
-		return req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
-	case cfg.Shared.IsResize:
-		if req.PreviousSuccessfulGeneration == "" {
-			return false
-		}
-		return req.PreviousSuccessfulGeneration != cfg.GenerationToken()
-	default:
-		return false
-	}
+	return req.PreviousKubeTag != "" && req.PreviousKubeTag != cfg.Shared.KubeTag
 }
 
 // RestartTracker is a thread-safe set of systemd service names that need
