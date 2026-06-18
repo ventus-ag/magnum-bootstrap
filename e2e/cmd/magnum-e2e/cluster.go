@@ -251,12 +251,15 @@ func (r *runner) run(ctx context.Context) error {
 	r.log("cluster uuid=%s", uuid)
 
 	if err := r.smokeCore(ctx); err != nil {
+		r.collectDiagnostics(ctx, "create-smoke")
 		return err
 	}
 	if err := r.verifyNodeCount(ctx); err != nil {
+		r.collectDiagnostics(ctx, "create-nodecount")
 		return err
 	}
 	if err := r.smokeCloudIntegration(ctx); err != nil {
+		r.collectDiagnostics(ctx, "create-cloud-integration")
 		return err
 	}
 

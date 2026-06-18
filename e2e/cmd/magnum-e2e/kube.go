@@ -8,6 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -308,6 +310,17 @@ func (r *runner) triggerCARotate(ctx context.Context) error {
 // re-triggering the reconciler on a node, which this tier can't do without a
 // Heat op; it stays covered by the FCoS VM tier.
 func (r *runner) verifyBundle(ctx context.Context, name string, disruptive bool) error {
+	if err := r.verifyBundleInner(ctx, name, disruptive); err != nil {
+		// Capture a node/pod diagnostic bundle at the moment of failure (mid-run),
+		// before teardown wipes the cluster — this is the only chance to see why a
+		// node went NotReady or a pod could not start.
+		r.collectDiagnostics(ctx, "verify-"+name)
+		return err
+	}
+	return nil
+}
+
+func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive bool) error {
 	if err := r.smokeCore(ctx); err != nil {
 		return fmt.Errorf("verify %s: %w", name, err)
 	}
@@ -594,4 +607,182 @@ func (r *runner) verifySAConsistency(ctx context.Context) error {
 	}
 	r.log("SA token accepted on %d/%d probes across masters ✅", accepted, probes)
 	return nil
+}
+
+// collectDiagnostics gathers a node/pod failure bundle straight from the
+// Kubernetes API — this tier has no SSH to nodes, so node-level state comes from
+// node conditions, Warning events, and the logs of pods that won't start. It
+// writes the full bundle to DIAG_DIR (uploaded as a CI artifact) and a one-line
+// summary to the run log. Best-effort: never returns an error and is safe to
+// call mid-run at any failure point, before teardown wipes the cluster.
+func (r *runner) collectDiagnostics(ctx context.Context, reason string) {
+	kc, err := r.k8sClient(ctx)
+	if err != nil {
+		r.err("diagnostics: cannot reach cluster API (%v)", err)
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "==== e2e node diagnostics ====\nreason:   %s\nscenario: %s\ncluster:  %s\ntime:     %s\n\n",
+		reason, r.cfg.scenario, r.cfg.clusterName, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+
+	// Nodes — with full condition messages for any that are not Ready.
+	var notReady []string
+	if nodes, nerr := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{}); nerr == nil {
+		fmt.Fprintf(&b, "-- nodes (%d) --\n%-46s %-26s %-14s %-12s %s\n",
+			len(nodes.Items), "NODE", "STATUS", "ROLES", "VERSION", "INTERNAL-IP")
+		for _, n := range nodes.Items {
+			st := nodeStatusStr(n)
+			fmt.Fprintf(&b, "%-46s %-26s %-14s %-12s %s\n",
+				n.Name, st, nodeRoles(n), n.Status.NodeInfo.KubeletVersion, nodeInternalIP(n))
+			if st != "Ready" {
+				notReady = append(notReady, n.Name)
+				for _, c := range n.Status.Conditions {
+					if c.Status != corev1.ConditionTrue && (c.Type == corev1.NodeReady || strings.TrimSpace(c.Message) != "") {
+						fmt.Fprintf(&b, "    %s=%s %s: %s\n", c.Type, c.Status, c.Reason, strings.TrimSpace(c.Message))
+					}
+				}
+			}
+		}
+	} else {
+		fmt.Fprintf(&b, "-- nodes: list error: %v --\n", nerr)
+	}
+
+	// Problem pods (all namespaces): not Running/Succeeded, a container not ready,
+	// or any restarts. These are what to pull logs from.
+	var problems []corev1.Pod
+	if pods, perr := kc.CoreV1().Pods("").List(ctx, metav1.ListOptions{}); perr == nil {
+		fmt.Fprintf(&b, "\n-- problem pods --\n%-20s %-52s %-7s %-22s %-9s %s\n",
+			"NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "NODE")
+		for _, p := range pods.Items {
+			ready, total, restarts := 0, len(p.Spec.Containers), int32(0)
+			for _, cs := range p.Status.ContainerStatuses {
+				if cs.Ready {
+					ready++
+				}
+				restarts += cs.RestartCount
+			}
+			if (p.Status.Phase == corev1.PodRunning || p.Status.Phase == corev1.PodSucceeded) && ready == total && restarts == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "%-20s %-52s %-7s %-22s %-9d %s\n",
+				p.Namespace, p.Name, fmt.Sprintf("%d/%d", ready, total), podStatusStr(p), restarts, p.Spec.NodeName)
+			problems = append(problems, p)
+		}
+		if len(problems) == 0 {
+			fmt.Fprintf(&b, "(none)\n")
+		}
+	}
+
+	// Recent Warning events (all namespaces) — FailedCreatePodSandBox,
+	// FailedScheduling, image-pull errors etc. are the direct "pod can't start" signal.
+	if evs, eerr := kc.CoreV1().Events("").List(ctx, metav1.ListOptions{}); eerr == nil {
+		type ev struct {
+			t time.Time
+			s string
+		}
+		var warns []ev
+		for _, e := range evs.Items {
+			if e.Type != corev1.EventTypeWarning {
+				continue
+			}
+			when := e.LastTimestamp.Time
+			if when.IsZero() {
+				when = e.EventTime.Time
+			}
+			warns = append(warns, ev{when, fmt.Sprintf("%dx %s %s/%s %s: %s",
+				e.Count, e.InvolvedObject.Kind, e.InvolvedObject.Namespace, e.InvolvedObject.Name,
+				e.Reason, strings.TrimSpace(e.Message))})
+		}
+		sort.Slice(warns, func(i, j int) bool { return warns[i].t.After(warns[j].t) })
+		fmt.Fprintf(&b, "\n-- recent Warning events (%d total, newest first, capped 40) --\n", len(warns))
+		for i, w := range warns {
+			if i >= 40 {
+				break
+			}
+			fmt.Fprintf(&b, "%s  %s\n", w.t.UTC().Format("15:04:05"), w.s)
+		}
+	}
+
+	// Tail logs of problem pods (current + previous when a container has restarted).
+	fmt.Fprintf(&b, "\n-- problem pod logs (tail 60) --\n")
+	for i, p := range problems {
+		if i >= 12 {
+			fmt.Fprintf(&b, "\n(… %d more problem pods omitted)\n", len(problems)-i)
+			break
+		}
+		for _, c := range p.Spec.Containers {
+			fmt.Fprintf(&b, "\n### %s/%s [%s] on %s\n", p.Namespace, p.Name, c.Name, p.Spec.NodeName)
+			b.WriteString(podLogTail(ctx, kc, p.Namespace, p.Name, c.Name, false))
+			if containerRestarted(p, c.Name) {
+				fmt.Fprintf(&b, "--- previous (crashed) instance ---\n")
+				b.WriteString(podLogTail(ctx, kc, p.Namespace, p.Name, c.Name, true))
+			}
+		}
+	}
+
+	r.writeDiagFile(reason, b.String())
+	r.log("diagnostics: %d node(s) NotReady %v, %d problem pod(s)", len(notReady), notReady, len(problems))
+}
+
+// podLogTail returns the last lines of one container's log (previous=crashed
+// instance), or an inline error note — never fails the caller.
+func podLogTail(ctx context.Context, kc *kubernetes.Clientset, ns, pod, container string, previous bool) string {
+	lines := int64(60)
+	req := kc.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{
+		Container: container, TailLines: &lines, Previous: previous,
+	})
+	out, err := req.DoRaw(ctx)
+	if err != nil {
+		return fmt.Sprintf("(log fetch error: %v)\n", err)
+	}
+	if len(out) == 0 {
+		return "(no log output)\n"
+	}
+	return string(out)
+}
+
+func containerRestarted(p corev1.Pod, name string) bool {
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Name == name && cs.RestartCount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// writeDiagFile writes the bundle to DIAG_DIR (default ./e2e-diagnostics) for CI
+// artifact upload, falling back to stdout so the data survives even if the dir
+// is not writable.
+func (r *runner) writeDiagFile(reason, content string) {
+	dir := os.Getenv("DIAG_DIR")
+	if dir == "" {
+		dir = "e2e-diagnostics"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		r.err("diagnostics: mkdir %s: %v — dumping inline", dir, err)
+		fmt.Println(content)
+		return
+	}
+	fn := filepath.Join(dir, fmt.Sprintf("%s-%s-%s.log",
+		r.cfg.clusterName, sanitizeFilename(reason), time.Now().UTC().Format("150405")))
+	if err := os.WriteFile(fn, []byte(content), 0o644); err != nil {
+		r.err("diagnostics: write %s: %v — dumping inline", fn, err)
+		fmt.Println(content)
+		return
+	}
+	r.log("diagnostics bundle written: %s", fn)
+}
+
+func sanitizeFilename(s string) string {
+	var out strings.Builder
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			out.WriteRune(c)
+		default:
+			out.WriteRune('-')
+		}
+	}
+	return out.String()
 }
