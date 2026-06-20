@@ -496,6 +496,32 @@ nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rota
 `chained-single` and `chained-multinode` (the wedge sequence
 `upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate`).
 
+**`version-ladder` (1m/1w, dispatch-only).** A long multi-version upgrade walk:
+create at the first version, then for every rung `upgrade → cloud-smoke`. Its op
+chain is **generated** from the upgrade ladder (not a static preset), so it lives
+outside the `scenarios` map / `allScenarios` (not in `SCENARIO=all`). Default
+ladder (built-in, zero-config on the ventus cloud, all templates version-pinned):
+`v1.20.12 → v1.23.17 → v1.28.4 → v1.30.10 → v1.32.2 → v1.33.10 → v1.34.6 →
+v1.35.3` (7 upgrades). Override with `UPGRADE_LADDER` (ordered comma list of
+template names) + `CLUSTER_TEMPLATE` (the create version). When `UPGRADE_LADDER`
+is empty the built-in ladder OWNS the create version too (`v1.20.12`), overriding
+a generic `CLUSTER_TEMPLATE`, so the first hop is never a downgrade. The ladder
+cursor advances once per `upgrade` op (in `execOp`, not per `runMutation` retry,
+so a retried trigger re-fires the same rung). The jumps are deliberately
+multi-minor (e.g. 1.23→1.28) — non-standard for kubeadm, a stress test of the
+reconciler's binary-swap upgrade. `triggerUpgrade(ctx, target)` and the per-op
+`upgradeTarget()` selector live in `cluster.go`; `defaultVersionLadder`,
+`nextLadderTarget`, `ladderOps` in `ops.go`.
+
+**cloud-smoke depth (`smokeCloudIntegration`, kube.go).** The `cloud-smoke` op
+(also run after every create) proves the OCCM/Cinder datapath, not just
+provisioning: an **nginx** Deployment mounts the PVC (`/data`) behind a
+LoadBalancer Service; it asserts the PVC **binds**, the LB **serves HTTP 200**
+(`waitLBServes`, real GET to the Octavia VIP), then **resizes** the PVC 1Gi→2Gi
+and waits for `status.capacity` to converge (`resizePVC`, online expansion —
+needs the mount; `ensureExpandableDefaultSC` fails fast if the default
+StorageClass forbids expansion). Runs in every scenario's create + ladder rung.
+
 **Robustness (`runMutation` in cluster.go):** every mutating op goes
 `ensureSettled` → snapshot → trigger (retry on busy/transient) → `waitTransition`
 → `waitStatus(UPDATE_COMPLETE)` → `verifyBundle`. This fixes the chained-op race

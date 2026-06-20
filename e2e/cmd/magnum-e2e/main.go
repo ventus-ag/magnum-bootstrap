@@ -42,6 +42,7 @@ type config struct {
 	clusterName       string
 	template          string // create-time template (name or UUID)
 	upgradeTemplate   string // upgrade target template (defaults to template)
+	upgradeLadder     string // ordered comma-separated upgrade-template ladder (version-ladder scenario)
 	keypair           string
 	kubeTag           string
 	kubeTagUpgrade    string
@@ -114,6 +115,7 @@ func loadConfig() config {
 	flag.StringVar(&c.clusterName, "cluster-name", defName, "cluster name [CLUSTER_NAME]")
 	flag.StringVar(&c.template, "template", envOr("CLUSTER_TEMPLATE", ""), "Magnum cluster template name or UUID [CLUSTER_TEMPLATE]")
 	flag.StringVar(&c.upgradeTemplate, "upgrade-template", envOr("UPGRADE_TEMPLATE", ""), "upgrade target template (default: same as -template) [UPGRADE_TEMPLATE]")
+	flag.StringVar(&c.upgradeLadder, "upgrade-ladder", envOr("UPGRADE_LADDER", ""), "ordered comma-separated upgrade-template ladder for the version-ladder scenario; empty + version-ladder = built-in 1.20→1.35 ladder [UPGRADE_LADDER]")
 	flag.StringVar(&c.keypair, "keypair", envOr("KEYPAIR", ""), "nova keypair name [KEYPAIR]")
 	flag.StringVar(&c.kubeTag, "kube-tag", envOr("KUBE_TAG", ""), "kube_tag label override; empty = inherit the template's own kube_tag [KUBE_TAG]")
 	flag.StringVar(&c.kubeTagUpgrade, "kube-tag-upgrade", envOr("KUBE_TAG_UPGRADE", ""), "upgrade target version label (informational; version comes from -upgrade-template) [KUBE_TAG_UPGRADE]")
@@ -132,7 +134,7 @@ func loadConfig() config {
 	skipRz := flag.Bool("skip-resize", envBool("SKIP_RESIZE"), "skip the resize step [SKIP_RESIZE]")
 	skip := flag.Bool("skip-ca-rotate", envBool("SKIP_CA_ROTATE"), "skip the ca-rotate step [SKIP_CA_ROTATE]")
 	skipPR := flag.Bool("skip-post-rotate", envBool("SKIP_POST_ROTATE"), "skip the post-rotation add-node + SA-consistency stage [SKIP_POST_ROTATE]")
-	flag.StringVar(&c.scenario, "scenario", envOr("SCENARIO", ""), "scenario preset (smoke|multinode|chained-single|chained-multinode); sets shape + op chain. Use SCENARIO env so the cluster-name tag + shape defaults apply [SCENARIO]")
+	flag.StringVar(&c.scenario, "scenario", envOr("SCENARIO", ""), "scenario preset (smoke|multinode|chained-single|chained-multinode|version-ladder); sets shape + op chain. Use SCENARIO env so the cluster-name tag + shape defaults apply [SCENARIO]")
 	flag.StringVar(&c.ops, "ops", envOr("OPS", ""), "explicit comma op chain, overrides scenario, e.g. upgrade,ca-rotate,resize-workers=3,add-nodepool=2 [OPS]")
 	flag.StringVar(&c.nodepoolName, "nodepool-name", envOr("NODEPOOL_NAME", "e2e-np"), "name of the extra worker nodepool (nodegroup) [NODEPOOL_NAME]")
 	flag.StringVar(&c.nodepoolFlavor, "nodepool-flavor", envOr("NODEPOOL_FLAVOR", ""), "flavor for the extra nodepool (a different node size); empty = template default [NODEPOOL_FLAVOR]")
@@ -146,6 +148,19 @@ func loadConfig() config {
 	c.skipPostRotate = *skipPR
 	if c.upgradeTemplate == "" {
 		c.upgradeTemplate = c.template
+	}
+
+	// version-ladder scenario shapes the create template + upgrade ladder:
+	//   - UPGRADE_LADDER unset → the built-in 1.20→1.35 walk OWNS both the create
+	//     version (ladder[0]) and the upgrade rungs, overriding any generic
+	//     CLUSTER_TEMPLATE so SCENARIO=version-ladder is zero-config in CI (where
+	//     MAGNUM_CLUSTER_TEMPLATE is pinned to a different version for other
+	//     scenarios — otherwise the first "upgrade" would be a downgrade).
+	//   - UPGRADE_LADDER set → custom walk; CLUSTER_TEMPLATE is the create version
+	//     (required; preflight errors if empty).
+	if c.scenario == ladderScenario && c.upgradeLadder == "" {
+		c.upgradeLadder = strings.Join(defaultVersionLadder[1:], ",")
+		c.template = defaultVersionLadder[0]
 	}
 
 	// Apply the scenario's cluster shape for any count the user did NOT set

@@ -27,6 +27,12 @@ type runner struct {
 	// (toggled by add-nodepool / del-nodepool ops). When true, the verify bundle
 	// also asserts the nodepool is schedulable.
 	nodepoolActive bool
+
+	// ladder is the ordered upgrade-template walk (version-ladder scenario); each
+	// `upgrade` op advances ladderPos by one rung. Empty = a single fixed upgrade
+	// template (cfg.upgradeTemplate).
+	ladder    []string
+	ladderPos int
 }
 
 // computeClient returns a lazily-built, cached Nova (compute v2) client.
@@ -165,7 +171,7 @@ func newRunner(ctx context.Context, cfg config) (*runner, error) {
 	// Acceptable. Pin to the fork's CURRENT_MAX_VER (1.10) so the full
 	// create→upgrade→resize→ca-rotate flow is accepted.
 	magnum.Microversion = "1.10"
-	return &runner{cfg: cfg, provider: provider, magnum: magnum}, nil
+	return &runner{cfg: cfg, provider: provider, magnum: magnum, ladder: splitTrim(cfg.upgradeLadder)}, nil
 }
 
 // listResources prints the cluster templates and nova keypairs visible to the
@@ -277,7 +283,14 @@ func (r *runner) run(ctx context.Context) error {
 func (r *runner) execOp(ctx context.Context, o op) error {
 	switch o.name {
 	case "upgrade":
-		return r.runMutation(ctx, "upgrade", true, func() error { return r.triggerUpgrade(ctx) })
+		// Resolve the target rung + advance the ladder ONCE per op (not per
+		// trigger retry inside runMutation), so a retried trigger re-fires the
+		// same rung instead of skipping ahead.
+		target, err := r.upgradeTarget()
+		if err != nil {
+			return err
+		}
+		return r.runMutation(ctx, "upgrade->"+target, true, func() error { return r.triggerUpgrade(ctx, target) })
 
 	case "ca-rotate":
 		return r.runMutation(ctx, "ca-rotate", true, func() error { return r.triggerCARotate(ctx) })
@@ -354,9 +367,16 @@ func (r *runner) preflight(ctx context.Context) error {
 	r.log("scenario=%q shape: %d master(s) / %d worker(s), nodepool=%q", r.cfg.scenario, r.cfg.masterCount, r.cfg.nodeCount, r.nodepoolName())
 	r.log("op chain (%d): %s", len(ops), formatOps(ops))
 	// KEYPAIR is optional — an ephemeral keypair is auto-created when unset.
-	ct, err := clustertemplates.Get(ctx, r.magnum, r.cfg.template).Extract()
+	// Resolve to a UUID first (GET-by-name 409s when several templates share a
+	// name, e.g. a public + a private copy; resolveTemplateID disambiguates via
+	// the project list), then GET by UUID for the unambiguous detail.
+	tmplID, err := r.resolveTemplateID(ctx, r.cfg.template)
 	if err != nil {
 		return fmt.Errorf("cluster template %q: %w", r.cfg.template, err)
+	}
+	ct, err := clustertemplates.Get(ctx, r.magnum, tmplID).Extract()
+	if err != nil {
+		return fmt.Errorf("cluster template %q (uuid %s): %w", r.cfg.template, tmplID, err)
 	}
 	r.log("auth OK; template %q resolved to %s (coe=%s, network_driver=%s)", r.cfg.template, ct.UUID, ct.COE, ct.NetworkDriver)
 	// Show the template's default labels — these are inherited at create, and
@@ -368,10 +388,20 @@ func (r *runner) preflight(ctx context.Context) error {
 	if ct.Labels["reconciler_version"] == "" && ct.Labels["reconciler_binary_url"] == "" {
 		r.log("note: template carries no reconciler_* labels — they must come from staging (-bootstrap-binary) or RECONCILER_VERSION/URL")
 	}
-	if r.cfg.upgradeTemplate != r.cfg.template {
+	if len(r.ladder) == 0 && r.cfg.upgradeTemplate != r.cfg.template {
 		if _, err := r.resolveTemplateID(ctx, r.cfg.upgradeTemplate); err != nil {
 			return fmt.Errorf("upgrade template %q: %w", r.cfg.upgradeTemplate, err)
 		}
+	}
+	// Resolve every upgrade-ladder rung up front so a typo / missing version
+	// template fails the dry preflight, before any real resource is created.
+	for i, rung := range r.ladder {
+		if _, err := r.resolveTemplateID(ctx, rung); err != nil {
+			return fmt.Errorf("upgrade ladder rung %d %q: %w", i+1, rung, err)
+		}
+	}
+	if len(r.ladder) > 0 {
+		r.log("upgrade ladder OK (%d rungs): %s", len(r.ladder), strings.Join(r.ladder, " → "))
 	}
 	return r.preflightKeypair(ctx)
 }
@@ -496,19 +526,36 @@ func (r *runner) createCluster(ctx context.Context) (string, error) {
 	return uuid, nil
 }
 
-// triggerUpgrade fires the Magnum upgrade action (no wait — runMutation owns
-// settle/wait/verify). Magnum upgrade targets a template; many deployments
-// parameterise a single template by the kube_tag label, in which case
-// -upgrade-template == -template and the version bump rides on the cluster's
-// kube_tag; if you keep a distinct template per version, point -upgrade-template
-// at it.
-func (r *runner) triggerUpgrade(ctx context.Context) error {
-	tmplID, err := r.resolveTemplateID(ctx, r.cfg.upgradeTemplate)
+// upgradeTarget picks the next upgrade template and advances the ladder cursor
+// exactly once per upgrade op. Without a ladder (the common single-hop case) it
+// returns the fixed -upgrade-template; with a ladder it returns the next rung and
+// errors if the op chain asked for more upgrades than there are rungs.
+func (r *runner) upgradeTarget() (string, error) {
+	if len(r.ladder) == 0 {
+		return r.cfg.upgradeTemplate, nil
+	}
+	t, next, err := nextLadderTarget(r.ladder, r.ladderPos)
 	if err != nil {
-		return fmt.Errorf("resolve upgrade template: %w", err)
+		return "", err
+	}
+	r.log("upgrade ladder rung %d/%d → %s", r.ladderPos+1, len(r.ladder), t)
+	r.ladderPos = next
+	return t, nil
+}
+
+// triggerUpgrade fires the Magnum upgrade action against the given target
+// template (no wait — runMutation owns settle/wait/verify). Magnum upgrade
+// targets a template; many deployments parameterise a single template by the
+// kube_tag label, in which case -upgrade-template == -template and the version
+// bump rides on the cluster's kube_tag; if you keep a distinct template per
+// version (or a version-ladder), each rung is its own template.
+func (r *runner) triggerUpgrade(ctx context.Context, target string) error {
+	tmplID, err := r.resolveTemplateID(ctx, target)
+	if err != nil {
+		return fmt.Errorf("resolve upgrade template %q: %w", target, err)
 	}
 	if _, err := clusters.Upgrade(ctx, r.magnum, r.cfg.clusterName, clusters.UpgradeOpts{ClusterTemplate: tmplID}).Extract(); err != nil {
-		return fmt.Errorf("upgrade: %w", err)
+		return fmt.Errorf("upgrade -> %s: %w", target, err)
 	}
 	return nil
 }

@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       scenario:
-        description: "Scenario: all (every scenario sequentially) | smoke | multinode | chained-single | chained-multinode"
+        description: "Scenario: all (every scenario sequentially) | smoke | multinode | chained-single | chained-multinode | version-ladder"
         type: string
         default: all
       ops:
@@ -69,6 +69,7 @@ on:
           - multinode
           - chained-single
           - chained-multinode
+          - version-ladder
       ops:
         description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
         type: string
@@ -136,6 +137,10 @@ jobs:
       # version), so the version comes from the template, not a kube_tag label.
       CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
       UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
+      # version-ladder upgrade walk (ordered template list). Empty => the driver's
+      # built-in 1.20→1.35 ladder (used when SCENARIO=version-ladder). Ignored by
+      # other scenarios.
+      UPGRADE_LADDER: ${{ vars.MAGNUM_UPGRADE_LADDER }}
       # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.
       KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
       # Scenario-tagged name keeps sequential matrix runs + teardown isolated.

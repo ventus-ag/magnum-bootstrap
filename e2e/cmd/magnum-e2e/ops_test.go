@@ -115,6 +115,110 @@ func TestPerScenarioName(t *testing.T) {
 	}
 }
 
+// TestSplitTrim covers comma/space trimming and empty-element dropping.
+func TestSplitTrim(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"  ", nil},
+		{"a", []string{"a"}},
+		{" a , b ,, c ", []string{"a", "b", "c"}},
+		{"v1.23.17,v1.28.4", []string{"v1.23.17", "v1.28.4"}},
+	}
+	for _, c := range cases {
+		got := splitTrim(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("splitTrim(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("splitTrim(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+// TestNextLadderTarget pins ladder advancement and overflow: each call returns
+// the rung at pos and pos+1, and a pos past the end errors (the op chain asked
+// for more upgrades than the ladder has rungs).
+func TestNextLadderTarget(t *testing.T) {
+	ladder := []string{"v1.23.17", "v1.28.4", "v1.30.10"}
+	pos := 0
+	for i, want := range ladder {
+		got, next, err := nextLadderTarget(ladder, pos)
+		if err != nil {
+			t.Fatalf("rung %d: unexpected err %v", i, err)
+		}
+		if got != want {
+			t.Errorf("rung %d: got %q, want %q", i, got, want)
+		}
+		if next != pos+1 {
+			t.Errorf("rung %d: next = %d, want %d", i, next, pos+1)
+		}
+		pos = next
+	}
+	if _, _, err := nextLadderTarget(ladder, pos); err == nil {
+		t.Errorf("nextLadderTarget past end = nil error, want overflow error")
+	}
+}
+
+// TestLadderOps checks the generated version-ladder chain: one (upgrade,
+// cloud-smoke) pair per rung, valid op names, in order.
+func TestLadderOps(t *testing.T) {
+	ladder := []string{"v1.23.17", "v1.28.4", "v1.30.10"}
+	ops, err := parseOps(ladderOps(ladder))
+	if err != nil {
+		t.Fatalf("generated ladder ops do not parse: %v", err)
+	}
+	if len(ops) != len(ladder)*2 {
+		t.Fatalf("got %d ops, want %d (%s)", len(ops), len(ladder)*2, formatOps(ops))
+	}
+	for i, o := range ops {
+		want := "upgrade"
+		if i%2 == 1 {
+			want = "cloud-smoke"
+		}
+		if o.name != want {
+			t.Errorf("op %d = %q, want %q", i, o.name, want)
+		}
+		if !knownOps[o.name] {
+			t.Errorf("op %d %q not in knownOps", i, o.name)
+		}
+	}
+}
+
+// TestDefaultVersionLadder pins the requested 1.20→1.35 walk: 8 version-pinned
+// rungs in order (rung[0] is the create template, the rest the upgrade ladder).
+func TestDefaultVersionLadder(t *testing.T) {
+	want := []string{"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10", "v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3"}
+	if len(defaultVersionLadder) != len(want) {
+		t.Fatalf("defaultVersionLadder has %d rungs, want %d", len(defaultVersionLadder), len(want))
+	}
+	for i := range want {
+		if defaultVersionLadder[i] != want[i] {
+			t.Errorf("rung %d = %q, want %q", i, defaultVersionLadder[i], want[i])
+		}
+	}
+	// The generated chain for the built-in ladder upgrades through every rung
+	// after the create version (len-1 upgrades).
+	ops, err := parseOps(ladderOps(defaultVersionLadder[1:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upgrades int
+	for _, o := range ops {
+		if o.name == "upgrade" {
+			upgrades++
+		}
+	}
+	if upgrades != len(want)-1 {
+		t.Errorf("built-in ladder generates %d upgrades, want %d", upgrades, len(want)-1)
+	}
+}
+
 // TestRetryableMutationErr pins the exact observed failure as retryable and a
 // genuine *_FAILED / 404 as not — this is the core of the chained-op robustness
 // fix (settle + retry instead of hard-fail + teardown).

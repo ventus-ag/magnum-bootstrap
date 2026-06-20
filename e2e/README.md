@@ -249,11 +249,38 @@ go run ./e2e/cmd/magnum-e2e \
 #   BOOTSTRAP_BINARY.
 ```
 
-It walks: create → smoke (nodes Ready) → cloud-integration (Cinder CSI PVC binds
-+ OCCM LoadBalancer Service gets an Octavia external IP) → upgrade → resize →
-ca-rotate → delete. The admin kubeconfig is built in-process from the Magnum cert
-API (CSR signed against the cluster CA, `CN=admin O=system:masters`); the
-cloud-integration checks are the payoff that the FCoS mock tier cannot fake.
+It walks: create → smoke (nodes Ready) → cloud-integration → an op chain
+(scenario/`OPS`-driven) → delete. The admin kubeconfig is built in-process from
+the Magnum cert API (CSR signed against the cluster CA, `CN=admin O=system:masters`);
+the cloud-integration checks are the payoff that the FCoS mock tier cannot fake.
+
+**cloud-integration (`cloud-smoke`)** now proves the *datapath*, not just
+provisioning: an **nginx** pod mounts the PVC behind a LoadBalancer Service, and
+it asserts (1) the Cinder CSI PVC **binds**, (2) the OCCM/Octavia LoadBalancer
+**serves HTTP 200** (a real GET to the external VIP), (3) the PVC **resizes**
+1Gi→2Gi online (`status.capacity` converges), then cleans up. Run after create
+and at every `cloud-smoke` op.
+
+**`version-ladder` scenario** — a long, dispatch-only multi-version upgrade walk
+that re-runs the full cloud-integration check at each step:
+
+```bash
+# Built-in ladder (zero-config on the ventus cloud): create at v1.20.12, then
+#   upgrade → cloud-smoke through v1.23.17, v1.28.4, v1.30.10, v1.32.2, v1.33.10,
+#   v1.34.6, v1.35.3 (7 multi-minor upgrades), nginx LB-serves + PVC-resize each.
+SCENARIO=version-ladder BOOTSTRAP_BINARY=dist/bootstrap go run ./e2e/cmd/magnum-e2e
+
+# Custom ladder: CLUSTER_TEMPLATE is the create version, UPGRADE_LADDER the rungs.
+SCENARIO=version-ladder CLUSTER_TEMPLATE=v1.28.4 \
+  UPGRADE_LADDER=v1.30.10,v1.32.2,v1.34.6 BOOTSTRAP_BINARY=dist/bootstrap \
+  go run ./e2e/cmd/magnum-e2e
+```
+
+Each rung is its own version-pinned template (Magnum upgrade targets a template,
+version baked into `kube_tag`). The jumps are intentionally multi-minor (e.g.
+1.23→1.28) to stress the reconciler's binary-swap upgrade — non-standard for
+kubeadm. It is shape 1m/1w and stays out of `SCENARIO=all` (runtime, not cost —
+we run our own cloud).
 
 > **Reconciler binary delivery.** The node launcher skips entirely unless *both*
 > `reconciler_version` and `reconciler_binary_url` resolve. `-bootstrap-binary`

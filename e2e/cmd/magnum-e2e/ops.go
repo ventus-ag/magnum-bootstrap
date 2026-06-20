@@ -135,7 +135,61 @@ var scenarios = map[string]scenarioDef{
 // allScenarios is the ordered list run by the "all" meta-scenario (one cluster
 // per entry, sequentially, in a single invocation). Order matters: cheapest
 // first so a smoke break fails fast before the long multi-master chains.
+//
+// version-ladder is intentionally NOT here: it is a long, dispatch-only walk
+// (its chain is generated from the ladder, not a fixed preset), so it is not
+// part of the default "all" sweep.
 var allScenarios = []string{"smoke", "multinode", "chained-single", "chained-multinode"}
+
+// ladderScenario is the name of the multi-version upgrade scenario. Its op chain
+// is generated from the upgrade ladder (one upgrade+cloud-smoke per rung), so it
+// lives outside the static scenarios map (and outside allScenarios).
+const ladderScenario = "version-ladder"
+
+// defaultVersionLadder is the version-ladder scenario's default walk: the cluster
+// is CREATEd at rung[0] and upgraded through each subsequent rung, re-running the
+// cloud-controller smoke (LB serves traffic + Cinder PVC resize) at every step.
+// Each entry is a version-pinned Magnum cluster-template name (kube_tag baked in);
+// all eight exist on the ventus cloud (Upper-Austria-M1). The jumps are
+// deliberately multi-minor (e.g. 1.23→1.28) to stress aggressive upgrades.
+var defaultVersionLadder = []string{
+	"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10",
+	"v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3",
+}
+
+// splitTrim splits a comma-separated list, trimming spaces and dropping empties.
+func splitTrim(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// nextLadderTarget returns the upgrade template at pos and the advanced position,
+// or an error if the op chain requested more upgrades than the ladder has rungs.
+// It is pure (no cluster I/O) so the advance/overflow logic is unit-testable.
+func nextLadderTarget(ladder []string, pos int) (string, int, error) {
+	if pos >= len(ladder) {
+		return "", pos, fmt.Errorf("upgrade ladder exhausted: requested upgrade #%d but ladder has only %d rung(s) (%s)",
+			pos+1, len(ladder), strings.Join(ladder, ","))
+	}
+	return ladder[pos], pos + 1, nil
+}
+
+// ladderOps generates the version-ladder op chain: one (upgrade, cloud-smoke)
+// pair per ladder rung. The create-time cloud-smoke (run()) already covers the
+// create version, so each pair upgrades to the next rung and re-checks the cloud
+// controller (LB serves + PVC resize) on it.
+func ladderOps(ladder []string) string {
+	parts := make([]string, 0, len(ladder)*2)
+	for range ladder {
+		parts = append(parts, "upgrade", "cloud-smoke")
+	}
+	return strings.Join(parts, ",")
+}
 
 func scenarioNames() string {
 	names := make([]string, 0, len(scenarios))
@@ -171,10 +225,15 @@ func (r *runner) resolveOpList() ([]op, error) {
 	switch {
 	case raw != "":
 		// explicit override
+	case r.cfg.scenario == ladderScenario:
+		if len(r.ladder) == 0 {
+			return nil, fmt.Errorf("scenario %q needs an upgrade ladder (set UPGRADE_LADDER / -upgrade-ladder)", ladderScenario)
+		}
+		raw = ladderOps(r.ladder)
 	case r.cfg.scenario != "":
 		sc, ok := scenarios[r.cfg.scenario]
 		if !ok {
-			return nil, fmt.Errorf("unknown scenario %q (known: %s)", r.cfg.scenario, scenarioNames())
+			return nil, fmt.Errorf("unknown scenario %q (known: %s, %s)", r.cfg.scenario, scenarioNames(), ladderScenario)
 		}
 		raw = sc.ops
 	default:

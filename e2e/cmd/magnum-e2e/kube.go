@@ -8,6 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -153,10 +155,21 @@ func (r *runner) dumpPods(ns string, pods []corev1.Pod) {
 	}
 }
 
+// Smoke workload object names (shared across create, wait, resize, cleanup).
+const (
+	smokePVC    = "e2e-pvc"
+	smokeDeploy = "e2e-web"
+	smokeSvc    = "e2e-lb"
+)
+
 // smokeCloudIntegration is the payoff of the real-OpenStack tier: it proves the
 // cloud controller manager (OCCM, via an Octavia LoadBalancer Service) and
 // Cinder CSI (a dynamically provisioned PVC) actually work — neither of which
-// the FCoS mock can fake.
+// the FCoS mock can fake. It goes beyond "provisioned": the LoadBalancer must
+// actually serve HTTP through nginx, and the PVC must resize (online expansion).
+//
+//	PVC(1Gi) -> nginx Deployment mounts it -> LB Service -> bound? -> LB IP? ->
+//	LB serves 200? -> resize PVC to 2Gi -> status.capacity reaches 2Gi? -> cleanup
 func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 	kc, err := r.k8sClient(ctx)
 	if err != nil {
@@ -164,10 +177,12 @@ func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 	}
 	defer r.cleanupSmoke(ctx, kc)
 
-	// --- Cinder CSI: dynamic PVC binds ---
-	r.log("smoke: Cinder CSI dynamic PVC")
+	// --- Cinder CSI: dynamic PVC, mounted by the nginx pod. A consumer is needed
+	// for a WaitForFirstConsumer StorageClass to bind, and the mount makes the
+	// later resize an ONLINE expansion that updates status.capacity. ---
+	r.log("smoke: Cinder CSI dynamic PVC (1Gi)")
 	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-pvc", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: smokePVC, Namespace: "default"},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{
@@ -178,28 +193,44 @@ func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 	if _, err := kc.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create PVC: %w", err)
 	}
+
+	// --- OCCM: nginx behind a LoadBalancer Service (Octavia). The Deployment
+	// mounts the PVC so it both binds and can be resized online. ---
+	r.log("smoke: nginx Deployment + OCCM LoadBalancer Service (Octavia)")
+	if err := r.createLBWorkload(ctx, kc); err != nil {
+		return err
+	}
+
+	// Pod scheduling + mount drives the bind (WaitForFirstConsumer).
 	if err := r.waitPVCBound(ctx, kc); err != nil {
 		return err
 	}
 	r.log("Cinder CSI PVC bound ✅")
 
-	// --- OCCM: LoadBalancer Service gets an external IP (Octavia) ---
-	r.log("smoke: OCCM LoadBalancer Service (Octavia)")
-	if err := r.createLBWorkload(ctx, kc); err != nil {
-		return err
-	}
+	// LoadBalancer gets an external IP …
 	ip, err := r.waitLBIngress(ctx, kc)
 	if err != nil {
 		return err
 	}
-	r.log("OCCM provisioned LoadBalancer IP %s ✅", ip)
+	r.log("OCCM provisioned LoadBalancer IP %s — probing datapath", ip)
+	// … and actually forwards traffic to nginx (proves the OCCM/Octavia datapath,
+	// not merely that an address was allocated).
+	if err := r.waitLBServes(ctx, ip); err != nil {
+		return err
+	}
+	r.log("OCCM LoadBalancer serves HTTP 200 at %s ✅", ip)
+
+	// --- Cinder CSI online volume expansion: 1Gi -> 2Gi. ---
+	if err := r.resizePVC(ctx, kc); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (r *runner) waitPVCBound(ctx context.Context, kc *kubernetes.Clientset) error {
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
-		pvc, err := kc.CoreV1().PersistentVolumeClaims("default").Get(ctx, "e2e-pvc", metav1.GetOptions{})
+		pvc, err := kc.CoreV1().PersistentVolumeClaims("default").Get(ctx, smokePVC, metav1.GetOptions{})
 		if err == nil && pvc.Status.Phase == corev1.ClaimBound {
 			return nil
 		}
@@ -214,33 +245,45 @@ func (r *runner) waitPVCBound(ctx context.Context, kc *kubernetes.Clientset) err
 	}
 }
 
+// createLBWorkload deploys an nginx Deployment behind a LoadBalancer Service.
+// The pod mounts the e2e PVC at /data (a neutral path, so nginx still serves its
+// default welcome page on "/" — the HTTP probe target) which both satisfies a
+// WaitForFirstConsumer StorageClass and makes the PVC resize an online expansion.
 func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset) error {
 	replicas := int32(1)
 	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-web", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: smokeDeploy, Namespace: "default"},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "e2e-web"}},
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": smokeDeploy}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "e2e-web"}},
-				Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name:  "agnhost",
-					Image: "registry.k8s.io/e2e-test-images/agnhost:2.47",
-					Args:  []string{"netexec", "--http-port=8080"},
-					Ports: []corev1.ContainerPort{{ContainerPort: 8080}},
-				}}},
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": smokeDeploy}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:         "nginx",
+						Image:        "nginx:1.27-alpine",
+						Ports:        []corev1.ContainerPort{{ContainerPort: 80}},
+						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+					}},
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: smokePVC},
+						},
+					}},
+				},
 			},
 		},
 	}
 	if _, err := kc.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create deployment: %w", err)
+		return fmt.Errorf("create nginx deployment: %w", err)
 	}
 	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-lb", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: smokeSvc, Namespace: "default"},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeLoadBalancer,
-			Selector: map[string]string{"app": "e2e-web"},
-			Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(8080)}},
+			Selector: map[string]string{"app": smokeDeploy},
+			Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(80)}},
 		},
 	}
 	if _, err := kc.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
@@ -274,11 +317,126 @@ func (r *runner) waitLBIngress(ctx context.Context, kc *kubernetes.Clientset) (s
 	}
 }
 
+// waitLBServes proves the OCCM/Octavia LoadBalancer actually forwards traffic
+// (not just that an IP was allocated): it GETs http://<ip>/ until nginx answers
+// 200. The datapath (member pool, health monitor) warms up a little after the IP
+// is assigned, and the pod must first become Ready, so it retries.
+func (r *runner) waitLBServes(ctx context.Context, ip string) error {
+	url := "http://" + ip + "/"
+	deadline := time.Now().Add(5 * time.Minute)
+	var lastErr error
+	for {
+		if err := httpProbeOK(ctx, url, 15*time.Second); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("LoadBalancer %s never served HTTP 200 — OCCM datapath issue (last: %v)", ip, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// resizePVC exercises Cinder CSI online volume expansion: it grows the e2e PVC
+// from 1Gi to 2Gi (get-modify-update on spec.resources.requests.storage) and
+// waits for status.capacity to actually reach 2Gi. Because the PVC is mounted by
+// the nginx pod this is an online expansion (ControllerExpand + NodeExpand) that
+// updates status.capacity. A StorageClass without AllowVolumeExpansion would
+// never converge, so that is checked first with a clear failure message.
+func (r *runner) resizePVC(ctx context.Context, kc *kubernetes.Clientset) error {
+	if err := r.ensureExpandableDefaultSC(ctx, kc); err != nil {
+		return err
+	}
+	const want = "2Gi"
+	wantQ := resource.MustParse(want)
+	r.log("smoke: resize PVC %s 1Gi → %s (online)", smokePVC, want)
+
+	pvc, err := kc.CoreV1().PersistentVolumeClaims("default").Get(ctx, smokePVC, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get PVC for resize: %w", err)
+	}
+	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = wantQ
+	if _, err := kc.CoreV1().PersistentVolumeClaims("default").Update(ctx, pvc, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("request PVC resize: %w", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Minute)
+	lastCap := "unset"
+	for {
+		cur, gerr := kc.CoreV1().PersistentVolumeClaims("default").Get(ctx, smokePVC, metav1.GetOptions{})
+		if gerr == nil {
+			if got, ok := cur.Status.Capacity[corev1.ResourceStorage]; ok {
+				lastCap = got.String()
+				if got.Cmp(wantQ) >= 0 {
+					r.log("Cinder CSI PVC resized to %s ✅", lastCap)
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("PVC %s status.capacity=%s never reached %s — Cinder CSI volume expansion issue", smokePVC, lastCap, want)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// ensureExpandableDefaultSC verifies the cluster's default StorageClass allows
+// volume expansion, so the resize step fails fast with a clear reason instead of
+// timing out. The PVC uses the default SC (no storageClassName set).
+func (r *runner) ensureExpandableDefaultSC(ctx context.Context, kc *kubernetes.Clientset) error {
+	scs, err := kc.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list storage classes: %w", err)
+	}
+	for _, sc := range scs.Items {
+		if sc.Annotations["storageclass.kubernetes.io/is-default-class"] != "true" {
+			continue
+		}
+		if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
+			return fmt.Errorf("default StorageClass %q has allowVolumeExpansion != true — cannot test PVC resize", sc.Name)
+		}
+		r.log("default StorageClass %q allows volume expansion", sc.Name)
+		return nil
+	}
+	return fmt.Errorf("no default StorageClass found — cannot test dynamic PVC resize")
+}
+
 func (r *runner) cleanupSmoke(ctx context.Context, kc *kubernetes.Clientset) {
 	r.log("cleaning up smoke workloads")
-	_ = kc.CoreV1().Services("default").Delete(ctx, "e2e-lb", metav1.DeleteOptions{})
-	_ = kc.AppsV1().Deployments("default").Delete(ctx, "e2e-web", metav1.DeleteOptions{})
-	_ = kc.CoreV1().PersistentVolumeClaims("default").Delete(ctx, "e2e-pvc", metav1.DeleteOptions{})
+	_ = kc.CoreV1().Services("default").Delete(ctx, smokeSvc, metav1.DeleteOptions{})
+	_ = kc.AppsV1().Deployments("default").Delete(ctx, smokeDeploy, metav1.DeleteOptions{})
+	_ = kc.CoreV1().PersistentVolumeClaims("default").Delete(ctx, smokePVC, metav1.DeleteOptions{})
+}
+
+// httpProbeOK does a single GET with a short timeout, returning nil only on a
+// 200. Used by the LoadBalancer datapath probe loop (a short per-attempt timeout
+// avoids a long hang on an allocated-but-not-yet-wired VIP).
+func httpProbeOK(ctx context.Context, url string, timeout time.Duration) error {
+	rctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // triggerCARotate fires a Magnum CA rotation (PATCH /certificates/{uuid}) with
