@@ -519,6 +519,68 @@ func ResetDesyncedRelease(executor *host.Executor, name, namespace string) {
 	}
 }
 
+// helmRemovedAPIRe confirms a Helm upgrade that failed because the DEPLOYED
+// release manifest references an apiVersion the cluster no longer serves. This
+// happens when a cluster is upgraded across a Kubernetes version that REMOVED an
+// API the installed chart used — most commonly policy/v1beta1 PodDisruptionBudget
+// (removed in 1.25). `helm upgrade` must build the existing manifest to diff it,
+// can't map the removed kind, and aborts:
+//
+//	Helm Release kube-system/openstack-autoscaler: unable to build kubernetes
+//	objects from current release manifest: resource mapping not found for name:
+//	"openstack-autoscaler-manager" namespace: "" from "": no matches for kind
+//	"PodDisruptionBudget" in version "policy/v1beta1"
+//
+// The fix is not a patch retry (the stored manifest itself is unbuildable) — the
+// release must be uninstalled and recreated from the new chart, which renders the
+// current apiVersion.
+// helmRemovedAPIRe captures the release pair bound directly to the unbuildable-
+// manifest phrase ("Helm Release ns/name: unable to build kubernetes objects from
+// current release manifest"), so only the offending release is recreated — not
+// every release that happens to be named elsewhere in the same error.
+var helmRemovedAPIRe = regexp.MustCompile(`Helm [Rr]elease "?([a-z0-9-]+)/([a-z0-9-]+)"?:\s*unable to build kubernetes objects from current release manifest`)
+
+// ParseHelmRemovedAPIFailures extracts releases that failed to upgrade because
+// their deployed manifest references a removed/unserved apiVersion. Returns nil
+// if the error is not of that shape.
+func ParseHelmRemovedAPIFailures(errMsg string) []HelmReleasePair {
+	// Guard: the unbuildable manifest must be due to an unmappable kind/version
+	// (a removed API), not some other build failure.
+	if !strings.Contains(errMsg, "resource mapping not found") && !strings.Contains(errMsg, "no matches for kind") {
+		return nil
+	}
+	matches := helmRemovedAPIRe.FindAllStringSubmatch(errMsg, -1)
+	seen := make(map[string]bool, len(matches))
+	var releases []HelmReleasePair
+	for _, m := range matches {
+		key := m[1] + "/" + m[2]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
+	}
+	return releases
+}
+
+// ResetRemovedAPIRelease drops a release whose stored manifest references a
+// removed apiVersion so a post-refresh `pulumi up` reinstalls it fresh from the
+// current chart. It clears the force marker (force is a `helm upgrade`, which
+// hits the same unbuildable-manifest error) and uninstalls the release; if
+// `helm uninstall` itself cannot build the manifest, it falls back to deleting
+// the Helm release-storage Secrets directly so the next install starts clean.
+func ResetRemovedAPIRelease(executor *host.Executor, name, namespace string) {
+	ClearForceUpdate(name, namespace)
+	if executor == nil {
+		return
+	}
+	if err := executor.Run("helm", "uninstall", name, "-n", namespace, "--no-hooks"); err != nil {
+		// Helm release storage is a Secret labelled owner=helm,name=<release>.
+		_ = executor.Run("kubectl", "delete", "secret", "-n", namespace,
+			"-l", "owner=helm,name="+name, "--ignore-not-found=true")
+	}
+}
+
 // ParseHelmOwnershipConflicts extracts resources that block a Helm release
 // update because they exist without the expected Helm ownership metadata.
 func ParseHelmOwnershipConflicts(errMsg string) []HelmOwnershipConflict {

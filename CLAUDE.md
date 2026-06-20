@@ -387,6 +387,24 @@ based on current vs desired state.
 - Config parser handles both `parseBool` (default false) and `!parseFalse` (default true)
   matching bash semantics for each field
 
+### Helm upgrade recovery (reconciler retry loop)
+After a failed `pulumi up`, `internal/reconcile/reconciler.go` parses the Helm
+error and retries with a targeted recovery (helpers in `cluster-helm/helper.go`):
+- **patch failure** → `MarkForceUpdate` → retry as `helm upgrade --force`
+- **"has no deployed releases"** (Pulumi state references a release Helm dropped)
+  → `ResetDesyncedRelease` (uninstall) + refresh → recreate fresh
+- **ownership conflict** → `RepairHelmOwnershipConflicts` (patch live resources) → retry
+- **removed-apiVersion manifest** → `ParseHelmRemovedAPIFailures` /
+  `ResetRemovedAPIRelease`: when the *deployed* release manifest references an API
+  the target Kubernetes no longer serves (canonical case: `policy/v1beta1`
+  PodDisruptionBudget, removed in **1.25**), `helm upgrade` can't build the stored
+  manifest and wedges every run. Recovery uninstalls the stale release (falling
+  back to deleting its `owner=helm,name=<rel>` storage Secrets if `helm uninstall`
+  also can't build it), refreshes, and recreates fresh from the new chart (which
+  renders the current apiVersion). This is what unblocks an upgrade that crosses
+  1.24→1.25 with any addon (autoscaler/metrics-server/npd) carrying a v1beta1 PDB —
+  surfaced by the `version-ladder` e2e's 1.23→1.28 jump.
+
 ### Node IP Resolution
 - `Config.ResolveNodeIP()` falls back to OpenStack metadata service
   (`http://169.254.169.254/latest/meta-data/local-ipv4`) when `KUBE_NODE_IP`

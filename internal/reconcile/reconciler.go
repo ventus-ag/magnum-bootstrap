@@ -319,6 +319,37 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 					retryUp("up (helm recreate retry)")
 				}
 			}
+			// A release installed on an older Kubernetes can carry a resource whose
+			// apiVersion was REMOVED by the version we are upgrading to (e.g.
+			// policy/v1beta1 PodDisruptionBudget, gone in 1.25). `helm upgrade` must
+			// build the deployed manifest to diff it, can't map the removed kind, and
+			// fails on every run — a permanent wedge for any upgrade crossing that
+			// boundary. A patch/force retry can't help (the stored manifest is itself
+			// unbuildable). Recover by uninstalling the stale release + purging its
+			// storage, then refreshing so Pulumi recreates it fresh from the new
+			// chart (which renders the current apiVersion).
+			if err != nil {
+				if removed := clusterhelm.ParseHelmRemovedAPIFailures(err.Error()); len(removed) > 0 {
+					recovered := make([]string, 0, len(removed))
+					for _, rel := range removed {
+						clusterhelm.ResetRemovedAPIRelease(executor, rel.Name, rel.Namespace)
+						recovered = append(recovered, rel.Namespace+"/"+rel.Name)
+					}
+					if req.Logger != nil {
+						req.Logger.Warnf("helm release(s) %v reference an apiVersion this Kubernetes no longer serves (removed-API upgrade boundary); uninstalling + recreating fresh from the new chart", recovered)
+					}
+					if _, refreshErr := stack.Refresh(ctx,
+						optrefresh.SuppressProgress(),
+						optrefresh.ProgressStreams(progressWriters...),
+						optrefresh.ErrorProgressStreams(errorProgressWriters...),
+					); refreshErr != nil {
+						if req.Logger != nil {
+							req.Logger.Warnf("refresh before helm removed-api recreate failed stack=%s err=%v; retrying up anyway", cfg.StackName(), refreshErr)
+						}
+					}
+					retryUp("up (helm removed-api recreate retry)")
+				}
+			}
 			// Some legacy clusters have Helm release resources whose objects exist
 			// in the cluster without the Helm ownership labels/annotations. Patch
 			// the expected metadata onto those live resources and keep retrying

@@ -79,6 +79,33 @@ func TestParseHelmNoDeployedReleases(t *testing.T) {
 	}
 }
 
+func TestParseHelmRemovedAPIFailures(t *testing.T) {
+	// Real error: cluster upgraded 1.23 -> 1.28 (crosses 1.25, which removed
+	// policy/v1beta1 PodDisruptionBudget); the deployed autoscaler manifest is
+	// unbuildable on the new cluster.
+	errMsg := `error: 1 error occurred:
+	* Helm release "kube-system/openstack-autoscaler" failed to initialize completely. ` +
+		`Error: Helm Release kube-system/openstack-autoscaler: unable to build kubernetes objects ` +
+		`from current release manifest: resource mapping not found for name: "openstack-autoscaler-manager" ` +
+		`namespace: "" from "": no matches for kind "PodDisruptionBudget" in version "policy/v1beta1"`
+
+	got := ParseHelmRemovedAPIFailures(errMsg)
+	if len(got) != 1 || got[0].Namespace != "kube-system" || got[0].Name != "openstack-autoscaler" {
+		t.Fatalf("ParseHelmRemovedAPIFailures() = %+v, want [{kube-system openstack-autoscaler}]", got)
+	}
+
+	// Unrelated helm errors must not match (so we don't uninstall on a transient).
+	for _, other := range []string{
+		`"coredns" has no deployed releases`,
+		`error: update failed`,
+		`Helm Release kube-system/openstack-ccm: timed out waiting for the condition`,
+	} {
+		if got := ParseHelmRemovedAPIFailures(other); got != nil {
+			t.Errorf("ParseHelmRemovedAPIFailures(%q) = %v, want nil", other, got)
+		}
+	}
+}
+
 func TestManagedReleaseByName(t *testing.T) {
 	oldRoot := helmMarkerRootDir
 	helmMarkerRootDir = t.TempDir()
