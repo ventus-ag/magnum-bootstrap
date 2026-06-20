@@ -2,11 +2,68 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
 )
+
+// TestOpStepLabels checks ladder upgrade rows are labelled with their target
+// version, in ladder order, while non-upgrade ops keep their plain name.
+func TestOpStepLabels(t *testing.T) {
+	r := &runner{ladder: []string{"v1.23.17", "v1.28.4"}}
+	ops, err := parseOps("upgrade,cloud-smoke,autoscale,upgrade")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := r.opStepLabels(ops)
+	want := []string{"upgrade→v1.23.17", "cloud-smoke", "autoscale", "upgrade→v1.28.4"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("label %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestStepSummaryArtifacts checks the GitHub step summary + JUnit emitters write
+// the expected pass/fail content without needing a cluster.
+func TestStepSummaryArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	gh := filepath.Join(dir, "summary.md")
+	t.Setenv("GITHUB_STEP_SUMMARY", gh)
+	t.Setenv("DIAG_DIR", dir)
+
+	r := &runner{cfg: config{scenario: "version-ladder", clusterName: "c1"}}
+	r.steps = []stepResult{
+		{name: "create", status: stepPass, dur: 2 * time.Minute},
+		{name: "upgrade→v1.28.4", status: stepFail, dur: time.Minute, errMsg: "UPDATE_FAILED: master_config_deployment exit 1"},
+		{name: "autoscale", status: stepSkip},
+	}
+	r.writeGitHubStepSummary()
+	r.writeJUnit()
+
+	md, err := os.ReadFile(gh)
+	if err != nil {
+		t.Fatalf("read step summary: %v", err)
+	}
+	for _, want := range []string{"version-ladder", "❌ FAIL", "upgrade→v1.28.4", "1 passed", "1 failed", "1 skipped"} {
+		if !strings.Contains(string(md), want) {
+			t.Errorf("step summary missing %q\n%s", want, md)
+		}
+	}
+	xmlBytes, err := os.ReadFile(filepath.Join(dir, "junit-version-ladder.xml"))
+	if err != nil {
+		t.Fatalf("read junit: %v", err)
+	}
+	for _, want := range []string{`tests="3"`, `failures="1"`, `skipped="1"`, "<failure", "master_config_deployment"} {
+		if !strings.Contains(string(xmlBytes), want) {
+			t.Errorf("junit missing %q\n%s", want, xmlBytes)
+		}
+	}
+}
 
 // TestEnableAutoscalerLabels checks the autoscaler labels are injected (lowercase
 // Magnum keys) and that user-supplied values are not overwritten.

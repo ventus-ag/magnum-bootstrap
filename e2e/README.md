@@ -254,6 +254,12 @@ It walks: create → smoke (nodes Ready) → cloud-integration → an op chain
 the Magnum cert API (CSR signed against the cluster CA, `CN=admin O=system:masters`);
 the cloud-integration checks are the payoff that the FCoS mock tier cannot fake.
 
+**Run summary.** Each scenario prints a per-step **PASS/FAIL/SKIP** table at the
+end (create + each op; upgrade rows show their target version; steps after a
+failure are marked SKIP, not silently dropped). In GitHub Actions it also renders
+on the run page via `$GITHUB_STEP_SUMMARY` and writes a JUnit `junit-<scenario>.xml`
+into the diagnostics artifact. `SCENARIO=all` adds a per-scenario roll-up.
+
 **cloud-integration (`cloud-smoke`)** now proves the *datapath*, not just
 provisioning: an **nginx** pod mounts the PVC behind a LoadBalancer Service, and
 it asserts (1) the Cinder CSI PVC **binds**, (2) the OCCM/Octavia LoadBalancer

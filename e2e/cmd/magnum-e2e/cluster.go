@@ -35,6 +35,13 @@ type runner struct {
 	// template (cfg.upgradeTemplate).
 	ladder    []string
 	ladderPos int
+
+	// Per-step result tracking for the end-of-run PASS/FAIL/SKIP summary (stdout +
+	// GitHub run summary + JUnit). runFailed latches on the first failed step so
+	// later steps record as SKIP instead of running.
+	steps     []stepResult
+	runFailed bool
+	runErr    error
 }
 
 // computeClient returns a lazily-built, cached Nova (compute v2) client.
@@ -263,39 +270,32 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.stageBootstrap(ctx); err != nil {
 		return err
 	}
-	uuid, err := r.createCluster(ctx)
-	if err != nil {
-		return err
-	}
-	r.log("cluster uuid=%s", uuid)
+	// Each phase is a tracked step: on the first failure the rest record as SKIP
+	// and `do` captures diagnostics at the failure point, so the end-of-run
+	// summary shows exactly what passed, what failed, and what never ran.
+	// printRunSummary always fires (even on failure / panic).
+	opLabels := r.opStepLabels(ops)
+	defer r.printRunSummary()
 
-	if err := r.smokeCore(ctx); err != nil {
-		r.collectDiagnostics(ctx, "create-smoke")
-		return err
-	}
-	if err := r.verifyNodeCount(ctx); err != nil {
-		r.collectDiagnostics(ctx, "create-nodecount")
-		return err
-	}
-	if err := r.smokeCloudIntegration(ctx); err != nil {
-		r.collectDiagnostics(ctx, "create-cloud-integration")
-		return err
-	}
+	r.do(ctx, "create", "create cluster from "+r.cfg.template, func() error {
+		uuid, e := r.createCluster(ctx)
+		if e == nil {
+			r.log("cluster uuid=%s", uuid)
+		}
+		return e
+	})
+	r.do(ctx, "create-smoke", "nodes Ready + core pods up", func() error { return r.smokeCore(ctx) })
+	r.do(ctx, "create-nodecount", "k8s nodes == nodegroup counts", func() error { return r.verifyNodeCount(ctx) })
+	r.do(ctx, "create-cloud", opDescriptions["cloud-smoke"], func() error { return r.smokeCloudIntegration(ctx) })
 
 	for i, o := range ops {
-		r.log("──────── op %d/%d: %s ────────", i+1, len(ops), formatOp(o))
-		if err := r.execOp(ctx, o); err != nil {
-			// Capture diagnostics at the failure point, before teardown wipes the
-			// cluster: k8s pods/events (when the API is still reachable) AND the
-			// node's reconciler run-once output from Heat (the only window on this
-			// no-SSH tier when an upgrade/config SoftwareDeployment exits non-zero).
-			r.collectDiagnostics(ctx, "op-"+o.name)
-			r.collectHeatDiagnostics(ctx, "op-"+o.name)
-			r.collectNodeLogs(ctx, "op-"+o.name)
-			return fmt.Errorf("op %s: %w", formatOp(o), err)
+		if !r.runFailed {
+			r.log("──────── op %d/%d: %s ────────", i+1, len(ops), formatOp(o))
 		}
+		o := o
+		r.do(ctx, opLabels[i], opDescription(o), func() error { return r.execOp(ctx, o) })
 	}
-	return nil
+	return r.runErr
 }
 
 // execOp dispatches a single op to its Magnum trigger (via runMutation, which
@@ -974,8 +974,6 @@ func (r *runner) dumpClusterState(ctx context.Context) {
 		fmt.Fprintf(&b, "  %s: %s\n", k, v)
 	}
 	r.writeDiagFile("cluster-state", b.String())
-	if strings.Contains(c.Status, "FAILED") {
-		r.collectHeatDiagnostics(ctx, "cluster-state")
-		r.collectNodeLogs(ctx, "cluster-state")
-	}
+	// Per-step Heat + node-log diagnostics are captured by `do` at the exact
+	// failing step; this stays a lightweight always-on status/faults snapshot.
 }

@@ -296,6 +296,9 @@ func scenarioRunner(r *runner, scn string) *runner {
 	r2 := *r
 	r2.cfg = c
 	r2.nodepoolActive = false
+	r2.steps = nil
+	r2.runFailed = false
+	r2.runErr = nil
 	return &r2
 }
 
@@ -352,6 +355,7 @@ func runAllScenarios(ctx context.Context, r *runner) {
 
 	r.log("════════════ E2E SUMMARY ════════════")
 	failed := 0
+	var md strings.Builder
 	for _, res := range results {
 		status := "PASS ✅"
 		if !res.ok {
@@ -359,6 +363,23 @@ func runAllScenarios(ctx context.Context, r *runner) {
 			failed++
 		}
 		r.log("  %-18s %s  (%s)", res.scn, status, res.dur.Round(time.Second))
+	}
+	overall := "✅ PASS"
+	if failed > 0 {
+		overall = "❌ FAIL"
+	}
+	fmt.Fprintf(&md, "# e2e roll-up · %s (%d/%d scenarios failed)\n\n| scenario | result | time |\n|----------|:--:|--:|\n",
+		overall, failed, len(results))
+	for _, res := range results {
+		icon := "✅"
+		if !res.ok {
+			icon = "❌"
+		}
+		fmt.Fprintf(&md, "| `%s` | %s | %s |\n", res.scn, icon, res.dur.Round(time.Second))
+	}
+	md.WriteString("\n")
+	if p := os.Getenv("GITHUB_STEP_SUMMARY"); p != "" {
+		appendFile(p, md.String())
 	}
 	if failed > 0 {
 		die("%d/%d scenario(s) failed", failed, len(results))

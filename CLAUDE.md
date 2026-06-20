@@ -547,6 +547,17 @@ counts, control-plane == master ng) + `verifySAConsistency` (disruptive ops) +
 `verifyNodepoolSchedulable` (when a nodepool exists). Idempotency re-run stays
 FCoS-only (this tier can't re-trigger a node without a Heat op).
 
+**Run summary (per-step PASS/FAIL/SKIP).** Every scenario run tracks each phase
+as a step (`do` in report.go): create, create-smoke, create-nodecount,
+create-cloud, then each op (upgrade rows show their target version, e.g.
+`upgrade→v1.28.4`). The first failure latches `runFailed` so later steps record as
+**SKIP** instead of aborting silently, and `printRunSummary` (deferred, always
+fires) emits the table three ways: stdout (`STEP SUMMARY`), the **GitHub run page**
+via `$GITHUB_STEP_SUMMARY` (markdown table — auto-present in Actions, no YAML
+change), and a **JUnit** `junit-<scenario>.xml` in `DIAG_DIR` (uploaded with the
+diagnostics artifact; point a Tests-tab reporter action at it if wanted). For
+`SCENARIO=all`, `runAllScenarios` also appends a per-scenario roll-up table.
+
 **Failure diagnostics (no-SSH-by-default tier).** On any op failure / cluster
 `*_FAILED`, three collectors write to `DIAG_DIR` (default `e2e-diagnostics`,
 uploaded as a CI artifact), so a failure is never a black box:
