@@ -39,6 +39,7 @@ var knownOps = map[string]bool{
 	"post-rotate":     true,
 	"cloud-smoke":     true,
 	"verify-sa":       true,
+	"autoscale":       true,
 }
 
 // parseOps parses a comma-separated op list. Each token is "name" or "name=N".
@@ -179,16 +180,26 @@ func nextLadderTarget(ladder []string, pos int) (string, int, error) {
 	return ladder[pos], pos + 1, nil
 }
 
-// ladderOps generates the version-ladder op chain: one (upgrade, cloud-smoke)
-// pair per ladder rung. The create-time cloud-smoke (run()) already covers the
-// create version, so each pair upgrades to the next rung and re-checks the cloud
-// controller (LB serves + PVC resize) on it.
+// ladderOps generates the version-ladder op chain: per ladder rung, upgrade then
+// re-check the cloud controller (cloud-smoke: LB serves + PVC resize) then drive
+// the cluster-autoscaler up>2 and back down (autoscale). The create-time
+// cloud-smoke (run()) already covers the create version.
 func ladderOps(ladder []string) string {
-	parts := make([]string, 0, len(ladder)*2)
+	parts := make([]string, 0, len(ladder)*3)
 	for range ladder {
-		parts = append(parts, "upgrade", "cloud-smoke")
+		parts = append(parts, "upgrade", "cloud-smoke", "autoscale")
 	}
 	return strings.Join(parts, ",")
+}
+
+// opsContain reports whether the op chain includes an op with the given name.
+func opsContain(ops []op, name string) bool {
+	for _, o := range ops {
+		if o.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func scenarioNames() string {

@@ -22,6 +22,8 @@ type runner struct {
 	magnum   *gophercloud.ServiceClient
 	nova     *gophercloud.ServiceClient // compute client, built lazily
 	swift    *gophercloud.ServiceClient // object-store client, built lazily
+	heat     *gophercloud.ServiceClient // orchestration (Heat) client, built lazily
+	sshKey   []byte                     // private key for node SSH (ephemeral keypair PEM, captured at create)
 
 	// nodepoolActive tracks whether the extra worker nodepool currently exists
 	// (toggled by add-nodepool / del-nodepool ops). When true, the verify bundle
@@ -67,9 +69,13 @@ func (r *runner) ensureKeypair(ctx context.Context) (string, error) {
 	}
 	name := r.ephemeralKeypairName()
 	r.log("no KEYPAIR set — creating ephemeral keypair %q", name)
-	if _, err := keypairs.Create(ctx, nova, keypairs.CreateOpts{Name: name}).Extract(); err != nil {
+	kp, err := keypairs.Create(ctx, nova, keypairs.CreateOpts{Name: name}).Extract()
+	if err != nil {
 		return "", fmt.Errorf("create ephemeral keypair: %w", err)
 	}
+	// Retain the generated private key (Nova returns it only at creation) so the
+	// diagnostics path can SSH to nodes for on-host logs when an op fails.
+	r.sshKey = []byte(kp.PrivateKey)
 	return name, nil
 }
 
@@ -242,6 +248,13 @@ func (r *runner) run(ctx context.Context) error {
 	}
 	r.log("op chain (%d): %s", len(ops), formatOps(ops))
 
+	// If the chain drives the cluster-autoscaler, the cluster must be CREATEd with
+	// it enabled (master-0 deploys the autoscaler from AUTO_SCALING_ENABLED + the
+	// worker nodegroup's min/max). Inject the labels before create.
+	if opsContain(ops, "autoscale") {
+		r.enableAutoscalerLabels()
+	}
+
 	if err := r.preflight(ctx); err != nil {
 		return err
 	}
@@ -272,6 +285,13 @@ func (r *runner) run(ctx context.Context) error {
 	for i, o := range ops {
 		r.log("──────── op %d/%d: %s ────────", i+1, len(ops), formatOp(o))
 		if err := r.execOp(ctx, o); err != nil {
+			// Capture diagnostics at the failure point, before teardown wipes the
+			// cluster: k8s pods/events (when the API is still reachable) AND the
+			// node's reconciler run-once output from Heat (the only window on this
+			// no-SSH tier when an upgrade/config SoftwareDeployment exits non-zero).
+			r.collectDiagnostics(ctx, "op-"+o.name)
+			r.collectHeatDiagnostics(ctx, "op-"+o.name)
+			r.collectNodeLogs(ctx, "op-"+o.name)
 			return fmt.Errorf("op %s: %w", formatOp(o), err)
 		}
 	}
@@ -348,6 +368,9 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 
 	case "verify-sa":
 		return r.verifySAConsistency(ctx)
+
+	case "autoscale":
+		return r.autoscaleCycle(ctx)
 	}
 	return fmt.Errorf("unhandled op %q", o.name)
 }
@@ -939,4 +962,20 @@ func (r *runner) dumpClusterState(ctx context.Context) {
 		return
 	}
 	r.err("cluster %s status=%s reason=%q faults=%v", c.Name, c.Status, c.StatusReason, c.Faults)
+
+	// Persist the failure context to the diagnostics dir so the CI artifact upload
+	// always has something — even when the Kubernetes API is unreachable. The Heat
+	// + node-log collectors add the deep detail (reconciler run-once output and the
+	// on-host service journals).
+	var b strings.Builder
+	fmt.Fprintf(&b, "cluster:  %s\nstatus:   %s\nreason:   %s\ntime:     %s\n\nfaults:\n",
+		c.Name, c.Status, c.StatusReason, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+	for k, v := range c.Faults {
+		fmt.Fprintf(&b, "  %s: %s\n", k, v)
+	}
+	r.writeDiagFile("cluster-state", b.String())
+	if strings.Contains(c.Status, "FAILED") {
+		r.collectHeatDiagnostics(ctx, "cluster-state")
+		r.collectNodeLogs(ctx, "cluster-state")
+	}
 }

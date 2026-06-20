@@ -261,13 +261,22 @@ it asserts (1) the Cinder CSI PVC **binds**, (2) the OCCM/Octavia LoadBalancer
 1Gi→2Gi online (`status.capacity` converges), then cleans up. Run after create
 and at every `cloud-smoke` op.
 
+**`autoscale` op** proves the cluster-autoscaler scales workers **up past 2** (a
+balloon Deployment with hostname anti-affinity forces pending pods) and back
+**down** to the floor. It enables the autoscaler at create
+(`auto_scaling_enabled` + `min_node_count`/`max_node_count`, `AUTOSCALE_MIN`/`MAX`,
+default 1/3) and patches the deployed autoscaler's scale-down timers short so the
+down phase finishes in minutes.
+
 **`version-ladder` scenario** — a long, dispatch-only multi-version upgrade walk
-that re-runs the full cloud-integration check at each step:
+that re-runs the full cloud-integration check **and** an autoscale up/down at each
+step:
 
 ```bash
 # Built-in ladder (zero-config on the ventus cloud): create at v1.20.12, then
-#   upgrade → cloud-smoke through v1.23.17, v1.28.4, v1.30.10, v1.32.2, v1.33.10,
-#   v1.34.6, v1.35.3 (7 multi-minor upgrades), nginx LB-serves + PVC-resize each.
+#   upgrade → cloud-smoke → autoscale through v1.23.17, v1.28.4, v1.30.10,
+#   v1.32.2, v1.33.10, v1.34.6, v1.35.3 (7 multi-minor upgrades): nginx LB-serves
+#   + PVC-resize + autoscaler up>2/down each rung.
 SCENARIO=version-ladder BOOTSTRAP_BINARY=dist/bootstrap go run ./e2e/cmd/magnum-e2e
 
 # Custom ladder: CLUSTER_TEMPLATE is the create version, UPGRADE_LADDER the rungs.

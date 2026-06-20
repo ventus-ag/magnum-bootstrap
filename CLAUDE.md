@@ -489,7 +489,8 @@ The driver is an **op-engine**, not a fixed pipeline. `e2e/cmd/magnum-e2e`
 creates a cluster of a configured shape, then runs an ordered op chain
 (`internal` to the driver, file `e2e/cmd/magnum-e2e/ops.go`): `upgrade`,
 `ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
-`resize-nodepool=N`, `del-nodepool`, `post-rotate`, `cloud-smoke`, `verify-sa`.
+`resize-nodepool=N`, `del-nodepool`, `post-rotate`, `cloud-smoke`, `verify-sa`,
+`autoscale`.
 Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Presets
 (`SCENARIO`): `smoke` (1m/1w, back-compat), `multinode` (3m/2w + extra worker
 nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rotate),
@@ -497,8 +498,8 @@ nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rota
 `upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate`).
 
 **`version-ladder` (1m/1w, dispatch-only).** A long multi-version upgrade walk:
-create at the first version, then for every rung `upgrade → cloud-smoke`. Its op
-chain is **generated** from the upgrade ladder (not a static preset), so it lives
+create at the first version, then for every rung `upgrade → cloud-smoke →
+autoscale`. Its op chain is **generated** from the upgrade ladder (not a static preset), so it lives
 outside the `scenarios` map / `allScenarios` (not in `SCENARIO=all`). Default
 ladder (built-in, zero-config on the ventus cloud, all templates version-pinned):
 `v1.20.12 → v1.23.17 → v1.28.4 → v1.30.10 → v1.32.2 → v1.33.10 → v1.34.6 →
@@ -522,6 +523,20 @@ and waits for `status.capacity` to converge (`resizePVC`, online expansion —
 needs the mount; `ensureExpandableDefaultSC` fails fast if the default
 StorageClass forbids expansion). Runs in every scenario's create + ladder rung.
 
+**`autoscale` op (`autoscale.go`).** Proves the cluster-autoscaler scales the
+worker nodegroup UP past 2 then back DOWN. If the chain contains `autoscale`,
+`run()` injects `auto_scaling_enabled=true,min_node_count,max_node_count`
+(lowercase Magnum labels, `AUTOSCALE_MIN`/`AUTOSCALE_MAX`, default 1/3) at create
+so master-0 deploys `openstack-autoscaler-manager`. The op: wait that Deployment
+Ready → **patch its scale-down flags short** (`scale-down-delay-after-add`,
+`-unneeded-time`, `scan-interval` → ~20s; the reconciler reverts this on the next
+upgrade's Helm apply, so each rung re-patches) → a balloon Deployment (pause pods,
+required hostname anti-affinity, replicas=max) forces pending pods → workers climb
+to **>2** (`countReadyWorkers`) → delete the balloon → the worker **nodegroup**
+count falls to the floor (`workerNGCount`, authoritative vs lagging k8s Node
+objects) → `ensureSettled`. Without the fast-timer patch a scale-down waits the
+~10m chart defaults.
+
 **Robustness (`runMutation` in cluster.go):** every mutating op goes
 `ensureSettled` → snapshot → trigger (retry on busy/transient) → `waitTransition`
 → `waitStatus(UPDATE_COMPLETE)` → `verifyBundle`. This fixes the chained-op race
@@ -531,6 +546,31 @@ cluster (`400 "...status is UPDATE_IN_PROGRESS is not supported"`).
 counts, control-plane == master ng) + `verifySAConsistency` (disruptive ops) +
 `verifyNodepoolSchedulable` (when a nodepool exists). Idempotency re-run stays
 FCoS-only (this tier can't re-trigger a node without a Heat op).
+
+**Failure diagnostics (no-SSH-by-default tier).** On any op failure / cluster
+`*_FAILED`, three collectors write to `DIAG_DIR` (default `e2e-diagnostics`,
+uploaded as a CI artifact), so a failure is never a black box:
+1. `collectDiagnostics` (kube.go) — k8s nodes/events/problem-pod logs (when the
+   API is reachable).
+2. `collectHeatDiagnostics` (diag.go) — walks the cluster's Heat stack for FAILED
+   resources and fetches each failed **SoftwareDeployment's** `deploy_stdout` /
+   `deploy_stderr` / `deploy_status_code` via a raw `software_deployments` GET —
+   i.e. the node's reconciler **`run-once` output**, the thing Heat shows only as
+   "deploy_status_code: ...non-zero".
+3. `collectNodeLogs` (nodelogs.go) — SSHes every Nova server for the cluster
+   (`core@<floating-ip>`) and pulls `/var/lib/magnum/reconciler-last-run.json`,
+   `/var/log/magnum-reconcile.log`, and the `heat-container-agent` / `kubelet` /
+   `containerd` / etcd / apiserver / controller journals + service states.
+   Needs a key: the **ephemeral** keypair's generated key is captured at create
+   (`ensureKeypair` keeps `kp.PrivateKey`); a **named** `KEYPAIR` needs
+   `-ssh-key`/`SSH_PRIVATE_KEY`. Host keys are not verified (ephemeral e2e VMs).
+   `dumpClusterState` also always writes a `cluster-state` status/faults file.
+
+Known result: the built-in ladder's **multi-minor jumps can fail** — e.g.
+`v1.23.17 → v1.28.4` (skip 4 minors) UPDATE_FAILED at `master_config_deployment`
+(reconciler `run-once` exit 1). The diagnostics above are how to root-cause it; a
+sequential ladder is possible since the cloud carries every intermediate template
+(v1.24.15, v1.25.11, v1.26.6, v1.27.3).
 
 `SCENARIO=all` is a meta-scenario: a **single `magnum-e2e` invocation** runs
 every scenario in `allScenarios` order (smoke → multinode → chained-single →

@@ -142,7 +142,11 @@ jobs:
       # other scenarios.
       UPGRADE_LADDER: ${{ vars.MAGNUM_UPGRADE_LADDER }}
       # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.
+      # When unset (ephemeral), the driver captures the generated private key and
+      # can SSH to nodes for on-host failure logs automatically. With a NAMED
+      # KEYPAIR, set SSH_PRIVATE_KEY (path on the runner) to enable node-log SSH.
       KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
+      SSH_PRIVATE_KEY: ${{ vars.MAGNUM_SSH_PRIVATE_KEY }}
       # Scenario-tagged name keeps sequential matrix runs + teardown isolated.
       CLUSTER_NAME: recon-e2e-${{ inputs.scenario }}-${{ github.run_id }}
       # Scenario preset (shape + op chain) and optional explicit op-chain override.

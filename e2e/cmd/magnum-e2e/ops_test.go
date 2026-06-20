@@ -2,10 +2,30 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/gophercloud/gophercloud/v2"
 )
+
+// TestEnableAutoscalerLabels checks the autoscaler labels are injected (lowercase
+// Magnum keys) and that user-supplied values are not overwritten.
+func TestEnableAutoscalerLabels(t *testing.T) {
+	// empty start: all three injected from the min/max config
+	r := &runner{cfg: config{autoscaleMin: 1, autoscaleMax: 3}}
+	r.enableAutoscalerLabels()
+	for _, want := range []string{"auto_scaling_enabled=true", "min_node_count=1", "max_node_count=3"} {
+		if !strings.Contains(r.cfg.extraLabels, want) {
+			t.Errorf("labels %q missing %q", r.cfg.extraLabels, want)
+		}
+	}
+	// user override preserved: don't clobber an explicit max_node_count
+	r2 := &runner{cfg: config{autoscaleMin: 1, autoscaleMax: 3, extraLabels: "max_node_count=9"}}
+	r2.enableAutoscalerLabels()
+	if strings.Count(r2.cfg.extraLabels, "max_node_count") != 1 || !strings.Contains(r2.cfg.extraLabels, "max_node_count=9") {
+		t.Errorf("user max_node_count not preserved: %q", r2.cfg.extraLabels)
+	}
+}
 
 func TestParseOps(t *testing.T) {
 	ops, err := parseOps("upgrade, ca-rotate ,resize-workers=3,add-nodepool=2")
@@ -165,28 +185,60 @@ func TestNextLadderTarget(t *testing.T) {
 	}
 }
 
-// TestLadderOps checks the generated version-ladder chain: one (upgrade,
-// cloud-smoke) pair per rung, valid op names, in order.
+// TestLadderOps checks the generated version-ladder chain: an (upgrade,
+// cloud-smoke, autoscale) triple per rung, valid op names, in order.
 func TestLadderOps(t *testing.T) {
 	ladder := []string{"v1.23.17", "v1.28.4", "v1.30.10"}
 	ops, err := parseOps(ladderOps(ladder))
 	if err != nil {
 		t.Fatalf("generated ladder ops do not parse: %v", err)
 	}
-	if len(ops) != len(ladder)*2 {
-		t.Fatalf("got %d ops, want %d (%s)", len(ops), len(ladder)*2, formatOps(ops))
+	want := []string{"upgrade", "cloud-smoke", "autoscale"}
+	if len(ops) != len(ladder)*len(want) {
+		t.Fatalf("got %d ops, want %d (%s)", len(ops), len(ladder)*len(want), formatOps(ops))
 	}
 	for i, o := range ops {
-		want := "upgrade"
-		if i%2 == 1 {
-			want = "cloud-smoke"
-		}
-		if o.name != want {
-			t.Errorf("op %d = %q, want %q", i, o.name, want)
+		if o.name != want[i%len(want)] {
+			t.Errorf("op %d = %q, want %q", i, o.name, want[i%len(want)])
 		}
 		if !knownOps[o.name] {
 			t.Errorf("op %d %q not in knownOps", i, o.name)
 		}
+	}
+	if !opsContain(ops, "autoscale") {
+		t.Error("ladder chain missing autoscale op")
+	}
+}
+
+// TestSetFlags pins the autoscaler flag rewrite: existing scale-down flags are
+// replaced (not duplicated), unrelated flags are preserved.
+func TestSetFlags(t *testing.T) {
+	args := []string{"--cloud-provider=magnum", "--scale-down-unneeded-time=10m", "--v=4"}
+	out := setFlags(args, map[string]string{"scale-down-unneeded-time": "20s", "scan-interval": "10s"})
+	got := map[string]string{}
+	var unneeded int
+	for _, a := range out {
+		if k, v, ok := strings.Cut(strings.TrimPrefix(a, "--"), "="); ok {
+			got[k] = v
+			if k == "scale-down-unneeded-time" {
+				unneeded++
+			}
+		}
+	}
+	if unneeded != 1 {
+		t.Errorf("scale-down-unneeded-time appears %d times, want 1 (no dup): %v", unneeded, out)
+	}
+	if got["scale-down-unneeded-time"] != "20s" {
+		t.Errorf("scale-down-unneeded-time = %q, want 20s", got["scale-down-unneeded-time"])
+	}
+	if got["scan-interval"] != "10s" {
+		t.Errorf("scan-interval not added: %v", out)
+	}
+	if got["cloud-provider"] != "magnum" || got["v"] != "4" {
+		t.Errorf("unrelated flags not preserved: %v", out)
+	}
+	if !hasFlags(out) {
+		t.Error("hasFlags = false on a flag slice")
 	}
 }
 
