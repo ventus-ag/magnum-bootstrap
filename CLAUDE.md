@@ -529,8 +529,12 @@ worker nodegroup UP past 2 then back DOWN. If the chain contains `autoscale`,
 (lowercase Magnum labels, `AUTOSCALE_MIN`/`AUTOSCALE_MAX`, default 1/3) at create
 so master-0 deploys `openstack-autoscaler-manager`. The op: wait that Deployment
 Ready → **patch its scale-down flags short** (`scale-down-delay-after-add`,
-`-unneeded-time`, `scan-interval` → ~20s; the reconciler reverts this on the next
-upgrade's Helm apply, so each rung re-patches) → a balloon Deployment (pause pods,
+`-unneeded-time`, `scan-interval` → ~20s, via idempotent `ensureFastTiming`: it
+patches only if missing, waits the rollout, then **re-reads to verify the flags
+stuck**. The k8s upgrade just before each `autoscale` op re-deploys the autoscaler
+from its Helm chart with stock ~10m timers, so it is re-applied every rung — and
+re-asserted again right before scale-down, in case a periodic reconcile / lagging
+Helm apply reverted it mid-op) → a balloon Deployment (pause pods,
 required hostname anti-affinity, replicas=max) forces pending pods → workers climb
 to **>2** (`countReadyWorkers`) → delete the balloon → the worker **nodegroup**
 count falls to the floor (`workerNGCount`, authoritative vs lagging k8s Node

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -84,7 +85,10 @@ func (r *runner) autoscaleCycle(ctx context.Context) error {
 	if err := r.waitAutoscalerReady(ctx, kc); err != nil {
 		return err
 	}
-	if err := r.patchAutoscalerFastTiming(ctx, kc); err != nil {
+	// The k8s upgrade just before this op re-deploys the autoscaler from its Helm
+	// chart (stock ~10m scale-down timers), overwriting any prior patch — so apply
+	// fast timers fresh here, every rung.
+	if err := r.ensureFastTiming(ctx, kc, "pre-scale-up"); err != nil {
 		return err
 	}
 
@@ -112,6 +116,12 @@ func (r *runner) autoscaleCycle(ctx context.Context) error {
 	// nodegroup's desired size (authoritative) rather than k8s nodes, which lag on
 	// scaledown until the cloud-node-lifecycle controller deletes the Node object.
 	r.deleteBalloon(ctx, kc)
+	// Re-assert fast timers: a periodic reconcile (or a lagging Helm apply) could
+	// have reverted them since scale-up, which would stall this scale-down on the
+	// stock ~10m timers. Idempotent — a no-op if they are still in place.
+	if err := r.ensureFastTiming(ctx, kc, "pre-scale-down"); err != nil {
+		return err
+	}
 	if err := r.waitCount(ctx, "scale-down", 25*time.Minute,
 		func(c context.Context) (int, error) { return r.workerNGCount(c) },
 		func(n int) bool { return n <= r.cfg.autoscaleMin }); err != nil {
@@ -169,11 +179,51 @@ func (r *runner) waitAutoscalerReady(ctx context.Context, kc *kubernetes.Clients
 	}
 }
 
-// patchAutoscalerFastTiming rewrites the autoscaler's scale-down timing flags to
-// short values so the scale-down phase completes in minutes instead of the ~10m
-// chart defaults. The reconciler reverts this on its next Helm apply (each
-// upgrade), which is why every rung re-patches.
-func (r *runner) patchAutoscalerFastTiming(ctx context.Context, kc *kubernetes.Clientset) error {
+// fastTimers are the short scale-down flags injected into the deployed autoscaler
+// so the scale-down phase completes in minutes instead of the ~10m chart defaults.
+var fastTimers = map[string]string{
+	"scale-down-delay-after-add":     "20s",
+	"scale-down-delay-after-delete":  "10s",
+	"scale-down-delay-after-failure": "20s",
+	"scale-down-unneeded-time":       "20s",
+	"scan-interval":                  "10s",
+}
+
+// autoscalerContainerIndex picks the container running the autoscaler binary.
+func autoscalerContainerIndex(cs []corev1.Container) int {
+	for i := range cs {
+		if strings.Contains(cs[i].Image, "cluster-autoscaler") {
+			return i
+		}
+	}
+	return 0
+}
+
+// autoscalerFlagSlice returns the container's CLI-flag slice (Args, or Command if
+// the flags live there) and whether they are in Command.
+func autoscalerFlagSlice(c *corev1.Container) (flags []string, inCommand bool) {
+	if hasFlags(c.Args) {
+		return c.Args, false
+	}
+	return c.Command, true
+}
+
+// flagsHaveTimers reports whether every fast timer is already set to its value.
+func flagsHaveTimers(flags []string) bool {
+	for k, v := range fastTimers {
+		if !slices.Contains(flags, "--"+k+"="+v) {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureFastTiming guarantees the deployed autoscaler carries the fast scale-down
+// timers, patching + waiting for rollout only if they are missing (so it is safe
+// to call repeatedly — e.g. again right before scale-down in case a reconcile
+// reverted them). After a patch it re-reads the Deployment to VERIFY the flags
+// actually stuck, catching a redeploy that raced our update.
+func (r *runner) ensureFastTiming(ctx context.Context, kc *kubernetes.Clientset, when string) error {
 	d, err := r.autoscalerDeployment(ctx, kc)
 	if err != nil {
 		return err
@@ -182,43 +232,42 @@ func (r *runner) patchAutoscalerFastTiming(ctx context.Context, kc *kubernetes.C
 	if len(cs) == 0 {
 		return fmt.Errorf("autoscaler deployment %s has no containers", d.Name)
 	}
-	ci := 0
-	for i := range cs {
-		if strings.Contains(cs[i].Image, "cluster-autoscaler") {
-			ci = i
-			break
-		}
-	}
-	fast := map[string]string{
-		"scale-down-delay-after-add":     "20s",
-		"scale-down-delay-after-delete":  "10s",
-		"scale-down-delay-after-failure": "20s",
-		"scale-down-unneeded-time":       "20s",
-		"scan-interval":                  "10s",
-	}
-	c := &cs[ci]
-	// The autoscaler's flags live in Args (chart default) or Command; edit whichever holds them.
-	if hasFlags(c.Args) {
-		c.Args = setFlags(c.Args, fast)
-	} else {
-		c.Command = setFlags(c.Command, fast)
+	ci := autoscalerContainerIndex(cs)
+	cur, _ := autoscalerFlagSlice(&cs[ci])
+	if flagsHaveTimers(cur) {
+		r.log("autoscale: fast scale-down timers already present (%s)", when)
+		return nil
 	}
 
+	flags, inCmd := autoscalerFlagSlice(&cs[ci])
+	flags = setFlags(flags, fastTimers)
+	if inCmd {
+		cs[ci].Command = flags
+	} else {
+		cs[ci].Args = flags
+	}
 	updated, err := kc.AppsV1().Deployments(autoscalerNS).Update(ctx, d, metav1.UpdateOptions{})
 	if err != nil {
-		return fmt.Errorf("patch autoscaler timing: %w", err)
+		return fmt.Errorf("patch autoscaler timing (%s): %w", when, err)
 	}
-	r.log("autoscale: patched %s with fast scale-down timers; waiting for rollout", updated.Name)
+	r.log("autoscale: patched %s with fast scale-down timers (%s); waiting for rollout", updated.Name, when)
 
 	gen := updated.Generation
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
-		cur, gerr := kc.AppsV1().Deployments(autoscalerNS).Get(ctx, updated.Name, metav1.GetOptions{})
-		if gerr == nil && cur.Status.ObservedGeneration >= gen && cur.Status.UpdatedReplicas >= 1 && cur.Status.AvailableReplicas >= 1 {
-			return nil
+		got, gerr := kc.AppsV1().Deployments(autoscalerNS).Get(ctx, updated.Name, metav1.GetOptions{})
+		if gerr == nil && got.Status.ObservedGeneration >= gen && got.Status.UpdatedReplicas >= 1 && got.Status.AvailableReplicas >= 1 {
+			// Verify the rolled-out spec actually carries our flags (not reverted
+			// by a racing redeploy).
+			gcs := got.Spec.Template.Spec.Containers
+			rolled, _ := autoscalerFlagSlice(&gcs[autoscalerContainerIndex(gcs)])
+			if flagsHaveTimers(rolled) {
+				return nil
+			}
+			return fmt.Errorf("autoscaler timing patch (%s) did not stick — flags reverted (likely a racing reconcile/redeploy)", when)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("autoscaler rollout after timing patch did not complete in time")
+			return fmt.Errorf("autoscaler rollout after timing patch (%s) did not complete in time", when)
 		}
 		select {
 		case <-ctx.Done():
