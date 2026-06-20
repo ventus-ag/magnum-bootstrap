@@ -11,6 +11,36 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/orchestration/v1/stackresources"
 )
 
+// resolveStackName returns the cluster's real Heat stack NAME. Magnum does NOT
+// name the stack after the cluster — it truncates the cluster name and appends a
+// stack short-id (e.g. cluster "…-27885457659" → stack "…-27885-ymdcavbxi2o2"),
+// and that stack name is also the prefix of every Nova server name. Heat list
+// calls need {name}+{id}, so this GETs /stacks/{id} (Heat 302-redirects to the
+// canonical /stacks/{name}/{id}, same host so the auth header is preserved) and
+// reads stack_name. Cached for the run.
+func (r *runner) resolveStackName(ctx context.Context, stackID string) (string, error) {
+	if r.stackNameCache != "" {
+		return r.stackNameCache, nil
+	}
+	orch, err := r.orchClient()
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Stack struct {
+			Name string `json:"stack_name"`
+		} `json:"stack"`
+	}
+	if _, err := orch.Get(ctx, orch.ServiceURL("stacks", stackID), &resp, &gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
+		return "", err
+	}
+	if resp.Stack.Name == "" {
+		return "", fmt.Errorf("stack %s has no stack_name", stackID)
+	}
+	r.stackNameCache = resp.Stack.Name
+	return resp.Stack.Name, nil
+}
+
 // orchClient returns a lazily-built, cached Heat (orchestration v1) client.
 func (r *runner) orchClient() (*gophercloud.ServiceClient, error) {
 	if r.heat != nil {
@@ -66,9 +96,16 @@ func (r *runner) collectHeatDiagnostics(ctx context.Context, reason string) {
 		return
 	}
 
-	// Magnum names the Heat stack after the cluster, so the cluster name is the
-	// stack name (Heat lists need name + id; /stacks/{name}/{id}/resources).
-	pages, err := stackresources.List(orch, r.cfg.clusterName, c.StackID, stackresources.ListOpts{Depth: 2}).AllPages(ctx)
+	stackName, err := r.resolveStackName(ctx, c.StackID)
+	if err != nil {
+		fmt.Fprintf(&b, "\n(resolve stack name failed: %v)\n", err)
+		r.writeDiagFile("heat-"+reason, b.String())
+		return
+	}
+	// Depth 5: the master/worker config SoftwareDeployments live a few levels down
+	// (cluster stack → kube_masters ResourceGroup → per-node kubemaster stack →
+	// master_config_deployment), so a shallow list would miss the one that failed.
+	pages, err := stackresources.List(orch, stackName, c.StackID, stackresources.ListOpts{Depth: 5}).AllPages(ctx)
 	if err != nil {
 		fmt.Fprintf(&b, "\n(list stack resources failed: %v)\n", err)
 		r.writeDiagFile("heat-"+reason, b.String())

@@ -105,7 +105,16 @@ func (r *runner) clusterNodeIPs(ctx context.Context) ([]nodeAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	pages, err := servers.List(nova, servers.ListOpts{Name: r.cfg.clusterName}).AllPages(ctx)
+	// Nova server names are "<stackname>-master-N" / "<stackname>-node-N", and the
+	// stack name is the truncated cluster name + a stack short-id — NOT the cluster
+	// name — so filter by the resolved stack name. Fall back to the cluster name.
+	nameFilter := r.cfg.clusterName
+	if c, cerr := r.getCluster(ctx); cerr == nil && c.StackID != "" {
+		if sn, serr := r.resolveStackName(ctx, c.StackID); serr == nil {
+			nameFilter = sn
+		}
+	}
+	pages, err := servers.List(nova, servers.ListOpts{Name: nameFilter}).AllPages(ctx)
 	if err != nil {
 		return nil, err
 	}

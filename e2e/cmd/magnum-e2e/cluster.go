@@ -25,6 +25,8 @@ type runner struct {
 	heat     *gophercloud.ServiceClient // orchestration (Heat) client, built lazily
 	sshKey   []byte                     // private key for node SSH (ephemeral keypair PEM, captured at create)
 
+	stackNameCache string // resolved Heat stack name (truncated cluster name + stack short-id)
+
 	// nodepoolActive tracks whether the extra worker nodepool currently exists
 	// (toggled by add-nodepool / del-nodepool ops). When true, the verify bundle
 	// also asserts the nodepool is schedulable.
