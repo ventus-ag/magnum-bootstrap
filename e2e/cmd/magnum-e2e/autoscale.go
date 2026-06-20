@@ -21,6 +21,25 @@ const (
 	balloonApp       = "e2e-autoscale"
 )
 
+// controlPlaneLabels mark a control-plane node. Both keys are checked because the
+// label was renamed master→control-plane at k8s 1.25 (the ladder spans 1.20→1.35),
+// and Magnum control-plane nodes are frequently schedulable (untainted), so a
+// worker-only workload must explicitly exclude them — otherwise a balloon pod
+// lands on a master and the autoscaler under-scales the worker nodegroup.
+var controlPlaneLabels = []string{
+	"node-role.kubernetes.io/control-plane",
+	"node-role.kubernetes.io/master",
+}
+
+func isControlPlane(node *corev1.Node) bool {
+	for _, l := range controlPlaneLabels {
+		if _, ok := node.Labels[l]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // enableAutoscalerLabels injects the cluster labels that turn the
 // cluster-autoscaler on at create (master-0 deploys it from AUTO_SCALING_ENABLED;
 // the worker nodegroup's min/max come from MIN_NODE_COUNT/MAX_NODE_COUNT). Magnum
@@ -255,12 +274,24 @@ func (r *runner) createBalloon(ctx context.Context, kc *kubernetes.Clientset, re
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": balloonApp}},
 				Spec: corev1.PodSpec{
-					Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
-						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-							LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": balloonApp}},
-							TopologyKey:   "kubernetes.io/hostname",
-						}},
-					}},
+					Affinity: &corev1.Affinity{
+						// Worker-only: exclude control-plane nodes (which are often
+						// schedulable here) so each replica forces a *worker* — and
+						// one pod per node, so replicas>workers ⇒ pending ⇒ scale-up.
+						NodeAffinity: &corev1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+								NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+									MatchExpressions: workerOnlyNodeSelector(),
+								}},
+							},
+						},
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+								LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": balloonApp}},
+								TopologyKey:   "kubernetes.io/hostname",
+							}},
+						},
+					},
 					Containers: []corev1.Container{{
 						Name:  "pause",
 						Image: "registry.k8s.io/pause:3.9",
@@ -275,6 +306,19 @@ func (r *runner) createBalloon(ctx context.Context, kc *kubernetes.Clientset, re
 	return nil
 }
 
+// workerOnlyNodeSelector requires a node to carry NEITHER control-plane label
+// (both requirements in one term are AND-ed), pinning balloon pods to workers.
+func workerOnlyNodeSelector() []corev1.NodeSelectorRequirement {
+	reqs := make([]corev1.NodeSelectorRequirement, 0, len(controlPlaneLabels))
+	for _, l := range controlPlaneLabels {
+		reqs = append(reqs, corev1.NodeSelectorRequirement{
+			Key:      l,
+			Operator: corev1.NodeSelectorOpDoesNotExist,
+		})
+	}
+	return reqs
+}
+
 func (r *runner) deleteBalloon(ctx context.Context, kc *kubernetes.Clientset) {
 	_ = kc.AppsV1().Deployments("default").Delete(ctx, balloonDeploy, metav1.DeleteOptions{})
 }
@@ -287,8 +331,9 @@ func (r *runner) countReadyWorkers(ctx context.Context, kc *kubernetes.Clientset
 		return 0, err
 	}
 	n := 0
-	for _, node := range nodes.Items {
-		if _, cp := node.Labels["node-role.kubernetes.io/control-plane"]; cp {
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if isControlPlane(node) {
 			continue
 		}
 		for _, cond := range node.Status.Conditions {
