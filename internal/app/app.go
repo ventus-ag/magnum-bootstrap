@@ -35,6 +35,12 @@ type runFlags struct {
 	backendURL     string
 	heatParamsFile string
 	timeout        time.Duration
+
+	// periodic is true only for the run-periodic command (the systemd drift
+	// timer). It gates non-convergence "day-2" maintenance (etcd defrag, alarm
+	// handling) so those disruptive-ish ops never run during a Heat-triggered
+	// run-once (create/upgrade/resize), only on the steady-state timer.
+	periodic bool
 }
 
 // defaultRunTimeout caps a single reconcile invocation when nothing else is
@@ -169,6 +175,7 @@ func newRunPeriodicCmd(ctx context.Context, code *int, stdout, stderr io.Writer)
 		Use:   "run-periodic",
 		Short: "Apply changes periodically (alias for up, used by the reconcile timer)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			f.periodic = true
 			*code = run(ctx, "up", f, stdout, stderr)
 			return nil
 		},
@@ -399,6 +406,7 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 		PreviousSuccessfulGeneration: previousState.LastSuccessfulGeneration,
 		PreviousKubeTag:              previousState.LastKubeTag,
 		PreviousCARotationID:         previousState.LastCARotationID,
+		Periodic:                     f.periodic,
 	}, eventCh)
 	safeCloseEngineEvents(eventCh)
 	<-done // wait for event stream to drain

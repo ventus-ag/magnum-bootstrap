@@ -42,6 +42,13 @@ type Request struct {
 	// when they change a file that affects a running service.  The "services"
 	// module reads the tracker and only restarts what actually changed.
 	Restarts *RestartTracker
+
+	// Periodic is true only on a run-periodic invocation (the systemd drift
+	// timer), false on a Heat-triggered run-once. Modules use it to gate
+	// steady-state "day-2" maintenance that must not run during create/upgrade/
+	// resize convergence — e.g. the etcd module only defrags and reconciles
+	// alarms on the periodic timer.
+	Periodic bool
 }
 
 // DisruptiveServiceCycleNeeded reports whether stop-services/start-services

@@ -180,7 +180,7 @@ internal/
     master-certs/           Master cert generation via Magnum API (6 certs, parallel signing)
     worker-certs/           Worker cert generation via Magnum API (2 certs, parallel signing)
     cert-api-manager/       CA key for controller-manager cert signing
-    etcd-config/            Etcd: volume, service, etcdctl, cluster join/rejoin/scale-down
+    etcd-config/            Etcd: volume, service, etcdctl, learner join/rejoin/scale-down, day-2 (defrag/alarms)
     kube-os-config/         OpenStack cloud-config rendering
     admin-kubeconfig/       Admin kubeconfig generation (root + core/ubuntu user)
     kubecommon/             Shared helpers: CNI, sysctl, kubeconfig, kubelet config
@@ -705,7 +705,32 @@ member list -w table` + `endpoint health`. Compare `NUMBER_OF_MASTERS` in
   member). The reconciler must therefore never trust that count destructively —
   `etcd-config`'s `cleanupExcessMembers` only evicts **unreachable** members, never
   a healthy one (else it nukes a freshly-joined master → "rejected stream … because
-  it was removed" wedge). See `[[project_etcd_bootstrap_stateful]]`.
+  it was removed" wedge), and never a **learner** (a join-in-progress is
+  client-unhealthy by nature). See `[[project_etcd_bootstrap_stateful]]`.
+- **multi-master join uses etcd LEARNERS** (etcd 3.6+). A joining/rejoining master
+  adds itself as a non-voting learner (`member add --learner`), starts etcd
+  `state=existing` (no endpoint-health wait — a learner can't serve linearizable
+  reads), then `ensurePromoted` promotes it to a voter once in sync. Adding a
+  learner never changes quorum, so concurrent masters on a 3-master create can't
+  demote the seed; etcd's `max-learners:1` serialises them (second join retries on
+  `too many learner members` until the first is promoted). `startWithExistingData`
+  also runs `ensurePromoted` so a learner stranded by a died-before-promote run is
+  finished on the next reconcile. Replaces the old voting-add, which wedged
+  3-master creates under etcd 3.6's slower join. See `[[project_etcd_learner_join]]`.
+- **etcd day-2 maintenance** (`etcd-config/day2.go`, `etcdDay2Maintenance`): the
+  reconciler runs periodically (systemd `magnum-reconcile-periodic.service` →
+  `run-periodic`), so steady-state etcd housekeeping is folded into the etcd
+  module's `walPresent` path. Gated to `moduleapi.Request.Periodic` (set ONLY by
+  the `run-periodic` command, never a Heat `run-once`), a non-upgrade window
+  (`PreviousKubeTag == KubeTag`), a healthy **started voter** (self), and **other
+  voters healthy** (so masters never defrag at once and drop quorum). Ops, all
+  best-effort (never fail the reconcile): `alarm list` → log NOSPACE/CORRUPT
+  (read-only, every cluster size); **defrag self only** (never the LB) — **HA-only
+  (≥3 voters** so quorum absorbs the blocking member; single/2-master skip it) —
+  via `endpoint status -w json` when `dbSize ≥ 128 MiB` AND free-fraction `≥ 0.45`;
+  disarm NOSPACE only after a successful defrag. Compaction is left to etcd's own
+  `auto-compaction` config.
+  See `[[project_etcd_day2_maintenance]]`.
 
 ## Remaining Work
 

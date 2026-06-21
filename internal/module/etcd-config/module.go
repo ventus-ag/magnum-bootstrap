@@ -146,6 +146,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 				return moduleapi.Result{}, fmt.Errorf("etcd has persisted data but did not become active; cluster unreachable or still a member — refusing to destroy data (likely quorum loss, manual recovery required): %w", err)
 			}
 		}
+		// Steady-state node: run day-2 etcd housekeeping (defrag, alarms). The
+		// call self-gates to the periodic timer and a healthy started voter, so it
+		// is a cheap no-op during a Heat run-once or while mid-recovery.
+		etcdDay2Maintenance(cfg, executor, nodeIP, protocol, certDir, lbEndpoint, req)
 		return moduleapi.Result{Changes: changes, Outputs: map[string]string{"etcdTag": etcdTag(cfg)}}, nil
 	}
 
@@ -574,11 +578,12 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 		}
 	}
 
-	// Add back, retrying the transient strict-reconfig-check rejection that
-	// occurs while the cluster is still forming quorum or other members are
-	// starting.
+	// Add back as a LEARNER, retrying the transient strict-reconfig-check
+	// rejections that occur while the cluster is still forming quorum or other
+	// members are starting. Same safe-add path as joinExistingCluster — a learner
+	// never degrades quorum, and ensurePromoted turns us into a voter once synced.
 	peerURL := protocol + "://" + nodeIP + ":2380"
-	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL)
+	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL, true)
 	if err != nil {
 		return nil, fmt.Errorf("rejoin etcd cluster: %w", err)
 	}
@@ -595,7 +600,13 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 	if err := clearEtcdData(executor); err != nil {
 		return nil, err
 	}
-	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, true)
+	changes, err := writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, false)
+	if err != nil {
+		return changes, err
+	}
+	pc, err := ensurePromoted(cfg, executor, lbEndpoint, certDir, nodeIP, protocol)
+	changes = append(changes, pc...)
+	return changes, err
 }
 
 func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol, certDir, lbEndpoint string) ([]host.Change, error) {
@@ -608,10 +619,12 @@ func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, pro
 	// degrades quorum and must go before we add ourselves afresh.
 	removeStaleSelfMembers(cfg, executor, args, nodeIP, protocol)
 
-	// Add ourselves, retrying the transient strict-reconfig-check rejection
-	// ("not enough started members") that occurs during a parallel create or a
-	// resize while peers are still starting.
-	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL)
+	// Add ourselves as a LEARNER (non-voting), retrying the transient
+	// strict-reconfig-check rejections ("not enough started members", "too many
+	// learner members") that occur during a parallel create or resize while peers
+	// are still starting. A learner does not change quorum, so the seed keeps
+	// leadership while we catch up; ensurePromoted turns us into a voter below.
+	addOut, err := memberAddWithRetry(executor, args, cfg.Shared.InstanceName, peerURL, true)
 	if err != nil {
 		return nil, fmt.Errorf("join etcd cluster: %w", err)
 	}
@@ -629,7 +642,162 @@ func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, pro
 	if err := clearEtcdData(executor); err != nil {
 		return nil, err
 	}
-	return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, true)
+	// A learner cannot serve linearizable reads, so do NOT wait for endpoint
+	// health here — it would never pass until promotion. Start, then promote.
+	changes, err := writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, false)
+	if err != nil {
+		return changes, err
+	}
+	pc, err := ensurePromoted(cfg, executor, lbEndpoint, certDir, nodeIP, protocol)
+	changes = append(changes, pc...)
+	return changes, err
+}
+
+// ensurePromoted turns this node from an etcd learner into a voting member once
+// it has caught up with the leader, then confirms the now-voter serves clients.
+// It is idempotent and cheap when we are already a voter (the normal reboot /
+// periodic-reconcile case): it lists members, finds ourselves by name+peer URL,
+// and returns immediately unless we are still a learner. The promotion retry loop
+// IS the catch-up wait — etcd rejects promotion until the learner is in sync.
+func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, certDir, nodeIP, protocol string) ([]host.Change, error) {
+	myPeer := protocol + "://" + nodeIP + ":2380"
+	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+
+	const attempts = 40
+	const delay = 3 * time.Second
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		out, err := runEtcdctl(executor, append(append([]string{}, args...), "member", "list")...)
+		if err != nil {
+			// Cluster transiently unreachable (forming quorum, leader change).
+			lastErr = err
+			if !executor.Apply {
+				break
+			}
+			time.Sleep(delay)
+			continue
+		}
+		self, ok := selectSelf(parseMemberList(out), cfg.Shared.InstanceName, myPeer)
+		switch promoteAction(self, ok) {
+		case promoteNoop:
+			// Not a member yet, or already a voter — nothing to do.
+			if ok && !self.isLearner && executor.Logger != nil {
+				executor.Logger.Infof("etcd: member %s already a voter; no promotion needed", cfg.Shared.InstanceName)
+			}
+			return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
+		case promoteDo:
+			_, perr := runEtcdctl(executor, append(append([]string{}, args...), "member", "promote", self.id)...)
+			if perr == nil {
+				if executor.Logger != nil {
+					executor.Logger.Infof("etcd: promoted learner %s (%s) to voter", cfg.Shared.InstanceName, self.id)
+				}
+				return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
+			}
+			lastErr = perr
+			switch classifyPromoteErr(perr) {
+			case promoteAlreadyVoter:
+				// Raced to voter between list and promote — success.
+				return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
+			case promoteFatal:
+				return nil, fmt.Errorf("etcd promote learner %s: %w", cfg.Shared.InstanceName, perr)
+			default:
+				// promoteRetry — learner not yet in sync with leader; wait.
+				if executor.Logger != nil {
+					executor.Logger.Warnf("etcd: learner %s not yet in sync (attempt %d/%d), retrying in %s", cfg.Shared.InstanceName, i+1, attempts, delay)
+				}
+			}
+		}
+		if !executor.Apply {
+			break
+		}
+		time.Sleep(delay)
+	}
+	if lastErr == nil {
+		// Loop exhausted without ever finding ourselves still a learner that we
+		// could promote — treat as nothing to do rather than failing the phase.
+		return nil, nil
+	}
+	return nil, fmt.Errorf("etcd: learner %s did not become a promotable voter after %d attempts: %w", cfg.Shared.InstanceName, attempts, lastErr)
+}
+
+// promoteHealthGate waits briefly for the (now promoted) local etcd to serve
+// linearizable reads, confirming the voter is live. Best-effort: it returns no
+// error so a slow-to-settle endpoint does not fail an otherwise-successful
+// promotion — the next reconcile re-checks.
+func promoteHealthGate(executor *host.Executor, nodeIP, protocol, certDir string, tlsDisabled bool) []host.Change {
+	if !executor.Apply {
+		return nil
+	}
+	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
+	for i := 0; i < 30; i++ {
+		if etcdHealthyOnce(executor, localEndpoint, certDir, tlsDisabled, "2s") {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if executor.Logger != nil {
+		executor.Logger.Warnf("etcd: %s did not report healthy locally after promotion; continuing (next reconcile re-checks)", localEndpoint)
+	}
+	return nil
+}
+
+// selectSelf finds this node's own member row by exact name AND peer URL. The
+// peer-URL match guards against a stale same-name entry with a different IP.
+func selectSelf(members []etcdMember, instanceName, myPeer string) (etcdMember, bool) {
+	for _, m := range members {
+		if m.name == instanceName && m.peerURL == myPeer {
+			return m, true
+		}
+	}
+	return etcdMember{}, false
+}
+
+type promoteDecision int
+
+const (
+	promoteNoop promoteDecision = iota // not a member, or already a voter
+	promoteDo                          // a learner that should be promoted
+)
+
+func promoteAction(self etcdMember, found bool) promoteDecision {
+	if !found || !self.isLearner {
+		return promoteNoop
+	}
+	return promoteDo
+}
+
+type promoteErrClass int
+
+const (
+	promoteRetry        promoteErrClass = iota // learner not yet in sync — keep waiting
+	promoteAlreadyVoter                        // target is no longer a learner — success
+	promoteFatal                               // unrecoverable (cert/peer-url/etc.)
+)
+
+// classifyPromoteErr distinguishes etcd's two "can only promote a learner member"
+// errors: the "...which is in sync with leader" variant means the learner is
+// still catching up (retry — this is the wait), while the bare variant means the
+// member is already a voter (success). Transient cluster errors retry; anything
+// else is fatal.
+func classifyPromoteErr(err error) promoteErrClass {
+	if err == nil {
+		return promoteAlreadyVoter
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "in sync with leader"):
+		return promoteRetry
+	case strings.Contains(msg, "can only promote a learner member"):
+		// Bare form, without the in-sync suffix → already a voter.
+		return promoteAlreadyVoter
+	case strings.Contains(msg, "member not found"):
+		// Slot vanished (raced with a remove) — nothing left to promote.
+		return promoteAlreadyVoter
+	case isTransientMemberAddErr(err):
+		return promoteRetry
+	default:
+		return promoteFatal
+	}
 }
 
 func cleanupEtcd(executor *host.Executor) {
@@ -695,7 +863,11 @@ func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, p
 			}
 		}
 		conf := buildConfig(cfg, nodeIP, protocol, "existing", initialCluster)
-		return writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, false)
+		changes, err := writeAndStartEtcd(executor, conf, protocol, nodeIP, certDir, cfg.Shared.TLSDisabled, false)
+		if err != nil {
+			return changes, err
+		}
+		return promoteStrandedLearner(cfg, executor, lbEndpoint, certDir, nodeIP, protocol, lbOK, changes)
 	}
 
 	// Config present: rebuild only for TLS/proxy drift, then ensure active. Never
@@ -705,7 +877,7 @@ func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, p
 		return nil, err
 	}
 	if executor.SystemctlIsActive("etcd") {
-		return nil, nil
+		return promoteStrandedLearner(cfg, executor, lbEndpoint, certDir, nodeIP, protocol, lbOK, nil)
 	}
 	res, err := (hostresource.SystemdServiceSpec{Unit: "etcd", SkipIfMissing: true, DaemonReload: true, Active: hostresource.BoolPtr(true)}).Apply(executor)
 	if err != nil {
@@ -714,7 +886,22 @@ func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, p
 	if executor.Apply && !executor.WaitForSystemctlActive("etcd", 2*time.Minute, 2*time.Second) {
 		return res.Changes, fmt.Errorf("etcd did not become active with existing data")
 	}
-	return res.Changes, nil
+	return promoteStrandedLearner(cfg, executor, lbEndpoint, certDir, nodeIP, protocol, lbOK, res.Changes)
+}
+
+// promoteStrandedLearner finishes a learner that wrote its WAL but whose previous
+// reconcile died before promotion: the walPresent path takes startWithExistingData
+// and never calls the join path again, so without this the node would remain a
+// non-voting learner forever (also permanently gating other joiners on
+// max-learners). No-op for an already-promoted voter — so it adds no latency to
+// the normal reboot/periodic path — and skipped entirely when the cluster (LB) is
+// unreachable.
+func promoteStrandedLearner(cfg config.Config, executor *host.Executor, lbEndpoint, certDir, nodeIP, protocol string, lbOK bool, changes []host.Change) ([]host.Change, error) {
+	if !lbOK {
+		return changes, nil
+	}
+	pc, err := ensurePromoted(cfg, executor, lbEndpoint, certDir, nodeIP, protocol)
+	return append(changes, pc...), err
 }
 
 // memberAddWithRetry runs `etcdctl member add` for this node, retrying on the
@@ -729,10 +916,16 @@ func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, p
 // member list from the live cluster. The bound (~12 × 10s) stays well within
 // Heat's deployment timeout. RunCapture is called directly (not runEtcdctl) to
 // avoid runEtcdctl's inner retry re-issuing this non-idempotent command.
-func memberAddWithRetry(executor *host.Executor, args []string, instanceName, peerURL string) (string, error) {
-	addArgs := make([]string, 0, len(args)+4)
-	addArgs = append(addArgs, args...)
-	addArgs = append(addArgs, "member", "add", instanceName, "--peer-urls="+peerURL)
+//
+// When learner is true the node is added as a non-voting learner: a learner is
+// not counted in quorum, so adding one never demotes the existing voters. This is
+// the safe way to grow an existing cluster (the seed keeps leadership while the
+// new node catches up; ensurePromoted later turns it into a voter). etcd's default
+// max-learners=1 serialises concurrent joiners — the second one's add is rejected
+// "too many learner members in cluster" until the first is promoted, which
+// isTransientMemberAddErr treats as retriable.
+func memberAddWithRetry(executor *host.Executor, args []string, instanceName, peerURL string, learner bool) (string, error) {
+	addArgs := memberAddArgs(args, instanceName, peerURL, learner)
 
 	const attempts = 12
 	const delay = 10 * time.Second
@@ -782,12 +975,29 @@ func isTransientMemberAddErr(err error) bool {
 		"connection refused",
 		"too many requests",
 		"rpc error",
+		// max-learners (default 1) is reached because another joiner is still a
+		// learner; clears once that node is promoted. This is what serialises
+		// concurrent master joins.
+		"too many learner members in cluster",
 	} {
 		if strings.Contains(msg, s) {
 			return true
 		}
 	}
 	return false
+}
+
+// memberAddArgs builds the `etcdctl member add` argument vector, appending
+// --learner for a non-voting learner add. Pure so the flag wiring is unit-tested
+// without a live cluster.
+func memberAddArgs(args []string, instanceName, peerURL string, learner bool) []string {
+	addArgs := make([]string, 0, len(args)+5)
+	addArgs = append(addArgs, args...)
+	addArgs = append(addArgs, "member", "add", instanceName, "--peer-urls="+peerURL)
+	if learner {
+		addArgs = append(addArgs, "--learner")
+	}
+	return addArgs
 }
 
 // isAlreadyMemberErr reports whether a member-add failed because the member (or
@@ -848,14 +1058,20 @@ func currentInitialCluster(executor *host.Executor, endpoint, certDir string, tl
 
 // etcdMember is one row of `etcdctl member list` default CSV output.
 type etcdMember struct {
-	id      string
-	name    string
-	peerURL string
+	id        string
+	name      string
+	peerURL   string
+	started   bool
+	isLearner bool
 }
 
-// parseMemberList parses default `etcdctl member list` CSV output
-// (ID, status, name, peerURLs, clientURLs, isLearner) into members. Lines with
-// fewer than 4 fields are skipped.
+// parseMemberList parses default `etcdctl member list` CSV output, whose six
+// ", "-joined columns are: ID, status, name, peerURLs, clientURLs, isLearner.
+// status is "started" or "unstarted" (the latter has an empty name); isLearner is
+// the literal "true"/"false". Lines with fewer than 4 fields are skipped; a
+// missing status/isLearner field defaults to started=false/isLearner=false rather
+// than dropping the row, so a future or truncated format never silently loses a
+// member.
 func parseMemberList(out string) []etcdMember {
 	var ms []etcdMember
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -864,9 +1080,11 @@ func parseMemberList(out string) []etcdMember {
 			continue
 		}
 		ms = append(ms, etcdMember{
-			id:      strings.TrimSpace(fields[0]),
-			name:    strings.TrimSpace(fields[2]),
-			peerURL: strings.TrimSpace(fields[3]),
+			id:        strings.TrimSpace(fields[0]),
+			name:      strings.TrimSpace(fields[2]),
+			peerURL:   strings.TrimSpace(fields[3]),
+			started:   len(fields) >= 2 && strings.TrimSpace(fields[1]) == "started",
+			isLearner: len(fields) >= 6 && strings.TrimSpace(fields[5]) == "true",
 		})
 	}
 	return ms
@@ -901,6 +1119,12 @@ func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, 
 	var candidates []memberEntry
 	for _, m := range members {
 		if strings.Contains(m.name, cfg.Shared.InstanceName) {
+			continue
+		}
+		// Never evict a learner: it is a join-in-progress (client-unhealthy by
+		// nature, so it would otherwise look like a scaled-down orphan and get
+		// culled mid-join). ensurePromoted/startWithExistingData finishes it.
+		if m.isLearner {
 			continue
 		}
 		candidates = append(candidates, memberEntry{member: m, masterIdx: extractMasterIndex(m.name)})

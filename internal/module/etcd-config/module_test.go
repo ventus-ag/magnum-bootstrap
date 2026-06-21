@@ -218,18 +218,109 @@ func TestParseMemberList(t *testing.T) {
 	out := strings.Join([]string{
 		" e89abea5794bf78, started, kube-x-master-0, https://10.0.0.93:2380, https://10.0.0.93:2379, false",
 		"f78f5dfdf2353870, started, kube-x-master-2, https://10.0.0.188:2380, https://10.0.0.188:2379, false",
-		"aaaa, unstarted, , https://10.0.0.50:2380, , false", // added-but-not-started: empty name
+		"aaaa, unstarted, , https://10.0.0.50:2380, , false",                                   // added-but-not-started: empty name
+		"bbbb, started, kube-x-master-1, https://10.0.0.77:2380, https://10.0.0.77:2379, true", // learner mid-join
 		"garbage line with no commas",
 	}, "\n")
 	ms := parseMemberList(out)
-	if len(ms) != 3 {
-		t.Fatalf("expected 3 parsed members (garbage skipped), got %d: %+v", len(ms), ms)
+	if len(ms) != 4 {
+		t.Fatalf("expected 4 parsed members (garbage skipped), got %d: %+v", len(ms), ms)
 	}
 	if ms[0].name != "kube-x-master-0" || ms[0].peerURL != "https://10.0.0.93:2380" {
 		t.Fatalf("member[0] mis-parsed: %+v", ms[0])
 	}
-	if ms[2].name != "" {
-		t.Fatalf("expected empty name for unstarted member, got %q", ms[2].name)
+	if !ms[0].started || ms[0].isLearner {
+		t.Fatalf("member[0] should be started voter, got started=%t isLearner=%t", ms[0].started, ms[0].isLearner)
+	}
+	if ms[2].name != "" || ms[2].started {
+		t.Fatalf("expected empty-name unstarted member, got name=%q started=%t", ms[2].name, ms[2].started)
+	}
+	if !ms[3].isLearner || !ms[3].started {
+		t.Fatalf("member[3] should be a started learner, got started=%t isLearner=%t", ms[3].started, ms[3].isLearner)
+	}
+}
+
+func TestParseMemberListShortRowDefaults(t *testing.T) {
+	// A 5-field row (no trailing isLearner) must not panic and must default to a
+	// non-learner started voter rather than dropping the member.
+	ms := parseMemberList("cccc, started, kube-x-master-3, https://10.0.0.9:2380, https://10.0.0.9:2379")
+	if len(ms) != 1 {
+		t.Fatalf("expected 1 member from a 5-field row, got %d", len(ms))
+	}
+	if ms[0].isLearner {
+		t.Fatalf("missing isLearner field must default to false, got true")
+	}
+}
+
+func TestMemberAddArgsLearnerFlag(t *testing.T) {
+	base := []string{"--endpoints=https://lb:2379"}
+	voter := memberAddArgs(base, "kube-x-master-1", "https://10.0.0.1:2380", false)
+	if got := strings.Join(voter, " "); !strings.Contains(got, "member add kube-x-master-1 --peer-urls=https://10.0.0.1:2380") || strings.Contains(got, "--learner") {
+		t.Fatalf("voter add args wrong: %q", got)
+	}
+	learner := memberAddArgs(base, "kube-x-master-1", "https://10.0.0.1:2380", true)
+	if got := strings.Join(learner, " "); !strings.HasSuffix(got, "--learner") {
+		t.Fatalf("learner add args must end with --learner: %q", got)
+	}
+}
+
+func TestClassifyPromoteErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want promoteErrClass
+	}{
+		{"nil is success", nil, promoteAlreadyVoter},
+		{"not in sync retries", errString("etcdserver: can only promote a learner member which is in sync with leader"), promoteRetry},
+		{"bare not-a-learner is already voter", errString("etcdserver: can only promote a learner member"), promoteAlreadyVoter},
+		{"member not found is success", errString("etcdserver: member not found"), promoteAlreadyVoter},
+		{"transient no leader retries", errString("rpc error: code = Unavailable: no leader"), promoteRetry},
+		{"context deadline retries", errString("context deadline exceeded"), promoteRetry},
+		{"cert error is fatal", errString("etcdserver: invalid certificate"), promoteFatal},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := classifyPromoteErr(c.err); got != c.want {
+				t.Fatalf("classifyPromoteErr(%v) = %d, want %d", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSelectSelfAndPromoteAction(t *testing.T) {
+	members := []etcdMember{
+		{id: "1", name: "kube-x-master-0", peerURL: "https://10.0.0.1:2380", isLearner: false},
+		{id: "2", name: "kube-x-master-1", peerURL: "https://10.0.0.2:2380", isLearner: true},
+		{id: "3", name: "kube-x-master-1", peerURL: "https://10.9.9.9:2380", isLearner: false}, // stale same-name, different IP
+	}
+
+	// Exact name+peer match picks the learner row, not the stale same-name entry.
+	self, ok := selectSelf(members, "kube-x-master-1", "https://10.0.0.2:2380")
+	if !ok || self.id != "2" {
+		t.Fatalf("selectSelf picked wrong row: %+v ok=%t", self, ok)
+	}
+	if promoteAction(self, ok) != promoteDo {
+		t.Fatal("a learner self must be promoted")
+	}
+
+	// A voter self is a no-op.
+	voter, ok := selectSelf(members, "kube-x-master-0", "https://10.0.0.1:2380")
+	if !ok || promoteAction(voter, ok) != promoteNoop {
+		t.Fatalf("a voter self must be a no-op: %+v ok=%t", voter, ok)
+	}
+
+	// Not a member → no-op.
+	if _, ok := selectSelf(members, "kube-x-master-9", "https://10.0.0.9:2380"); ok {
+		t.Fatal("absent node must not match")
+	}
+	if promoteAction(etcdMember{}, false) != promoteNoop {
+		t.Fatal("not-found must be a no-op")
+	}
+}
+
+func TestIsTransientMemberAddErrLearnerLimit(t *testing.T) {
+	if !isTransientMemberAddErr(errString("member add: exit status 1 (stderr: etcdserver: too many learner members in cluster)")) {
+		t.Fatal("too-many-learners must be transient so concurrent joiners serialize")
 	}
 }
 
