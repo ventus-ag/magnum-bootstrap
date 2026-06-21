@@ -567,7 +567,7 @@ func (r *runner) createCluster(ctx context.Context) (string, error) {
 	// break the cluster. With merge_labels=true our reconciler_*/kube_tag
 	// overrides are layered on top of the template defaults (ours win on tie).
 	mergeLabels := true
-	uuid, err := clusters.Create(ctx, r.magnum, clusters.CreateOpts{
+	opts := clusters.CreateOpts{
 		Name:              r.cfg.clusterName,
 		ClusterTemplateID: tmplID,
 		Keypair:           keypair,
@@ -575,7 +575,15 @@ func (r *runner) createCluster(ctx context.Context) (string, error) {
 		NodeCount:         &nc,
 		Labels:            labels,
 		MergeLabels:       &mergeLabels,
-	}).Extract()
+	}
+	// Cap the Heat stack's own create_timeout so a wedged create FAILS (and rolls
+	// back) at this bound instead of churning for Magnum's ~60m default and leaving
+	// a half-built, hard-to-delete stack. Create normally finishes in ~5m.
+	if r.cfg.createTimeoutMin > 0 {
+		ct := r.cfg.createTimeoutMin
+		opts.CreateTimeout = &ct
+	}
+	uuid, err := clusters.Create(ctx, r.magnum, opts).Extract()
 	if err != nil {
 		return "", fmt.Errorf("create: %w", err)
 	}
@@ -814,8 +822,15 @@ func (r *runner) cleanupEphemeralKeypair(ctx context.Context) {
 // waitStatus polls the cluster status until it reaches want, fails fast on any
 // *_FAILED status, and (for DELETE_COMPLETE) treats a vanished cluster as done.
 func (r *runner) waitStatus(ctx context.Context, want string) error {
-	deadline := time.Now().Add(time.Duration(r.cfg.timeoutMin) * time.Minute)
-	r.log("waiting for status %s (timeout %dm)", want, r.cfg.timeoutMin)
+	mins := r.cfg.timeoutMin
+	// Create has its own (shorter) budget. Poll a few minutes past Heat's
+	// create_timeout so we observe the terminal CREATE_FAILED Heat emits at the cap
+	// (waitStatus fails fast on *_FAILED) rather than a blind client timeout.
+	if want == "CREATE_COMPLETE" && r.cfg.createTimeoutMin > 0 {
+		mins = r.cfg.createTimeoutMin + 3
+	}
+	deadline := time.Now().Add(time.Duration(mins) * time.Minute)
+	r.log("waiting for status %s (timeout %dm)", want, mins)
 	for {
 		c, err := clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
 		if err != nil {

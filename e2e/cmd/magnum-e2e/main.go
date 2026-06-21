@@ -54,7 +54,8 @@ type config struct {
 	reconcilerURL     string
 	bootstrapBinary   string // local reconciler binary to stage into Swift (current build)
 	extraLabels       string
-	timeoutMin        int
+	timeoutMin        int // per-operation timeout (upgrade/resize/ca-rotate/delete)
+	createTimeoutMin  int // create-specific timeout: Heat stack create_timeout + create-wait budget
 	region            string
 	keepCluster       bool
 	skipUpgrade       bool
@@ -146,6 +147,7 @@ func loadConfig() config {
 	flag.StringVar(&c.bootstrapBinary, "bootstrap-binary", envOr("BOOTSTRAP_BINARY", ""), "path to a locally-built reconciler binary; staged into Swift (public-read) so nodes fetch this exact build [BOOTSTRAP_BINARY]")
 	flag.StringVar(&c.extraLabels, "extra-labels", envOr("EXTRA_LABELS", ""), "extra cluster labels k=v,k2=v2 [EXTRA_LABELS]")
 	flag.IntVar(&c.timeoutMin, "timeout-min", envIntOr("TIMEOUT_MIN", 60), "per-operation timeout in minutes [TIMEOUT_MIN]")
+	flag.IntVar(&c.createTimeoutMin, "create-timeout-min", envIntOr("CREATE_TIMEOUT_MIN", 20), "cluster-create timeout in minutes: sets Heat's create_timeout and bounds the create-wait (create normally ~5m) [CREATE_TIMEOUT_MIN]")
 	flag.StringVar(&c.region, "region", envOr("OS_REGION_NAME", ""), "OpenStack region [OS_REGION_NAME]")
 	keep := flag.Bool("keep", envBool("KEEP_CLUSTER"), "do not delete the cluster on exit [KEEP_CLUSTER]")
 	skipUp := flag.Bool("skip-upgrade", envBool("SKIP_UPGRADE"), "skip the upgrade step [SKIP_UPGRADE]")
