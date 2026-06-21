@@ -80,6 +80,12 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	var changes []host.Change
 	configChanged := false
 
+	strayCNI, err := removeStrayCNIConfs(cfg, executor)
+	if err != nil {
+		return nil, false, err
+	}
+	changes = append(changes, strayCNI...)
+
 	legacyDockerUnit, err := removeLegacyDockerUnitOverride(executor, "/etc/systemd/system/docker.service")
 	if err != nil {
 		return nil, false, err
@@ -511,6 +517,44 @@ oom_score = 0
 
 func containerdUsesSystemdCgroup(cgroupDriver string) bool {
 	return strings.EqualFold(cgroupDriver, "systemd")
+}
+
+// removeStrayCNIConfs deletes non-Kubernetes CNI configs that ship baked into
+// the node image. The Ubuntu image carries podman's default
+// /etc/cni/net.d/87-podman-bridge.conflist (a node-local 10.88.0.0/16 bridge).
+// containerd's CRI plugin selects the lexicographically-first valid config in
+// conf_dir, so during the boot window before the flannel DaemonSet writes
+// 10-flannel.conflist, that podman config is the only one present and becomes
+// the cluster's default CNI. Any pod scheduled in that window (CoreDNS,
+// metrics-server, addons) lands on the node-local podman bridge and cannot be
+// routed to from other nodes — breaking cross-node DNS and any pod that must
+// reach the control plane. Removing it before kubelet starts (container-runtime
+// is phase 3; kubelet comes up in phase 14) restores Fedora CoreOS behavior:
+// /etc/cni/net.d stays empty until flannel lands, so pods wait Pending instead
+// of being placed on the wrong network.
+//
+// Gated to Ubuntu: on Fedora CoreOS the heat-container-agent runs under podman
+// and may legitimately use this bridge, so the file is left untouched there.
+// strayCNIConfPaths are the non-Kubernetes CNI configs removed on Ubuntu nodes.
+// Declared as a package var so tests can point it at a temp directory.
+var strayCNIConfPaths = []string{
+	"/etc/cni/net.d/87-podman-bridge.conflist",
+	"/etc/cni/net.d/87-podman.conflist",
+}
+
+func removeStrayCNIConfs(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
+	if !cfg.IsUbuntu() {
+		return nil, nil
+	}
+	var changes []host.Change
+	for _, path := range strayCNIConfPaths {
+		res, err := (hostresource.FileSpec{Path: path, Absent: true}).Apply(executor)
+		if err != nil {
+			return nil, fmt.Errorf("remove stray CNI config %s: %w", path, err)
+		}
+		changes = append(changes, res.Changes...)
+	}
+	return changes, nil
 }
 
 func removeLegacyDockerUnitOverride(executor *host.Executor, path string) (*host.Change, error) {
