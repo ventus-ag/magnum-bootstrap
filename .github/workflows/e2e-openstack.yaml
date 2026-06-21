@@ -94,6 +94,12 @@ on:
         description: Skip the post-rotation add-node + SA-consistency check (legacy)
         type: boolean
         default: false
+  # Weekly full sweep. Scheduled events carry NO inputs, so the env block below
+  # falls back to SCENARIO=all (every scenario incl. the version-ladder walk).
+  # Sunday 02:17 UTC — off-peak, off-minute; the ~multi-hour run finishes well
+  # inside timeout-minutes before the work week. Only fires on the default branch.
+  schedule:
+    - cron: "17 2 * * 0"
 
 permissions:
   contents: read
@@ -109,6 +115,10 @@ jobs:
   e2e-openstack:
     name: e2e-openstack
     runs-on: self-hosted
+    # The "all" sweep now includes the full version-ladder walk (create@1.20 +
+    # 7 rungs × upgrade/cloud-smoke/autoscale) on top of the other scenarios, so
+    # it can run several hours. Override GitHub's 6h default with a generous cap.
+    timeout-minutes: 720
     # Standard OpenStack RC env, shared by the run and teardown steps. The tool's
     # own auth reader honours the full split-domain RC (OS_USER_DOMAIN_* vs
     # OS_PROJECT_DOMAIN_*), and prefers an application credential when its vars
@@ -148,9 +158,11 @@ jobs:
       KEYPAIR: ${{ vars.MAGNUM_KEYPAIR }}
       SSH_PRIVATE_KEY: ${{ vars.MAGNUM_SSH_PRIVATE_KEY }}
       # Scenario-tagged name keeps sequential matrix runs + teardown isolated.
-      CLUSTER_NAME: recon-e2e-${{ inputs.scenario }}-${{ github.run_id }}
+      # Fallback to 'all' so the weekly schedule (no inputs) gets a clean name.
+      CLUSTER_NAME: recon-e2e-${{ inputs.scenario || 'all' }}-${{ github.run_id }}
       # Scenario preset (shape + op chain) and optional explicit op-chain override.
-      SCENARIO: ${{ inputs.scenario }}
+      # Schedule events carry no inputs, so default to the full 'all' sweep.
+      SCENARIO: ${{ inputs.scenario || 'all' }}
       OPS: ${{ inputs.ops }}
       # Reconciler binary delivery. Default: BOOTSTRAP_BINARY (set per-step
       # below) stages the EXACT prebuilt binary into the cloud's Swift store
@@ -223,7 +235,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-node-diagnostics-${{ inputs.scenario || 'run' }}-${{ github.run_id }}
+          name: e2e-node-diagnostics-${{ inputs.scenario || 'all' }}-${{ github.run_id }}
           path: ${{ github.workspace }}/e2e-diagnostics
           if-no-files-found: ignore
           retention-days: 14

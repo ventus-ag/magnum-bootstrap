@@ -274,9 +274,10 @@ balloon Deployment with hostname anti-affinity forces pending pods) and back
 default 1/3) and patches the deployed autoscaler's scale-down timers short so the
 down phase finishes in minutes.
 
-**`version-ladder` scenario** — a long, dispatch-only multi-version upgrade walk
-that re-runs the full cloud-integration check **and** an autoscale up/down at each
-step:
+**`version-ladder` scenario** — a long multi-version upgrade walk that re-runs the
+full cloud-integration check **and** an autoscale up/down at each step. It is part
+of `SCENARIO=all` (runs last, after the other scenarios) and can also be dispatched
+on its own:
 
 ```bash
 # Built-in ladder (zero-config on the ventus cloud): create at v1.20.12, then

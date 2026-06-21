@@ -174,9 +174,8 @@ func loadConfig() config {
 	//     scenarios — otherwise the first "upgrade" would be a downgrade).
 	//   - UPGRADE_LADDER set → custom walk; CLUSTER_TEMPLATE is the create version
 	//     (required; preflight errors if empty).
-	if c.scenario == ladderScenario && c.upgradeLadder == "" {
-		c.upgradeLadder = strings.Join(defaultVersionLadder[1:], ",")
-		c.template = defaultVersionLadder[0]
+	if c.scenario == ladderScenario {
+		applyLadderDefaults(&c)
 	}
 
 	// Apply the scenario's cluster shape for any count the user did NOT set
@@ -293,13 +292,40 @@ func scenarioRunner(r *runner, scn string) *runner {
 		c.masterCount = def.masters
 		c.nodeCount = def.workers
 	}
+	if scn == ladderScenario {
+		// The ladder's chain is generated (not a scenarios-map preset): shape it
+		// 1m/1w and let the built-in/UPGRADE_LADDER walk own the create version +
+		// rungs.
+		c.masterCount = 1
+		c.nodeCount = 1
+		applyLadderDefaults(&c)
+	}
 	r2 := *r
 	r2.cfg = c
+	// Only the ladder scenario walks a ladder; clear it for the others so a
+	// preset's "upgrade" op targets its upgradeTemplate, not a stray ladder.
+	if scn == ladderScenario {
+		r2.ladder = splitTrim(c.upgradeLadder)
+	} else {
+		r2.ladder = nil
+	}
+	r2.ladderPos = 0
 	r2.nodepoolActive = false
 	r2.steps = nil
 	r2.runFailed = false
 	r2.runErr = nil
 	return &r2
+}
+
+// applyLadderDefaults configures the version-ladder create template + upgrade
+// ladder. With UPGRADE_LADDER unset the built-in 1.20→1.35 walk owns BOTH the
+// create version (ladder[0]) and the upgrade rungs; with it set, CLUSTER_TEMPLATE
+// is the create version and UPGRADE_LADDER the rungs. Idempotent.
+func applyLadderDefaults(c *config) {
+	if c.upgradeLadder == "" {
+		c.upgradeLadder = strings.Join(defaultVersionLadder[1:], ",")
+		c.template = defaultVersionLadder[0]
+	}
 }
 
 // perScenarioName derives a per-scenario cluster name from the base name. The
@@ -391,11 +417,14 @@ func runAllScenarios(ctx context.Context, r *runner) {
 // the shared auth/template/keypair preflight once.
 func preflightAll(ctx context.Context, r *runner) error {
 	for _, scn := range allScenarios {
-		ops, err := parseOps(scenarios[scn].ops)
+		// Build the real per-scenario runner so the generated version-ladder
+		// chain (and its shape/ladder) is validated the same way it will run.
+		sr := scenarioRunner(r, scn)
+		ops, err := sr.resolveOpList()
 		if err != nil {
 			return fmt.Errorf("scenario %q: %w", scn, err)
 		}
-		r.log("scenario %q: %dm/%dw, ops: %s", scn, scenarios[scn].masters, scenarios[scn].workers, formatOps(ops))
+		r.log("scenario %q: %dm/%dw, ops: %s", scn, sr.cfg.masterCount, sr.cfg.nodeCount, formatOps(ops))
 	}
 	// One real auth/template/keypair check (template + creds are scenario-agnostic).
 	return scenarioRunner(r, allScenarios[0]).preflight(ctx)

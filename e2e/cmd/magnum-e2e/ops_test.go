@@ -167,13 +167,50 @@ func TestScenariosParse(t *testing.T) {
 // scenarios defined in the catalog (no preset silently dropped, no dangling
 // name).
 func TestAllScenariosCoverMap(t *testing.T) {
-	if len(allScenarios) != len(scenarios) {
-		t.Fatalf("allScenarios has %d entries, scenarios map has %d", len(allScenarios), len(scenarios))
-	}
+	// Every all-scenario is either a scenarios-map preset or the generated
+	// version-ladder (the one entry whose chain is built from the ladder, not a
+	// fixed preset). Exactly one ladder entry is expected.
+	ladders := 0
 	for _, scn := range allScenarios {
-		if _, ok := scenarios[scn]; !ok {
-			t.Errorf("allScenarios entry %q not in scenarios map", scn)
+		if scn == ladderScenario {
+			ladders++
+			continue
 		}
+		if _, ok := scenarios[scn]; !ok {
+			t.Errorf("allScenarios entry %q not in scenarios map and is not the ladder scenario", scn)
+		}
+	}
+	if ladders != 1 {
+		t.Fatalf("expected exactly 1 version-ladder entry in allScenarios, got %d", ladders)
+	}
+	// Every map preset is part of the all-sweep.
+	if len(allScenarios) != len(scenarios)+ladders {
+		t.Fatalf("allScenarios has %d entries; want %d map presets + %d ladder", len(allScenarios), len(scenarios), ladders)
+	}
+}
+
+func TestScenarioRunnerLadder(t *testing.T) {
+	base := &runner{cfg: config{scenario: "all", clusterName: "recon-e2e-all-1"}}
+	sr := scenarioRunner(base, ladderScenario)
+	if sr.cfg.masterCount != 1 || sr.cfg.nodeCount != 1 {
+		t.Fatalf("ladder shape = %dm/%dw, want 1m/1w", sr.cfg.masterCount, sr.cfg.nodeCount)
+	}
+	if sr.cfg.template != defaultVersionLadder[0] {
+		t.Fatalf("ladder create template = %q, want %q", sr.cfg.template, defaultVersionLadder[0])
+	}
+	if len(sr.ladder) != len(defaultVersionLadder)-1 {
+		t.Fatalf("ladder rungs = %d, want %d", len(sr.ladder), len(defaultVersionLadder)-1)
+	}
+	ops, err := sr.resolveOpList()
+	if err != nil {
+		t.Fatalf("resolveOpList for ladder in all-mode: %v", err)
+	}
+	if len(ops) == 0 {
+		t.Fatal("ladder produced no ops")
+	}
+	// A non-ladder scenario in all-mode must not inherit a ladder.
+	if other := scenarioRunner(base, "smoke"); len(other.ladder) != 0 {
+		t.Fatalf("non-ladder scenario should have no ladder, got %d rungs", len(other.ladder))
 	}
 }
 

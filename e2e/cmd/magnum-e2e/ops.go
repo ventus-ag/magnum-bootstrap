@@ -135,12 +135,13 @@ var scenarios = map[string]scenarioDef{
 
 // allScenarios is the ordered list run by the "all" meta-scenario (one cluster
 // per entry, sequentially, in a single invocation). Order matters: cheapest
-// first so a smoke break fails fast before the long multi-master chains.
+// first so a smoke break fails fast before the long multi-master chains, and the
+// long version-ladder walk runs LAST.
 //
-// version-ladder is intentionally NOT here: it is a long, dispatch-only walk
-// (its chain is generated from the ladder, not a fixed preset), so it is not
-// part of the default "all" sweep.
-var allScenarios = []string{"smoke", "multinode", "chained-single", "chained-multinode"}
+// version-ladder is the one entry whose op chain is generated from the upgrade
+// ladder (not a fixed preset in the scenarios map), so scenarioRunner/preflightAll
+// special-case it; see ladderScenario.
+var allScenarios = []string{"smoke", "multinode", "chained-single", "chained-multinode", ladderScenario}
 
 // ladderScenario is the name of the multi-version upgrade scenario. Its op chain
 // is generated from the upgrade ladder (one upgrade+cloud-smoke per rung), so it

@@ -515,10 +515,15 @@ nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rota
 `chained-single` and `chained-multinode` (the wedge sequence
 `upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate`).
 
-**`version-ladder` (1m/1w, dispatch-only).** A long multi-version upgrade walk:
-create at the first version, then for every rung `upgrade → cloud-smoke →
-autoscale`. Its op chain is **generated** from the upgrade ladder (not a static preset), so it lives
-outside the `scenarios` map / `allScenarios` (not in `SCENARIO=all`). Default
+**`version-ladder` (1m/1w).** A long multi-version upgrade walk: create at the
+first version, then for every rung `upgrade → cloud-smoke → autoscale`. Its op
+chain is **generated** from the upgrade ladder (not a static preset), so it lives
+outside the `scenarios` map but is still part of `allScenarios` — `scenarioRunner`
+/ `preflightAll` special-case it (shape 1m/1w + `applyLadderDefaults`). It runs
+**last** in `SCENARIO=all` (longest scenario; self-hosted job `timeout-minutes:
+720`). `e2e-openstack.yaml` runs the full `all` sweep **weekly** (`schedule` cron
+`17 2 * * 0`, Sun 02:17 UTC, default branch; scheduled events carry no inputs so
+the env falls back to `SCENARIO=all`, build-from-source). Default
 ladder (built-in, zero-config on the ventus cloud, all templates version-pinned):
 `v1.20.12 → v1.23.17 → v1.28.4 → v1.30.10 → v1.32.2 → v1.33.10 → v1.34.6 →
 v1.35.3` (7 upgrades). Override with `UPGRADE_LADDER` (ordered comma list of
