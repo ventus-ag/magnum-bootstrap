@@ -87,26 +87,20 @@ func (r *runner) toggleAddon(ctx context.Context, a addonToggle, enable bool) er
 	return r.waitDeploymentAbsent(ctx, kc, a.namespace, a.deployment)
 }
 
-// patchClusterLabel PATCHes the cluster's label map (replace /labels with the
-// full current set plus the one changed key — Magnum's replace op swaps the whole
-// map, so we must preserve the others). This is the trigger the fork turns into a
-// reconfigure_cluster stack update.
+// patchClusterLabel flips a SINGLE cluster label key. Magnum types a JSON-patch
+// op's `value` as text|int (api/.../types.py JsonPatchType.value), so sending the
+// whole /labels object is rejected with 400 "Wrong type". Instead patch the one
+// key as a string: `add /labels/<key>` creates-or-replaces it (the path pattern
+// ^(/[\w-]+)+$ accepts the sub-path; underscore is \w). Magnum's _patch still
+// sees the `labels` field change → labels_changed → the fork's reconfigure_cluster
+// re-extracts ALL labels and re-fires the master reconciler run-once.
 func (r *runner) patchClusterLabel(ctx context.Context, key, val string) error {
-	c, err := clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
-	if err != nil {
-		return fmt.Errorf("get cluster for label patch: %w", err)
-	}
-	labels := make(map[string]string, len(c.Labels)+1)
-	for k, v := range c.Labels {
-		labels[k] = v
-	}
-	labels[key] = val
 	opts := []clusters.UpdateOpts{{
-		Op:    clusters.ReplaceOp,
-		Path:  "/labels",
-		Value: labels,
+		Op:    clusters.AddOp,
+		Path:  "/labels/" + key,
+		Value: val,
 	}}
-	if _, err := clusters.Update(ctx, r.magnum, c.UUID, opts).Extract(); err != nil {
+	if _, err := clusters.Update(ctx, r.magnum, r.cfg.clusterName, opts).Extract(); err != nil {
 		return fmt.Errorf("patch cluster label %s=%s: %w", key, val, err)
 	}
 	return nil
