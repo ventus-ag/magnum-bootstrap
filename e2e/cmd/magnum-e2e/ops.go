@@ -118,6 +118,15 @@ type scenarioDef struct {
 	upgradeTemplate  string // upgrade target for the `upgrade` op; empty = same as template
 	sshUser          string // node-log SSH user (FCoS=core, Ubuntu=ubuntu); empty = -ssh-user
 	nodepoolTemplate string // cluster_template_id label for the extra nodepool
+
+	// upgradeLadder, when non-empty, makes each `upgrade` op in this scenario climb
+	// one rung instead of all re-upgrading to the same upgradeTemplate. It feeds
+	// runner.ladder (the same cursor the version-ladder scenario uses) and so MUST
+	// have at least as many rungs as the chain has `upgrade` ops. The create version
+	// still comes from CLUSTER_TEMPLATE (this only supplies the upgrade targets, so
+	// UPGRADE_TEMPLATE is unused for this scenario). An explicit UPGRADE_LADDER env
+	// still overrides it (resolveLadder).
+	upgradeLadder []string
 }
 
 // Ubuntu (k8s_ubuntu_v1) cluster templates on the ventus cloud. Overridable via
@@ -142,10 +151,16 @@ var scenarios = map[string]scenarioDef{
 	"smoke": {
 		masters: 1, workers: 1,
 		ops: "disable-autoscaler,enable-metrics-server,upgrade,cloud-smoke,resize-workers=2,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate",
+		// The 3 `upgrade` ops climb a real version ladder (see climbLadder) instead
+		// of re-upgrading to 1.31 three times — one rung per `upgrade` op.
+		upgradeLadder: climbLadder,
 	},
 	"multinode": {
 		masters: 3, workers: 2,
 		ops: "add-nodepool=2,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
+		// 3-master coverage: the 3 `upgrade` ops climb 1.31→1.32→1.33 (see
+		// climbLadder) so multimaster upgrades exercise real minor bumps.
+		upgradeLadder: climbLadder,
 	},
 	"chained-single": {
 		masters: 1, workers: 1,
@@ -154,6 +169,10 @@ var scenarios = map[string]scenarioDef{
 	"chained-multinode": {
 		masters: 3, workers: 2,
 		ops: "add-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate",
+		// 3-master repeated-op wedge chain: the 3 `upgrade` ops climb 1.31→1.32→1.33
+		// (see climbLadder) so each is a real bump through the concurrent dual-CA
+		// barrier, not the same transition thrice.
+		upgradeLadder: climbLadder,
 	},
 	// ubuntu-upgrade — k8s_ubuntu_v1 driver lifecycle: create 1.29 → upgrade 1.31
 	// (a 2-minor cluster upgrade; the ±1 skew guard is nodepool-only) → cloud-smoke.
@@ -210,6 +229,14 @@ var defaultVersionLadder = []string{
 	"v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3",
 }
 
+// climbLadder is the per-upgrade target ladder shared by the lifecycle scenarios
+// whose chain has exactly 3 `upgrade` ops (smoke, multinode, chained-multinode).
+// Instead of re-upgrading to the same version 3×, each `upgrade` op climbs one
+// real minor: create v1.30.10 (CLUSTER_TEMPLATE) → 1.31.6 → 1.32.2 → 1.33.10. The
+// upgrade-after-ca-rotate race coverage is preserved (the later rungs still fire
+// right after a ca-rotate). All three rungs exist on the ventus cloud.
+var climbLadder = []string{"v1.31.6", "v1.32.2", "v1.33.10"}
+
 // splitTrim splits a comma-separated list, trimming spaces and dropping empties.
 func splitTrim(s string) []string {
 	var out []string
@@ -219,6 +246,21 @@ func splitTrim(s string) []string {
 		}
 	}
 	return out
+}
+
+// resolveLadder picks the per-upgrade target ladder for a runner. Precedence:
+// an explicit UPGRADE_LADDER (cfg.upgradeLadder, also set by the version-ladder
+// scenario's applyLadderDefaults) always wins; otherwise a scenario's built-in
+// upgradeLadder (e.g. smoke's 1.31→1.32→1.33 climb) is used. Empty result =
+// single fixed upgradeTemplate (upgradeTarget falls back to cfg.upgradeTemplate).
+func resolveLadder(cfg config) []string {
+	if l := splitTrim(cfg.upgradeLadder); len(l) > 0 {
+		return l
+	}
+	if def, ok := scenarios[cfg.scenario]; ok && len(def.upgradeLadder) > 0 {
+		return append([]string(nil), def.upgradeLadder...)
+	}
+	return nil
 }
 
 // nextLadderTarget returns the upgrade template at pos and the advanced position,

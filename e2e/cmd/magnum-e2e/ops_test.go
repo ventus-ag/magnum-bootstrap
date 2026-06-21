@@ -253,9 +253,32 @@ func TestScenarioRunnerLadder(t *testing.T) {
 	if len(ops) == 0 {
 		t.Fatal("ladder produced no ops")
 	}
-	// A non-ladder scenario in all-mode must not inherit a ladder.
-	if other := scenarioRunner(base, "smoke"); len(other.ladder) != 0 {
+	// A scenario with neither UPGRADE_LADDER nor a built-in ladder must not
+	// inherit one in all-mode (chained-single has none).
+	if other := scenarioRunner(base, "chained-single"); len(other.ladder) != 0 {
 		t.Fatalf("non-ladder scenario should have no ladder, got %d rungs", len(other.ladder))
+	}
+
+	// A scenario with a built-in upgradeLadder (smoke climbs 1.31→1.32→1.33) must
+	// inherit it in all-mode, with at least one rung per `upgrade` op so the ladder
+	// never runs off the end mid-run.
+	smoke := scenarioRunner(base, "smoke")
+	wantRungs := scenarios["smoke"].upgradeLadder
+	if len(smoke.ladder) != len(wantRungs) {
+		t.Fatalf("smoke ladder = %d rungs, want %d (%v)", len(smoke.ladder), len(wantRungs), wantRungs)
+	}
+	smokeOps, err := smoke.resolveOpList()
+	if err != nil {
+		t.Fatalf("resolveOpList for smoke: %v", err)
+	}
+	nUp := 0
+	for _, o := range smokeOps {
+		if o.name == "upgrade" {
+			nUp++
+		}
+	}
+	if nUp > len(smoke.ladder) {
+		t.Fatalf("smoke has %d upgrade ops but only %d ladder rungs", nUp, len(smoke.ladder))
 	}
 }
 

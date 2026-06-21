@@ -346,13 +346,11 @@ func scenarioRunner(r *runner, scn string) *runner {
 	}
 	r2 := *r
 	r2.cfg = c
-	// Only the ladder scenario walks a ladder; clear it for the others so a
-	// preset's "upgrade" op targets its upgradeTemplate, not a stray ladder.
-	if scn == ladderScenario {
-		r2.ladder = splitTrim(c.upgradeLadder)
-	} else {
-		r2.ladder = nil
-	}
+	// Resolve this scenario's upgrade ladder: an explicit UPGRADE_LADDER or the
+	// version-ladder walk (both in c.upgradeLadder) wins; else a scenario's own
+	// built-in ladder (e.g. smoke's 1.31→1.32→1.33). Scenarios with neither get a
+	// nil ladder so their "upgrade" ops target upgradeTemplate.
+	r2.ladder = resolveLadder(c)
 	r2.ladderPos = 0
 	r2.nodepoolActive = false
 	r2.steps = nil

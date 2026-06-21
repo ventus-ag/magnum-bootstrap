@@ -186,7 +186,7 @@ func newRunner(ctx context.Context, cfg config) (*runner, error) {
 	// Acceptable. Pin to the fork's CURRENT_MAX_VER (1.10) so the full
 	// create→upgrade→resize→ca-rotate flow is accepted.
 	magnum.Microversion = "1.10"
-	return &runner{cfg: cfg, provider: provider, magnum: magnum, ladder: splitTrim(cfg.upgradeLadder)}, nil
+	return &runner{cfg: cfg, provider: provider, magnum: magnum, ladder: resolveLadder(cfg)}, nil
 }
 
 // listResources prints the cluster templates and nova keypairs visible to the
@@ -449,6 +449,18 @@ func (r *runner) preflight(ctx context.Context) error {
 	}
 	if len(r.ladder) > 0 {
 		r.log("upgrade ladder OK (%d rungs): %s", len(r.ladder), strings.Join(r.ladder, " → "))
+		// A ladder must have at least one rung per `upgrade` op, else upgradeTarget
+		// runs off the end mid-run (after billing). Catch the mismatch dry.
+		nUp := 0
+		for _, o := range ops {
+			if o.name == "upgrade" {
+				nUp++
+			}
+		}
+		if nUp > len(r.ladder) {
+			return fmt.Errorf("op chain has %d upgrade op(s) but the ladder has only %d rung(s): %s",
+				nUp, len(r.ladder), strings.Join(r.ladder, ","))
+		}
 	}
 	return r.preflightKeypair(ctx)
 }
