@@ -40,6 +40,10 @@ var knownOps = map[string]bool{
 	"cloud-smoke":     true,
 	"verify-sa":       true,
 	"autoscale":       true,
+	// component toggle: flip an addon label on the live cluster, then assert the
+	// reconciler installed/uninstalled it (see toggle.go).
+	"disable-autoscaler":    true,
+	"enable-metrics-server": true,
 }
 
 // parseOps parses a comma-separated op list. Each token is "name" or "name=N".
@@ -99,29 +103,49 @@ func opNames() string {
 // scenarioDef is a named preset: a cluster shape plus an op chain. The shape
 // values are applied as defaults in loadConfig (explicit flags/env still win);
 // the op string is parsed at run start.
+//
+// The optional template fields let a scenario pin its own create/upgrade/nodepool
+// templates and SSH user so it is zero-config in CI (templates otherwise come from
+// CLUSTER_TEMPLATE/UPGRADE_TEMPLATE). They are applied for any value the user did
+// not set explicitly (loadConfig) or forced per-scenario in the "all" sweep
+// (scenarioRunner).
 type scenarioDef struct {
 	masters int
 	workers int
 	ops     string
+
+	template         string // create template (name or UUID); empty = use CLUSTER_TEMPLATE
+	upgradeTemplate  string // upgrade target for the `upgrade` op; empty = same as template
+	sshUser          string // node-log SSH user (FCoS=core, Ubuntu=ubuntu); empty = -ssh-user
+	nodepoolTemplate string // cluster_template_id label for the extra nodepool
 }
+
+// Ubuntu (k8s_ubuntu_v1) cluster templates on the ventus cloud. Overridable via
+// CLUSTER_TEMPLATE / UPGRADE_TEMPLATE / NODEPOOL_TEMPLATE.
+const (
+	ubuntuTemplate129 = "v1.29.14-u22"
+	ubuntuTemplate131 = "v1.31.6-u22"
+)
 
 // scenarios are the CI/dispatch presets.
 //
-//   - smoke             — current 1m/1w linear coverage (back-compat baseline).
-//   - multinode         — headline 3m/2w + extra nodepool; worker+nodepool resize
-//     up/down THEN upgrade THEN ca-rotate (the explicitly verified
-//     resize→upgrade→ca-rotate order), then post-rotate add-node + SA check.
+//   - smoke             — default 1m/1w coverage: addon label toggles, upgrade,
+//     worker resize, repeated CA-rotation/upgrade wedge sequence, then
+//     post-rotation master add + SA check.
+//   - multinode         — default 3m/2w coverage: extra nodepool lifecycle,
+//     worker+nodepool resize up/down, repeated upgrade/CA-rotation wedge sequence,
+//     then post-rotation add-node + SA check.
 //   - chained-single    — the repeated-op wedge sequence on 1 node.
 //   - chained-multinode — the same chain on 3m/2w + nodepool (concurrent dual-CA
 //     barrier + heterogeneous node sizes through the whole chain).
 var scenarios = map[string]scenarioDef{
 	"smoke": {
 		masters: 1, workers: 1,
-		ops: "upgrade,resize-workers=2,ca-rotate,post-rotate",
+		ops: "disable-autoscaler,enable-metrics-server,upgrade,cloud-smoke,resize-workers=2,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate",
 	},
 	"multinode": {
 		masters: 3, workers: 2,
-		ops: "add-nodepool=2,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,post-rotate",
+		ops: "add-nodepool=2,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
 	},
 	"chained-single": {
 		masters: 1, workers: 1,
@@ -131,21 +155,48 @@ var scenarios = map[string]scenarioDef{
 		masters: 3, workers: 2,
 		ops: "add-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate",
 	},
+	// ubuntu-upgrade — k8s_ubuntu_v1 driver lifecycle: create 1.29 → upgrade 1.31
+	// (a 2-minor cluster upgrade; the ±1 skew guard is nodepool-only) → cloud-smoke.
+	"ubuntu-upgrade": {
+		masters: 1, workers: 1,
+		ops:             "upgrade,cloud-smoke",
+		template:        ubuntuTemplate129,
+		upgradeTemplate: ubuntuTemplate131,
+		sshUser:         "ubuntu",
+	},
+	// ubuntu-nodepool — Ubuntu cluster + extra Ubuntu nodepool created via the
+	// fork's cluster_template_id label path (same OS, same version → within skew).
+	"ubuntu-nodepool": {
+		masters: 1, workers: 1,
+		ops:              "add-nodepool=1,resize-nodepool=2,del-nodepool",
+		template:         ubuntuTemplate131,
+		sshUser:          "ubuntu",
+		nodepoolTemplate: ubuntuTemplate131,
+	},
+	// component-toggle — flip cluster addon labels on a live cluster and assert the
+	// reconciler installs/uninstalls: disable autoscaler (Pulumi prunes the Helm
+	// release) then enable metrics-server. OS-agnostic; uses the default template.
+	"component-toggle": {
+		masters: 1, workers: 1,
+		ops: "disable-autoscaler,enable-metrics-server",
+	},
 }
 
-// allScenarios is the ordered list run by the "all" meta-scenario (one cluster
-// per entry, sequentially, in a single invocation). Order matters: cheapest
-// first so a smoke break fails fast before the long multi-master chains, and the
-// long version-ladder walk runs LAST.
+// allScenarios is the ordered default sweep run by the "all" meta-scenario (one
+// cluster per entry, sequentially, in a single invocation). It intentionally keeps
+// Fedora coverage to the two cluster shapes we need to create (single-master and
+// multi-master), keeps Ubuntu upgrade/nodepool coverage as separate OS-driver
+// scenarios, and keeps the long version-ladder walk. Other named scenarios remain
+// dispatchable for focused/manual runs.
 //
 // version-ladder is the one entry whose op chain is generated from the upgrade
 // ladder (not a fixed preset in the scenarios map), so scenarioRunner/preflightAll
 // special-case it; see ladderScenario.
-var allScenarios = []string{"smoke", "multinode", "chained-single", "chained-multinode", ladderScenario}
+var allScenarios = []string{"smoke", "multinode", "ubuntu-upgrade", "ubuntu-nodepool", ladderScenario}
 
 // ladderScenario is the name of the multi-version upgrade scenario. Its op chain
 // is generated from the upgrade ladder (one upgrade+cloud-smoke per rung), so it
-// lives outside the static scenarios map (and outside allScenarios).
+// lives outside the static scenarios map.
 const ladderScenario = "version-ladder"
 
 // defaultVersionLadder is the version-ladder scenario's default walk: the cluster

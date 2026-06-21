@@ -29,17 +29,19 @@ type stepResult struct {
 // opDescriptions are one-line summaries of what each op proves, shown in the
 // per-step run summary (stdout + the GitHub run summary + JUnit).
 var opDescriptions = map[string]string{
-	"upgrade":         "rolling k8s upgrade to the target version",
-	"cloud-smoke":     "OCCM LB serves HTTP 200 + Cinder PVC create/resize",
-	"autoscale":       "cluster-autoscaler scales workers up >2 then back down",
-	"ca-rotate":       "rotate the cluster CA (dual-CA, zero-downtime)",
-	"post-rotate":     "add a node after CA rotation (SA-key trust)",
-	"verify-sa":       "service-account key consistency across nodes",
-	"resize-workers":  "resize the worker nodegroup",
-	"resize-masters":  "resize the master nodegroup",
-	"add-nodepool":    "create an extra worker nodepool",
-	"resize-nodepool": "resize the extra worker nodepool",
-	"del-nodepool":    "delete the extra worker nodepool",
+	"upgrade":               "rolling k8s upgrade to the target version",
+	"cloud-smoke":           "OCCM LB serves HTTP 200 + Cinder PVC create/resize",
+	"autoscale":             "cluster-autoscaler scales workers up >2 then back down",
+	"ca-rotate":             "rotate the cluster CA (dual-CA, zero-downtime)",
+	"post-rotate":           "add a node after CA rotation (SA-key trust)",
+	"verify-sa":             "service-account key consistency across nodes",
+	"resize-workers":        "resize the worker nodegroup",
+	"resize-masters":        "resize the master nodegroup",
+	"add-nodepool":          "create an extra worker nodepool",
+	"resize-nodepool":       "resize the extra worker nodepool",
+	"del-nodepool":          "delete the extra worker nodepool",
+	"disable-autoscaler":    "disable cluster-autoscaler and prune its Helm release",
+	"enable-metrics-server": "enable metrics-server and wait for it to become Ready",
 }
 
 func opDescription(o op) string {

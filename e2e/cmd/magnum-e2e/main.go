@@ -68,6 +68,12 @@ type config struct {
 	ops            string
 	nodepoolName   string
 	nodepoolFlavor string
+	// nodepoolTemplate, when set, is attached to the extra nodepool as a
+	// `cluster_template_id` label so the nodepool is provisioned from that
+	// template (the fork resolves its kube_tag/image from it). The nodepool
+	// still uses the CLUSTER's driver/OS at create time, so this must be a
+	// same-OS template within ±1 minor of the cluster (Magnum rejects more).
+	nodepoolTemplate string
 
 	// Node SSH for on-host diagnostics (reconciler log, heat-container-agent +
 	// kubernetes service journals) when an op fails. sshKeyPath is required only
@@ -150,6 +156,7 @@ func loadConfig() config {
 	flag.StringVar(&c.ops, "ops", envOr("OPS", ""), "explicit comma op chain, overrides scenario, e.g. upgrade,ca-rotate,resize-workers=3,add-nodepool=2 [OPS]")
 	flag.StringVar(&c.nodepoolName, "nodepool-name", envOr("NODEPOOL_NAME", "e2e-np"), "name of the extra worker nodepool (nodegroup) [NODEPOOL_NAME]")
 	flag.StringVar(&c.nodepoolFlavor, "nodepool-flavor", envOr("NODEPOOL_FLAVOR", ""), "flavor for the extra nodepool (a different node size); empty = template default [NODEPOOL_FLAVOR]")
+	flag.StringVar(&c.nodepoolTemplate, "nodepool-template", envOr("NODEPOOL_TEMPLATE", ""), "cluster template (name or UUID) attached to the extra nodepool as a cluster_template_id label; same-OS, within ±1 minor of the cluster [NODEPOOL_TEMPLATE]")
 	flag.StringVar(&c.sshKeyPath, "ssh-key", envOr("SSH_PRIVATE_KEY", ""), "path to a private key for node-log SSH on failure; needed only with a named KEYPAIR (ephemeral keypair captures its own key) [SSH_PRIVATE_KEY]")
 	flag.StringVar(&c.sshUser, "ssh-user", envOr("SSH_USER", "core"), "SSH login user for node-log collection (Fedora CoreOS = core) [SSH_USER]")
 	flag.IntVar(&c.autoscaleMin, "autoscale-min", envIntOr("AUTOSCALE_MIN", 1), "cluster-autoscaler worker floor for the autoscale op (scale-down target) [AUTOSCALE_MIN]")
@@ -162,8 +169,22 @@ func loadConfig() config {
 	c.skipResize = *skipRz
 	c.skipCARotate = *skip
 	c.skipPostRotate = *skipPR
-	if c.upgradeTemplate == "" {
-		c.upgradeTemplate = c.template
+
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	// Apply the scenario preset (cluster shape + optional template/ssh-user
+	// pinning) for any value the user did NOT set explicitly — an explicit flag
+	// OR env var always wins. Runs BEFORE the upgradeTemplate fallback below so a
+	// scenario's own upgradeTemplate is not clobbered by its create template.
+	if sc, ok := scenarios[c.scenario]; ok {
+		if !set["master-count"] && !envPresent("MASTER_COUNT") {
+			c.masterCount = sc.masters
+		}
+		if !set["node-count"] && !envPresent("NODE_COUNT") {
+			c.nodeCount = sc.workers
+		}
+		applyScenarioTemplates(&c, sc, set)
 	}
 
 	// version-ladder scenario shapes the create template + upgrade ladder:
@@ -178,19 +199,29 @@ func loadConfig() config {
 		applyLadderDefaults(&c)
 	}
 
-	// Apply the scenario's cluster shape for any count the user did NOT set
-	// explicitly (explicit flag OR env var always wins over the preset).
-	if sc, ok := scenarios[c.scenario]; ok {
-		set := map[string]bool{}
-		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
-		if !set["master-count"] && !envPresent("MASTER_COUNT") {
-			c.masterCount = sc.masters
-		}
-		if !set["node-count"] && !envPresent("NODE_COUNT") {
-			c.nodeCount = sc.workers
-		}
+	if c.upgradeTemplate == "" {
+		c.upgradeTemplate = c.template
 	}
 	return c
+}
+
+// applyScenarioTemplates fills the create/upgrade/nodepool templates and SSH user
+// from a scenario preset for any value the user did not set explicitly (an
+// explicit flag or env var always wins). It lets a scenario like ubuntu-upgrade
+// be zero-config in CI. Called before the upgradeTemplate fallback in loadConfig.
+func applyScenarioTemplates(c *config, sc scenarioDef, set map[string]bool) {
+	if sc.template != "" && !set["template"] && !envPresent("CLUSTER_TEMPLATE") {
+		c.template = sc.template
+	}
+	if sc.upgradeTemplate != "" && !set["upgrade-template"] && !envPresent("UPGRADE_TEMPLATE") {
+		c.upgradeTemplate = sc.upgradeTemplate
+	}
+	if sc.sshUser != "" && !set["ssh-user"] && !envPresent("SSH_USER") {
+		c.sshUser = sc.sshUser
+	}
+	if sc.nodepoolTemplate != "" && !set["nodepool-template"] && !envPresent("NODEPOOL_TEMPLATE") {
+		c.nodepoolTemplate = sc.nodepoolTemplate
+	}
 }
 
 // envPresent reports whether an environment variable is set (even if empty).
@@ -291,6 +322,19 @@ func scenarioRunner(r *runner, scn string) *runner {
 	if def, ok := scenarios[scn]; ok {
 		c.masterCount = def.masters
 		c.nodeCount = def.workers
+		// Each scenario in the "all" sweep owns its own templates / SSH user /
+		// nodepool template (a scenario without a template keeps the base cfg's).
+		if def.template != "" {
+			c.template = def.template
+			c.upgradeTemplate = def.template // default; overridden if def pins one
+		}
+		if def.upgradeTemplate != "" {
+			c.upgradeTemplate = def.upgradeTemplate
+		}
+		if def.sshUser != "" {
+			c.sshUser = def.sshUser
+		}
+		c.nodepoolTemplate = def.nodepoolTemplate
 	}
 	if scn == ladderScenario {
 		// The ladder's chain is generated (not a scenarios-map preset): shape it

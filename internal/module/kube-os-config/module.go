@@ -43,7 +43,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes = append(changes, dirResult.Changes...)
 
 	caBundle := hostresource.CopySpec{
-		Source: "/etc/pki/tls/certs/ca-bundle.crt",
+		Source: caBundleSource(cfg),
 		Path:   "/etc/kubernetes/ca-bundle.crt",
 		Mode:   0o644,
 	}
@@ -102,6 +102,17 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 	return nil
 }
 
+// caBundleSource returns the system CA bundle path for the node OS. EnsureCopy
+// errors on a missing source, so the path must match the OS: Debian/Ubuntu use
+// /etc/ssl/certs/ca-certificates.crt; RHEL/Fedora CoreOS use
+// /etc/pki/tls/certs/ca-bundle.crt.
+func caBundleSource(cfg config.Config) string {
+	if cfg.IsUbuntu() {
+		return "/etc/ssl/certs/ca-certificates.crt"
+	}
+	return "/etc/pki/tls/certs/ca-bundle.crt"
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}
@@ -119,7 +130,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	caBundle := hostresource.CopySpec{
-		Source: "/etc/pki/tls/certs/ca-bundle.crt",
+		Source: caBundleSource(heat.Cfg),
 		Path:   "/etc/kubernetes/ca-bundle.crt",
 		Mode:   0o644,
 	}

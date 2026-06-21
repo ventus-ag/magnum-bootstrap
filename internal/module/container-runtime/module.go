@@ -161,28 +161,37 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			return nil, false, fmt.Errorf("download containerd tarball: %w", err)
 		}
 		changes = append(changes, dl.Changes...)
-		// Fedora CoreOS makes /usr/local and /opt symlinks into the writable /var
-		// (/usr/local -> ../var/usrlocal, /opt -> ../var/opt) while /usr itself is a
-		// read-only composefs overlay. tar cannot create the cri bundle's usr/local/*
-		// or opt/* members through those symlinks — composefs rejects the directory
-		// create with EXDEV ("Invalid cross-device link"), even with
-		// --keep-directory-symlink and a pre-created target. So never extract through
-		// /usr: extract straight into the writable /var target (containerd 2.x) or
-		// unpack to a scratch dir and copy each tree into its real writable location
-		// (containerd 1.x). /var/usrlocal IS /usr/local and /var/opt IS /opt, so the
-		// installed files appear at the expected paths; /etc is writable directly.
-		// This installs on any FCoS image (composefs or not) with no pre-provisioning.
-		usrLocalTarget, err := (hostresource.DirectorySpec{Path: "/var/usrlocal", Mode: 0o755}).Apply(executor)
+		// Install roots differ by OS. Fedora CoreOS makes /usr/local and /opt
+		// symlinks into the writable /var (/usr/local -> ../var/usrlocal,
+		// /opt -> ../var/opt) while /usr itself is a read-only composefs overlay.
+		// tar cannot create the cri bundle's usr/local/* or opt/* members through
+		// those symlinks — composefs rejects the directory create with EXDEV
+		// ("Invalid cross-device link"), even with --keep-directory-symlink and a
+		// pre-created target. So on FCoS never extract through /usr: extract straight
+		// into the writable /var target (containerd 2.x) or unpack to a scratch dir
+		// and copy each tree into its real writable location (containerd 1.x).
+		// /var/usrlocal IS /usr/local and /var/opt IS /opt there. On Ubuntu /usr/local
+		// and /opt are ordinary writable directories (and /var/usrlocal does NOT
+		// exist), so we must target them directly — otherwise the binary lands in
+		// /var/usrlocal/bin while the systemd drop-in below points at
+		// /usr/local/bin/containerd and containerd fails to start. /etc is writable
+		// on both. This installs on any FCoS image (composefs or not) and on Ubuntu
+		// with no pre-provisioning.
+		usrLocalRoot, optRoot := "/var/usrlocal", "/var/opt"
+		if cfg.IsUbuntu() {
+			usrLocalRoot, optRoot = "/usr/local", "/opt"
+		}
+		usrLocalTarget, err := (hostresource.DirectorySpec{Path: usrLocalRoot, Mode: 0o755}).Apply(executor)
 		if err != nil {
-			return nil, false, fmt.Errorf("ensure containerd install target /var/usrlocal: %w", err)
+			return nil, false, fmt.Errorf("ensure containerd install target %s: %w", usrLocalRoot, err)
 		}
 		changes = append(changes, usrLocalTarget.Changes...)
 
 		if useV2Layout {
 			// containerd 2.x: tarball has a bin/ directory; extract straight into
-			// /var/usrlocal (== /usr/local), bypassing the read-only /usr overlay.
+			// the usr/local root (== /usr/local on both OSes).
 			if err := executor.Run("tar", "xzf", localPath,
-				"-C", "/var/usrlocal",
+				"-C", usrLocalRoot,
 				"--no-same-owner", "--touch", "--no-same-permissions",
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
@@ -212,10 +221,11 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 			}
-			// dst /var/usrlocal == /usr/local, /var/opt == /opt; /etc is writable.
+			// dst: FCoS /var/usrlocal == /usr/local, /var/opt == /opt; Ubuntu uses
+			// /usr/local and /opt directly. /etc is writable on both.
 			placements := []struct{ tree, dst string }{
-				{"usr/local", "/var/usrlocal"},
-				{"opt", "/var/opt"},
+				{"usr/local", usrLocalRoot},
+				{"opt", optRoot},
 				{"etc", "/etc"},
 			}
 			for _, p := range placements {

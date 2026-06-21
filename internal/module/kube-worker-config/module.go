@@ -153,6 +153,7 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 		NodeIP:           cfg.ResolveNodeIP(),
 		InstanceID:       kubecommon.FetchInstanceID(executor),
 		FeatureGates:     kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag),
+		ResolvConf:       kubecommon.NodeResolvConf(),
 	}
 
 	change, err = applyWorkerFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/kubelet-config.yaml", Content: []byte(kubecommon.RenderKubeletConfig(opts)), Mode: 0o644})
@@ -286,6 +287,7 @@ func registerKubeletConfigResources(ctx *pulumi.Context, name string, cfg config
 		NodeIP:           cfg.ResolveNodeIP(),
 		InstanceID:       kubecommon.FetchInstanceID(executor),
 		FeatureGates:     kubeletconfig.FeatureGatesYAML(cfg.Shared.KubeTag),
+		ResolvConf:       kubecommon.NodeResolvConf(),
 	}
 	if _, err := hostsdk.RegisterFileSpec(ctx, name+"-config", hostresource.FileSpec{Path: "/etc/kubernetes/kubelet-config.yaml", Content: []byte(kubecommon.RenderKubeletConfig(optsCfg)), Mode: 0o644}, opts...); err != nil {
 		return err

@@ -41,6 +41,52 @@ type Config struct {
 	Master        *MasterConfig     `json:"master,omitempty"`
 	Worker        *WorkerConfig     `json:"worker,omitempty"`
 	Trigger       TriggerConfig     `json:"trigger"`
+
+	// Distro is the node OS family (the os-release ID, e.g. "fedora-coreos",
+	// "ubuntu"), detected at Load() time from /etc/os-release — NOT a heat-param.
+	// The reconciler is one binary for both Fedora CoreOS and Ubuntu; modules
+	// branch on IsFCoS()/IsUbuntu() for the handful of OS-specific paths.
+	Distro string `json:"distro,omitempty"`
+}
+
+// IsUbuntu reports whether the node runs Ubuntu (or a Debian derivative).
+func (c Config) IsUbuntu() bool {
+	d := strings.ToLower(c.Distro)
+	return strings.Contains(d, "ubuntu") || strings.Contains(d, "debian")
+}
+
+// IsFCoS reports whether the node runs Fedora CoreOS (or another RHEL-family
+// immutable image). It is the DEFAULT when the distro is unknown, so existing
+// Fedora CoreOS behavior is preserved if detection ever fails.
+func (c Config) IsFCoS() bool {
+	if c.IsUbuntu() {
+		return false
+	}
+	return true
+}
+
+// detectDistro reads the os-release ID from the node. Returns "" when neither
+// file is present (e.g. unit tests on a dev box), which IsFCoS() treats as FCoS.
+func detectDistro() string {
+	for _, p := range []string{"/etc/os-release", "/usr/lib/os-release"} {
+		if b, err := os.ReadFile(p); err == nil {
+			if id := parseOSReleaseID(string(b)); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+// parseOSReleaseID extracts the lowercased ID= value from os-release content.
+func parseOSReleaseID(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "ID="); ok {
+			return strings.ToLower(strings.Trim(strings.TrimSpace(v), "\"'"))
+		}
+	}
+	return ""
 }
 
 type SharedConfig struct {

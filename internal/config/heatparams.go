@@ -124,6 +124,14 @@ func Load(path string) (Config, error) {
 		},
 	}
 
+	// Node OS family: an explicit OS_DISTRO heat-param wins (handy for tests),
+	// otherwise detect from the node's os-release. Unknown ⇒ IsFCoS() (default).
+	if d := strings.ToLower(strings.TrimSpace(raw["OS_DISTRO"])); d != "" {
+		cfg.Distro = d
+	} else {
+		cfg.Distro = detectDistro()
+	}
+
 	role := strings.ToLower(strings.TrimSpace(raw["NODEGROUP_ROLE"]))
 	switch role {
 	case "master", "control-plane":

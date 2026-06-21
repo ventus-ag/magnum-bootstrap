@@ -109,8 +109,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			Summary: fmt.Sprintf("mount %s at %s", devicePath, storageDir)})
 	}
 
-	// Restore SELinux context only if we just formatted.
-	if strings.TrimSpace(fstype) != "xfs" {
+	// Restore SELinux context only if we just formatted — Fedora CoreOS only
+	// (Ubuntu uses AppArmor; restorecon is absent / a no-op there).
+	if cfg.IsFCoS() && strings.TrimSpace(fstype) != "xfs" {
 		_ = executor.Run("restorecon", "-R", storageDir)
 	}
 

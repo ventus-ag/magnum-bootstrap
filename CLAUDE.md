@@ -509,11 +509,13 @@ creates a cluster of a configured shape, then runs an ordered op chain
 `ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
 `resize-nodepool=N`, `del-nodepool`, `post-rotate`, `cloud-smoke`, `verify-sa`,
 `autoscale`.
-Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Presets
-(`SCENARIO`): `smoke` (1m/1w, back-compat), `multinode` (3m/2w + extra worker
-nodepool; worker+nodepool resize up/down → upgrade → ca-rotate → post-rotate),
-`chained-single` and `chained-multinode` (the wedge sequence
-`upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate`).
+Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Default-sweep
+presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade, worker
+resize, repeated CA-rotate/upgrade wedge, post-rotate add), `multinode` (3m/2w
+Fedora + extra worker nodepool: nodepool/worker resize up/down, repeated wedge,
+post-rotate add), `ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+Focused manual presets remain available: `chained-single`, `chained-multinode`,
+and `component-toggle`.
 
 **`version-ladder` (1m/1w).** A long multi-version upgrade walk: create at the
 first version, then for every rung `upgrade → cloud-smoke → autoscale`. Its op
@@ -614,15 +616,16 @@ Known result: the built-in ladder's **multi-minor jumps can fail** — e.g.
 sequential ladder is possible since the cloud carries every intermediate template
 (v1.24.15, v1.25.11, v1.26.6, v1.27.3).
 
-`SCENARIO=all` is a meta-scenario: a **single `magnum-e2e` invocation** runs
-every scenario in `allScenarios` order (smoke → multinode → chained-single →
-chained-multinode) one-by-one, each its own cluster created + torn down before
-the next (one run, one log, `runAllScenarios` in main.go). It does NOT stop on
-first failure — all run, a per-scenario PASS/FAIL summary prints, exit is
-non-zero if any failed. `-teardown` + `SCENARIO=all` deletes every scenario's
-cluster (the always() safety net). `ci.yaml` `e2e-openstack` is now a **single
-job** calling the reusable with `scenario: all` (schedule/label) or a single
-scenario via the `os_scenario` dispatch choice.
+`SCENARIO=all` is a meta-scenario: a **single `magnum-e2e` invocation** runs the
+curated default sweep in `allScenarios` order (smoke → multinode →
+ubuntu-upgrade → ubuntu-nodepool → version-ladder) one-by-one, each its own
+cluster created + torn down before the next (one run, one log, `runAllScenarios`
+in main.go). It does NOT stop on first failure — all run, a per-scenario
+PASS/FAIL summary prints, exit is non-zero if any failed. `-teardown` +
+`SCENARIO=all` deletes every default-sweep cluster (the always() safety net).
+`ci.yaml` `e2e-openstack` is now a **single job** calling the reusable with
+`scenario: all` (schedule/label) or a single scenario via the `os_scenario`
+dispatch choice.
 
 Nodepool nodes are ordinary workers to the reconciler, labeled
 `magnum.openstack.org/nodegroup=<name>`; master nodegroups are API-blocked so

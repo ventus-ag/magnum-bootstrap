@@ -2,12 +2,31 @@ package kubecommon
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 )
+
+// systemdResolvConf is the systemd-resolved stub used by Fedora CoreOS and
+// default Ubuntu cloud images; fallbackResolvConf is the plain libc resolver.
+const (
+	systemdResolvConf  = "/run/systemd/resolve/resolv.conf"
+	fallbackResolvConf = "/etc/resolv.conf"
+)
+
+// NodeResolvConf returns the kubelet resolvConf path for this node: the
+// systemd-resolved stub when present (FCoS + default Ubuntu 22.04), otherwise
+// /etc/resolv.conf. Called from both Run() and Register() on the same node so
+// the rendered config is identical (no spurious drift).
+func NodeResolvConf() string {
+	if _, err := os.Stat(systemdResolvConf); err == nil {
+		return systemdResolvConf
+	}
+	return fallbackResolvConf
+}
 
 // KubeletConfigOpts contains the parameters for rendering kubelet-config.yaml.
 type KubeletConfigOpts struct {
@@ -19,10 +38,15 @@ type KubeletConfigOpts struct {
 	InstanceID         string
 	FeatureGates       string
 	RegisterWithTaints string // empty for workers, taint block for masters
+	ResolvConf         string // empty defaults to the systemd-resolved stub
 }
 
 // RenderKubeletConfig produces the kubelet-config.yaml content.
 func RenderKubeletConfig(opts KubeletConfigOpts) string {
+	resolvConf := opts.ResolvConf
+	if resolvConf == "" {
+		resolvConf = systemdResolvConf
+	}
 	return fmt.Sprintf(`---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -52,7 +76,7 @@ containerLogMaxSize: 10Mi
 %smaxPods: 110
 podPidsLimit: -1
 providerID: openstack:///%s
-resolvConf: /run/systemd/resolve/resolv.conf
+resolvConf: %s
 volumePluginDir: /var/lib/kubelet/volumeplugins
 rotateCertificates: true
 tlsCertFile: %s/kubelet.crt
@@ -63,7 +87,7 @@ eventRecordQPS: 5
 containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
 %s
 `, opts.CertDir, opts.CgroupDriver, opts.DNSServiceIP, opts.DNSClusterDomain,
-		opts.NodeIP, opts.RegisterWithTaints, opts.InstanceID,
+		opts.NodeIP, opts.RegisterWithTaints, opts.InstanceID, resolvConf,
 		opts.CertDir, opts.CertDir, opts.FeatureGates)
 }
 

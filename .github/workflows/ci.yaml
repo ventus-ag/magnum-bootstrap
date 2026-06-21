@@ -69,7 +69,7 @@ on:
         type: boolean
         default: false
       os_scenario:
-        description: "OpenStack tier: scenario to run (all = full matrix)"
+        description: "OpenStack tier: scenario to run (all = curated default sweep)"
         type: choice
         default: all
         options:
@@ -78,6 +78,10 @@ on:
           - multinode
           - chained-single
           - chained-multinode
+          - ubuntu-upgrade
+          - ubuntu-nodepool
+          - component-toggle
+          - version-ladder
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
 
@@ -387,9 +391,9 @@ jobs:
   # which is ALSO independently runnable via its own workflow_dispatch
   # (Actions → e2e-openstack → Run workflow), decoupled from a full CI run.
   #
-  # A SINGLE job, ONE invocation: scenario=all makes the magnum-e2e binary run
-  # every scenario one-by-one in this one run (each its own cluster, torn down
-  # before the next). Dispatch can pick a single scenario via os_scenario.
+  # A SINGLE job, ONE invocation: scenario=all makes the magnum-e2e binary run the
+  # curated default sweep one-by-one in this one run (each its own cluster, torn
+  # down before the next). Dispatch can pick a single scenario via os_scenario.
   e2e-openstack:
     name: e2e-openstack
     needs: [build]

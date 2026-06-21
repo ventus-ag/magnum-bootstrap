@@ -264,6 +264,18 @@ func (r *runner) run(ctx context.Context) error {
 		r.enableAutoscalerLabels()
 	}
 
+	// component-toggle ops need a defined starting state at create so the toggle
+	// is a real transition the reconciler must act on:
+	//   - disable-autoscaler: cluster-autoscaler must be ON to then prune it
+	//     (enableAutoscalerLabels also pins min/max so the chart deploys cleanly).
+	//   - enable-metrics-server: metrics-server must be OFF so enabling installs it.
+	if opsContain(ops, "disable-autoscaler") {
+		r.enableAutoscalerLabels()
+	}
+	if opsContain(ops, "enable-metrics-server") {
+		r.setCreateLabel("metrics_server_enabled", "false")
+	}
+
 	if err := r.preflight(ctx); err != nil {
 		return err
 	}
@@ -345,21 +357,25 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 
 	case "add-nodepool":
 		count := o.argOr(1)
+		previousActive := r.nodepoolActive
+		r.nodepoolActive = true
 		if err := r.runMutation(ctx, fmt.Sprintf("add-nodepool=%d", count), true, func() error {
 			return r.triggerNodepoolCreate(ctx, count)
 		}); err != nil {
+			r.nodepoolActive = previousActive
 			return err
 		}
-		r.nodepoolActive = true
 		return nil
 
 	case "del-nodepool":
+		previousActive := r.nodepoolActive
+		r.nodepoolActive = false
 		if err := r.runMutation(ctx, "del-nodepool", true, func() error {
 			return r.triggerNodepoolDelete(ctx)
 		}); err != nil {
+			r.nodepoolActive = previousActive
 			return err
 		}
-		r.nodepoolActive = false
 		return nil
 
 	case "post-rotate":
@@ -373,6 +389,12 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 
 	case "autoscale":
 		return r.autoscaleCycle(ctx)
+
+	case "disable-autoscaler":
+		return r.toggleAddon(ctx, autoscalerToggle, false)
+
+	case "enable-metrics-server":
+		return r.toggleAddon(ctx, metricsServerToggle, true)
 	}
 	return fmt.Errorf("unhandled op %q", o.name)
 }
@@ -667,8 +689,11 @@ func (r *runner) nodepoolName() string {
 
 // triggerNodepoolCreate creates the extra worker nodegroup (no wait). It runs
 // with a distinct flavor when NODEPOOL_FLAVOR is set, so the cluster carries
-// heterogeneous node sizes through the op chain. MergeLabels keeps the
-// template's CNI/runtime/reconciler labels (see merge_labels gotcha).
+// heterogeneous node sizes through the op chain. When NODEPOOL_TEMPLATE is set
+// it attaches a cluster_template_id label so the fork provisions the nodepool
+// from that template (same OS as the cluster, within ±1 minor — Magnum's
+// nodegroup version-skew guard rejects more). MergeLabels keeps the template's
+// CNI/runtime/reconciler labels (see merge_labels gotcha).
 func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
 	n := count
 	merge := true
@@ -681,11 +706,20 @@ func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
 	if r.cfg.nodepoolFlavor != "" {
 		opts.FlavorID = r.cfg.nodepoolFlavor
 	}
+	tmplLabel := ""
+	if r.cfg.nodepoolTemplate != "" {
+		tmplID, err := r.resolveTemplateID(ctx, r.cfg.nodepoolTemplate)
+		if err != nil {
+			return fmt.Errorf("resolve nodepool template %q: %w", r.cfg.nodepoolTemplate, err)
+		}
+		opts.Labels = map[string]string{"cluster_template_id": tmplID}
+		tmplLabel = fmt.Sprintf(", cluster_template_id=%s (%s)", r.cfg.nodepoolTemplate, tmplID)
+	}
 	ng, err := nodegroups.Create(ctx, r.magnum, r.cfg.clusterName, opts).Extract()
 	if err != nil {
 		return fmt.Errorf("create nodepool %q: %w", r.nodepoolName(), err)
 	}
-	r.log("nodepool %q (uuid=%s, flavor=%q) creating with %d node(s)", ng.Name, ng.UUID, r.cfg.nodepoolFlavor, count)
+	r.log("nodepool %q (uuid=%s, flavor=%q%s) creating with %d node(s)", ng.Name, ng.UUID, r.cfg.nodepoolFlavor, tmplLabel, count)
 	return nil
 }
 

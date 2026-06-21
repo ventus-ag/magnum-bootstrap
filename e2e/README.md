@@ -260,6 +260,12 @@ failure are marked SKIP, not silently dropped). In GitHub Actions it also render
 on the run page via `$GITHUB_STEP_SUMMARY` and writes a JUnit `junit-<scenario>.xml`
 into the diagnostics artifact. `SCENARIO=all` adds a per-scenario roll-up.
 
+`SCENARIO=all` is a curated default sweep, not every named preset: `smoke`
+(single-master Fedora), `multinode` (multi-master Fedora), `ubuntu-upgrade`,
+`ubuntu-nodepool`, then `version-ladder`. Focused presets such as
+`chained-single`, `chained-multinode`, and `component-toggle` remain dispatchable
+for manual/debug runs; their coverage is folded into the default Fedora chains.
+
 **cloud-integration (`cloud-smoke`)** now proves the *datapath*, not just
 provisioning: an **nginx** pod mounts the PVC behind a LoadBalancer Service, and
 it asserts (1) the Cinder CSI PVC **binds**, (2) the OCCM/Octavia LoadBalancer
@@ -297,8 +303,7 @@ SCENARIO=version-ladder CLUSTER_TEMPLATE=v1.28.4 \
 Each rung is its own version-pinned template (Magnum upgrade targets a template,
 version baked into `kube_tag`). The jumps are intentionally multi-minor (e.g.
 1.23→1.28) to stress the reconciler's binary-swap upgrade — non-standard for
-kubeadm. It is shape 1m/1w and stays out of `SCENARIO=all` (runtime, not cost —
-we run our own cloud).
+kubeadm. It is shape 1m/1w and remains in `SCENARIO=all`, running last.
 
 > **Reconciler binary delivery.** The node launcher skips entirely unless *both*
 > `reconciler_version` and `reconciler_binary_url` resolve. `-bootstrap-binary`

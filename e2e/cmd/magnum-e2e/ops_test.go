@@ -142,8 +142,8 @@ func TestScenariosParse(t *testing.T) {
 			t.Errorf("scenario %q bad shape %d/%d", name, sc.masters, sc.workers)
 		}
 	}
-	// chained scenarios must contain the user-requested wedge sequence.
-	for _, name := range []string{"chained-single", "chained-multinode"} {
+	// Chained/fused Fedora scenarios must contain the repeated-op wedge sequence.
+	for _, name := range []string{"chained-single", "chained-multinode", "smoke", "multinode"} {
 		ops, err := parseOps(scenarios[name].ops)
 		if err != nil {
 			t.Fatal(err)
@@ -163,29 +163,74 @@ func TestScenariosParse(t *testing.T) {
 	}
 }
 
-// TestAllScenariosCoverMap ensures the "all" meta-scenario runs exactly the
-// scenarios defined in the catalog (no preset silently dropped, no dangling
-// name).
-func TestAllScenariosCoverMap(t *testing.T) {
-	// Every all-scenario is either a scenarios-map preset or the generated
-	// version-ladder (the one entry whose chain is built from the ladder, not a
-	// fixed preset). Exactly one ladder entry is expected.
-	ladders := 0
+func TestAllScenariosDefaultSweep(t *testing.T) {
+	want := []string{"smoke", "multinode", "ubuntu-upgrade", "ubuntu-nodepool", ladderScenario}
+	if len(allScenarios) != len(want) {
+		t.Fatalf("allScenarios has %d entries, want %d (%v)", len(allScenarios), len(want), want)
+	}
+	for i, scn := range want {
+		if allScenarios[i] != scn {
+			t.Fatalf("allScenarios[%d] = %q, want %q (full list: %v)", i, allScenarios[i], scn, allScenarios)
+		}
+	}
 	for _, scn := range allScenarios {
 		if scn == ladderScenario {
-			ladders++
 			continue
 		}
 		if _, ok := scenarios[scn]; !ok {
 			t.Errorf("allScenarios entry %q not in scenarios map and is not the ladder scenario", scn)
 		}
 	}
-	if ladders != 1 {
-		t.Fatalf("expected exactly 1 version-ladder entry in allScenarios, got %d", ladders)
+}
+
+func TestDefaultAllCoverage(t *testing.T) {
+	smoke := scenarios["smoke"]
+	if smoke.masters != 1 || smoke.workers != 1 {
+		t.Fatalf("smoke shape = %dm/%dw, want 1m/1w", smoke.masters, smoke.workers)
 	}
-	// Every map preset is part of the all-sweep.
-	if len(allScenarios) != len(scenarios)+ladders {
-		t.Fatalf("allScenarios has %d entries; want %d map presets + %d ladder", len(allScenarios), len(scenarios), ladders)
+	assertOpsContain(t, "smoke", smoke.ops, "disable-autoscaler", "enable-metrics-server", "resize-workers", "cloud-smoke", "post-rotate")
+	assertMinOpCount(t, "smoke", smoke.ops, "upgrade", 3)
+	assertMinOpCount(t, "smoke", smoke.ops, "ca-rotate", 3)
+
+	multinode := scenarios["multinode"]
+	if multinode.masters != 3 || multinode.workers != 2 {
+		t.Fatalf("multinode shape = %dm/%dw, want 3m/2w", multinode.masters, multinode.workers)
+	}
+	assertOpsContain(t, "multinode", multinode.ops, "add-nodepool", "resize-workers", "resize-nodepool", "del-nodepool", "post-rotate")
+	assertMinOpCount(t, "multinode", multinode.ops, "upgrade", 3)
+	assertMinOpCount(t, "multinode", multinode.ops, "ca-rotate", 3)
+
+	assertOpsContain(t, "ubuntu-upgrade", scenarios["ubuntu-upgrade"].ops, "upgrade", "cloud-smoke")
+	assertOpsContain(t, "ubuntu-nodepool", scenarios["ubuntu-nodepool"].ops, "add-nodepool", "resize-nodepool", "del-nodepool")
+}
+
+func assertOpsContain(t *testing.T, scenario, raw string, names ...string) {
+	t.Helper()
+	ops, err := parseOps(raw)
+	if err != nil {
+		t.Fatalf("scenario %q ops %q: %v", scenario, raw, err)
+	}
+	for _, name := range names {
+		if !opsContain(ops, name) {
+			t.Errorf("scenario %q missing op %q in %s", scenario, name, raw)
+		}
+	}
+}
+
+func assertMinOpCount(t *testing.T, scenario, raw, name string, want int) {
+	t.Helper()
+	ops, err := parseOps(raw)
+	if err != nil {
+		t.Fatalf("scenario %q ops %q: %v", scenario, raw, err)
+	}
+	got := 0
+	for _, o := range ops {
+		if o.name == name {
+			got++
+		}
+	}
+	if got < want {
+		t.Errorf("scenario %q has %d %q ops, want >=%d (%s)", scenario, got, name, want, raw)
 	}
 }
 

@@ -53,13 +53,17 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	changes := make([]host.Change, 0)
 
-	// /var/usrlocal is the Fedora CoreOS symlink target for /usr/local. The client
-	// binaries below install to /usr/local/bin/{kubelet,kubectl,helm}; os.MkdirAll
-	// of that parent only succeeds when /var/usrlocal already exists (a dangling
-	// symlink is not a directory). This module can run concurrently with
-	// container-runtime, so ensure the target here too rather than relying on the
-	// node image or another module to have created it.
-	for _, dir := range []string{"/var/usrlocal", "/srv/magnum/bin", "/srv/magnum/k8s", moduleStateDir(req)} {
+	// The client binaries below install to /usr/local/bin/{kubelet,kubectl,helm}.
+	// On Fedora CoreOS /usr/local is a symlink to /var/usrlocal, so os.MkdirAll of
+	// that parent only succeeds when /var/usrlocal already exists (a dangling
+	// symlink is not a directory) — and this module can run concurrently with
+	// container-runtime, so we ensure the target here too. Ubuntu has a real
+	// writable /usr/local and no /var/usrlocal, so creating it there is skipped.
+	dirs := []string{"/srv/magnum/bin", "/srv/magnum/k8s", moduleStateDir(req)}
+	if cfg.IsFCoS() {
+		dirs = append([]string{"/var/usrlocal"}, dirs...)
+	}
+	for _, dir := range dirs {
 		result, err := (hostresource.DirectorySpec{Path: dir, Mode: 0o755}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err

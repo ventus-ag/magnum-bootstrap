@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       scenario:
-        description: "Scenario: all (every scenario sequentially) | smoke | multinode | chained-single | chained-multinode | version-ladder"
+        description: "Scenario: all (curated default sweep) | smoke | multinode | chained-single | chained-multinode | ubuntu-upgrade | ubuntu-nodepool | component-toggle | version-ladder"
         type: string
         default: all
       ops:
@@ -60,7 +60,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: Scenario to run (all = every scenario, one by one, in this run)
+        description: Scenario to run (all = curated default sweep, one cluster at a time)
         type: choice
         default: all
         options:
@@ -69,6 +69,9 @@ on:
           - multinode
           - chained-single
           - chained-multinode
+          - ubuntu-upgrade
+          - ubuntu-nodepool
+          - component-toggle
           - version-ladder
       ops:
         description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
@@ -94,8 +97,8 @@ on:
         description: Skip the post-rotation add-node + SA-consistency check (legacy)
         type: boolean
         default: false
-  # Weekly full sweep. Scheduled events carry NO inputs, so the env block below
-  # falls back to SCENARIO=all (every scenario incl. the version-ladder walk).
+  # Weekly default sweep. Scheduled events carry NO inputs, so the env block below
+  # falls back to SCENARIO=all (curated sweep incl. the version-ladder walk).
   # Sunday 02:17 UTC — off-peak, off-minute; the ~multi-hour run finishes well
   # inside timeout-minutes before the work week. Only fires on the default branch.
   schedule:
@@ -115,9 +118,9 @@ jobs:
   e2e-openstack:
     name: e2e-openstack
     runs-on: self-hosted
-    # The "all" sweep now includes the full version-ladder walk (create@1.20 +
-    # 7 rungs × upgrade/cloud-smoke/autoscale) on top of the other scenarios, so
-    # it can run several hours. Override GitHub's 6h default with a generous cap.
+    # The "all" sweep includes the full version-ladder walk (create@1.20 + 7
+    # rungs × upgrade/cloud-smoke/autoscale) after the shorter default scenarios,
+    # so it can run several hours. Override GitHub's 6h default with a generous cap.
     timeout-minutes: 720
     # Standard OpenStack RC env, shared by the run and teardown steps. The tool's
     # own auth reader honours the full split-domain RC (OS_USER_DOMAIN_* vs
