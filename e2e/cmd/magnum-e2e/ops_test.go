@@ -393,3 +393,32 @@ func TestRetryableMutationErr(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDfTotalBytes(t *testing.T) {
+	// busybox `df -Pk /data` on a ~2Gi ext4 volume (header + one data line; -P
+	// guarantees the fs is on a single line).
+	out := "Filesystem           1024-blocks      Used Available Capacity Mounted on\n" +
+		"/dev/vdb                 2031440      3072   2012984       0% /data"
+	got, err := parseDfTotalBytes(out)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if want := int64(2031440) * 1024; got != want {
+		t.Fatalf("total = %d, want %d", got, want)
+	}
+	// A ~2Gi fs must clear the 0.75×2Gi gate; the original ~1Gi must not.
+	min := (int64(2) << 30) * 3 / 4
+	if got < min {
+		t.Fatalf("2Gi fs (%d) should clear gate %d", got, min)
+	}
+	oneGi, _ := parseDfTotalBytes("hdr\n/dev/vdb 999320 1 999319 1% /data")
+	if oneGi >= min {
+		t.Fatalf("1Gi fs (%d) must NOT clear gate %d", oneGi, min)
+	}
+
+	for _, bad := range []string{"", "only-header-line", "fs\nbadfield notanumber"} {
+		if _, err := parseDfTotalBytes(bad); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
+	}
+}

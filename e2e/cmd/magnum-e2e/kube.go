@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 // k8sClient builds an admin kubernetes client for the live cluster the same way
@@ -37,23 +41,30 @@ import (
 // rest.Config. It is rebuilt on every call so a post-rotation smoke uses the
 // freshly rotated CA + a freshly signed leaf.
 func (r *runner) k8sClient(ctx context.Context) (*kubernetes.Clientset, error) {
+	kc, _, err := r.k8sClientWithConfig(ctx)
+	return kc, err
+}
+
+// k8sClientWithConfig is like k8sClient but also returns the rest.Config, which
+// pod exec (remotecommand, used by the in-pod filesystem check) needs.
+func (r *runner) k8sClientWithConfig(ctx context.Context) (*kubernetes.Clientset, *rest.Config, error) {
 	c, err := clusters.Get(ctx, r.magnum, r.cfg.clusterName).Extract()
 	if err != nil {
-		return nil, fmt.Errorf("get cluster: %w", err)
+		return nil, nil, fmt.Errorf("get cluster: %w", err)
 	}
 	if c.APIAddress == "" {
-		return nil, fmt.Errorf("cluster has no api_address yet")
+		return nil, nil, fmt.Errorf("cluster has no api_address yet")
 	}
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("generate client key: %w", err)
+		return nil, nil, fmt.Errorf("generate client key: %w", err)
 	}
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
 		Subject: pkix.Name{CommonName: "admin", Organization: []string{"system:masters"}},
 	}, key)
 	if err != nil {
-		return nil, fmt.Errorf("create CSR: %w", err)
+		return nil, nil, fmt.Errorf("create CSR: %w", err)
 	}
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
 
@@ -62,11 +73,11 @@ func (r *runner) k8sClient(ctx context.Context) (*kubernetes.Clientset, error) {
 		CSR:         string(csrPEM),
 	}).Extract()
 	if err != nil {
-		return nil, fmt.Errorf("sign client CSR: %w", err)
+		return nil, nil, fmt.Errorf("sign client CSR: %w", err)
 	}
 	ca, err := certificates.Get(ctx, r.magnum, c.UUID).Extract()
 	if err != nil {
-		return nil, fmt.Errorf("fetch cluster CA: %w", err)
+		return nil, nil, fmt.Errorf("fetch cluster CA: %w", err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
@@ -79,7 +90,11 @@ func (r *runner) k8sClient(ctx context.Context) (*kubernetes.Clientset, error) {
 		},
 		Timeout: 30 * time.Second,
 	}
-	return kubernetes.NewForConfig(cfg)
+	kc, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kc, cfg, nil
 }
 
 // smokeCore waits until every node is Ready and prints the kube-system pods.
@@ -157,9 +172,11 @@ func (r *runner) dumpPods(ns string, pods []corev1.Pod) {
 
 // Smoke workload object names (shared across create, wait, resize, cleanup).
 const (
-	smokePVC    = "e2e-pvc"
-	smokeDeploy = "e2e-web"
-	smokeSvc    = "e2e-lb"
+	smokePVC       = "e2e-pvc"
+	smokeDeploy    = "e2e-web"
+	smokeSvc       = "e2e-lb"
+	smokeContainer = "nginx"
+	smokeMountPath = "/data"
 )
 
 // smokeCloudIntegration is the payoff of the real-OpenStack tier: it proves the
@@ -171,7 +188,7 @@ const (
 //	PVC(1Gi) -> nginx Deployment mounts it -> LB Service -> bound? -> LB IP? ->
 //	LB serves 200? -> resize PVC to 2Gi -> status.capacity reaches 2Gi? -> cleanup
 func (r *runner) smokeCloudIntegration(ctx context.Context) error {
-	kc, err := r.k8sClient(ctx)
+	kc, restCfg, err := r.k8sClientWithConfig(ctx)
 	if err != nil {
 		return err
 	}
@@ -221,7 +238,7 @@ func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 	r.log("OCCM LoadBalancer serves HTTP 200 at %s ✅", ip)
 
 	// --- Cinder CSI online volume expansion: 1Gi -> 2Gi. ---
-	if err := r.resizePVC(ctx, kc); err != nil {
+	if err := r.resizePVC(ctx, kc, restCfg); err != nil {
 		return err
 	}
 	return nil
@@ -260,10 +277,10 @@ func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset)
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": smokeDeploy}},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:         "nginx",
+						Name:         smokeContainer,
 						Image:        "nginx:1.27-alpine",
 						Ports:        []corev1.ContainerPort{{ContainerPort: 80}},
-						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: smokeMountPath}},
 					}},
 					Volumes: []corev1.Volume{{
 						Name: "data",
@@ -343,12 +360,13 @@ func (r *runner) waitLBServes(ctx context.Context, ip string) error {
 }
 
 // resizePVC exercises Cinder CSI online volume expansion: it grows the e2e PVC
-// from 1Gi to 2Gi (get-modify-update on spec.resources.requests.storage) and
-// waits for status.capacity to actually reach 2Gi. Because the PVC is mounted by
-// the nginx pod this is an online expansion (ControllerExpand + NodeExpand) that
-// updates status.capacity. A StorageClass without AllowVolumeExpansion would
-// never converge, so that is checked first with a clear failure message.
-func (r *runner) resizePVC(ctx context.Context, kc *kubernetes.Clientset) error {
+// from 1Gi to 2Gi (get-modify-update on spec.resources.requests.storage), waits
+// for status.capacity to actually reach 2Gi, then verifies the in-pod filesystem
+// grew too. Because the PVC is mounted by the nginx pod this is an online
+// expansion (ControllerExpand + NodeExpand) that updates status.capacity. A
+// StorageClass without AllowVolumeExpansion would never converge, so that is
+// checked first with a clear failure message.
+func (r *runner) resizePVC(ctx context.Context, kc *kubernetes.Clientset, restCfg *rest.Config) error {
 	if err := r.ensureExpandableDefaultSC(ctx, kc); err != nil {
 		return err
 	}
@@ -373,8 +391,12 @@ func (r *runner) resizePVC(ctx context.Context, kc *kubernetes.Clientset) error 
 			if got, ok := cur.Status.Capacity[corev1.ResourceStorage]; ok {
 				lastCap = got.String()
 				if got.Cmp(wantQ) >= 0 {
-					r.log("Cinder CSI PVC resized to %s ✅", lastCap)
-					return nil
+					r.log("Cinder CSI PVC %s status.capacity = %s ✅", smokePVC, lastCap)
+					// status.capacity on a mounted Filesystem PVC only advances
+					// after kubelet's NodeExpand grows the in-pod filesystem;
+					// verify the container actually sees the bigger disk (hard
+					// proof, not just the PVC object's reported capacity).
+					return r.verifyPodFilesystemGrew(ctx, kc, restCfg, wantQ)
 				}
 			}
 		}
@@ -387,6 +409,95 @@ func (r *runner) resizePVC(ctx context.Context, kc *kubernetes.Clientset) error 
 		case <-time.After(10 * time.Second):
 		}
 	}
+}
+
+// verifyPodFilesystemGrew execs `df` inside the smoke nginx pod and asserts the
+// mounted /data filesystem actually grew to ~the resized size. This proves the
+// kubelet NodeExpand resized the in-pod filesystem (the application sees the
+// space), not merely that the PVC object's status.capacity advanced.
+func (r *runner) verifyPodFilesystemGrew(ctx context.Context, kc *kubernetes.Clientset, restCfg *rest.Config, want resource.Quantity) error {
+	pod, err := r.runningSmokePod(ctx, kc)
+	if err != nil {
+		return err
+	}
+	// 75% of the requested size absorbs filesystem reserved blocks/overhead while
+	// still cleanly distinguishing the 2Gi volume from the original 1Gi.
+	minBytes := want.Value() * 3 / 4
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastBytes int64
+	for {
+		out, eerr := r.execInPod(ctx, kc, restCfg, pod, smokeContainer, []string{"df", "-Pk", smokeMountPath})
+		if eerr == nil {
+			if b, perr := parseDfTotalBytes(out); perr == nil {
+				lastBytes = b
+				if b >= minBytes {
+					r.log("in-pod %s filesystem = %d MiB (≥ %d MiB) ✅", smokeMountPath, b>>20, minBytes>>20)
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("in-pod %s filesystem is %d MiB after resize (want ≥ %d MiB) — NodeExpand did not grow the container filesystem", smokeMountPath, lastBytes>>20, minBytes>>20)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// runningSmokePod returns the name of a Running pod of the smoke deployment.
+func (r *runner) runningSmokePod(ctx context.Context, kc *kubernetes.Clientset) (string, error) {
+	pods, err := kc.CoreV1().Pods("default").List(ctx, metav1.ListOptions{LabelSelector: "app=" + smokeDeploy})
+	if err != nil {
+		return "", fmt.Errorf("list smoke pods: %w", err)
+	}
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodRunning {
+			return p.Name, nil
+		}
+	}
+	return "", fmt.Errorf("no running %s pod for in-pod filesystem check", smokeDeploy)
+}
+
+// execInPod runs cmd in a pod container and returns its stdout (SPDY exec).
+func (r *runner) execInPod(ctx context.Context, kc *kubernetes.Clientset, restCfg *rest.Config, pod, container string, cmd []string) (string, error) {
+	req := kc.CoreV1().RESTClient().Post().
+		Resource("pods").Name(pod).Namespace("default").SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: container,
+			Command:   cmd,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+	exec, err := remotecommand.NewSPDYExecutor(restCfg, "POST", req.URL())
+	if err != nil {
+		return "", fmt.Errorf("init pod exec: %w", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr}); err != nil {
+		return "", fmt.Errorf("exec %v in %s: %w (stderr: %s)", cmd, pod, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+// parseDfTotalBytes parses `df -Pk` output and returns the filesystem total in
+// bytes (the 1024-blocks column × 1024). -P guarantees exactly one line per fs.
+func parseDfTotalBytes(out string) (int64, error) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("unexpected df output: %q", out)
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("cannot parse df data line: %q", lines[len(lines)-1])
+	}
+	kb, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse df 1024-blocks %q: %w", fields[1], err)
+	}
+	return kb * 1024, nil
 }
 
 // ensureExpandableDefaultSC verifies the cluster's default StorageClass allows

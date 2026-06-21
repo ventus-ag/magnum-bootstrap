@@ -544,7 +544,11 @@ LoadBalancer Service; it asserts the PVC **binds**, the LB **serves HTTP 200**
 (`waitLBServes`, real GET to the Octavia VIP), then **resizes** the PVC 1Gi→2Gi
 and waits for `status.capacity` to converge (`resizePVC`, online expansion —
 needs the mount; `ensureExpandableDefaultSC` fails fast if the default
-StorageClass forbids expansion). Runs in every scenario's create + ladder rung.
+StorageClass forbids expansion). It then **execs `df` inside the nginx pod**
+(`verifyPodFilesystemGrew` via SPDY `remotecommand`) and asserts the mounted
+`/data` filesystem actually grew (≥0.75× the new size) — hard proof NodeExpand
+resized the container filesystem, not just the PVC object's capacity. Runs in
+every scenario's create + ladder rung.
 
 **`autoscale` op (`autoscale.go`).** Proves the cluster-autoscaler scales the
 worker nodegroup UP past 2 then back DOWN. If the chain contains `autoscale`,

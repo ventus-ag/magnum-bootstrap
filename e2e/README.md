@@ -264,8 +264,10 @@ into the diagnostics artifact. `SCENARIO=all` adds a per-scenario roll-up.
 provisioning: an **nginx** pod mounts the PVC behind a LoadBalancer Service, and
 it asserts (1) the Cinder CSI PVC **binds**, (2) the OCCM/Octavia LoadBalancer
 **serves HTTP 200** (a real GET to the external VIP), (3) the PVC **resizes**
-1Gi→2Gi online (`status.capacity` converges), then cleans up. Run after create
-and at every `cloud-smoke` op.
+1Gi→2Gi online (`status.capacity` converges **and** `df` inside the nginx pod
+confirms the mounted `/data` filesystem actually grew — proving NodeExpand, not
+just the PVC object), then cleans up. Run after create and at every `cloud-smoke`
+op.
 
 **`autoscale` op** proves the cluster-autoscaler scales workers **up past 2** (a
 balloon Deployment with hostname anti-affinity forces pending pods) and back
