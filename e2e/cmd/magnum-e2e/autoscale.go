@@ -112,6 +112,18 @@ func (r *runner) autoscaleCycle(ctx context.Context) error {
 	}
 	r.log("autoscale: scaled UP to >2 workers ✅")
 
+	// Settle the scale-up's Heat update BEFORE removing the load. countReadyWorkers
+	// keys off k8s Node-Ready, which goes true while the autoscaler's scale-up Magnum
+	// resize is still UPDATE_IN_PROGRESS in Heat. If we delete the balloon now, the
+	// autoscaler's scale-down resize fires a NEW Heat update that preempts the
+	// in-flight one ("Stack UPDATE cancelled" → UPDATE_FAILED). The balloon still
+	// pins every worker, so nodes stay needed and the autoscaler can't scale down
+	// while we wait — settling here is safe and closes the overlap window.
+	if err := r.ensureSettled(ctx); err != nil {
+		r.deleteBalloon(ctx, kc)
+		return fmt.Errorf("settle after scale-up: %w", err)
+	}
+
 	// Scale DOWN: remove the load; idle workers are reclaimed. Count the worker
 	// nodegroup's desired size (authoritative) rather than k8s nodes, which lag on
 	// scaledown until the cloud-node-lifecycle controller deletes the Node object.
