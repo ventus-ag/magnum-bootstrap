@@ -193,9 +193,21 @@ func (r *runner) waitAutoscalerReady(ctx context.Context, kc *kubernetes.Clients
 
 // fastTimers are the short scale-down flags injected into the deployed autoscaler
 // so the scale-down phase completes in minutes instead of the ~10m chart defaults.
+//
+// scale-down-delay-after-delete is deliberately NOT short. It is a hard global
+// cooldown the autoscaler waits after any scale-down before the next one, so it
+// serializes the floor walk (e.g. 3→2→1 removes one node per resize). Each
+// resize is a full Magnum cluster stack-update; this autoscaler's Magnum provider
+// does NOT gate on the cluster being UPDATE_IN_PROGRESS, so if the next delete
+// fires before the previous resize's Heat update completes, Heat preempts the
+// in-flight update ("resources.kube_masters: Stack UPDATE cancelled" →
+// UPDATE_FAILED). Keeping this cooldown comfortably longer than a single-node
+// Heat removal (~1–3 min on the real cloud) guarantees each scale-down update
+// reaches UPDATE_COMPLETE before the next begins. unneeded-time stays short so
+// detection is still fast; the cooldown only paces the deletes.
 var fastTimers = map[string]string{
 	"scale-down-delay-after-add":     "20s",
-	"scale-down-delay-after-delete":  "10s",
+	"scale-down-delay-after-delete":  "4m",
 	"scale-down-delay-after-failure": "20s",
 	"scale-down-unneeded-time":       "20s",
 	"scan-interval":                  "10s",
