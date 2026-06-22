@@ -161,7 +161,7 @@ func loadConfig() config {
 	flag.StringVar(&c.nodepoolTemplate, "nodepool-template", envOr("NODEPOOL_TEMPLATE", ""), "cluster template (name or UUID) attached to the extra nodepool as a cluster_template_id label; same-OS, within ±1 minor of the cluster [NODEPOOL_TEMPLATE]")
 	flag.StringVar(&c.sshKeyPath, "ssh-key", envOr("SSH_PRIVATE_KEY", ""), "path to a private key for node-log SSH on failure; needed only with a named KEYPAIR (ephemeral keypair captures its own key) [SSH_PRIVATE_KEY]")
 	flag.StringVar(&c.sshUser, "ssh-user", envOr("SSH_USER", "core"), "SSH login user for node-log collection (Fedora CoreOS = core) [SSH_USER]")
-	flag.IntVar(&c.autoscaleMin, "autoscale-min", envIntOr("AUTOSCALE_MIN", 1), "cluster-autoscaler worker floor for the autoscale op (scale-down target) [AUTOSCALE_MIN]")
+	flag.IntVar(&c.autoscaleMin, "autoscale-min", envIntOr("AUTOSCALE_MIN", 2), "cluster-autoscaler worker floor for the autoscale op (scale-down target). Defaults to autoscale-max-1 so scale-down is a SINGLE node removal (one Magnum resize): a multi-node scale-down issues back-to-back resizes, and the reconciler's autoscaler-Helm re-apply on each resize reverts the fast-timer patch mid-walk, so the 2nd resize preempts the 1st's still-in-flight Heat update (\"Stack UPDATE cancelled\" -> UPDATE_FAILED) [AUTOSCALE_MIN]")
 	flag.IntVar(&c.autoscaleMax, "autoscale-max", envIntOr("AUTOSCALE_MAX", 3), "cluster-autoscaler worker ceiling for the autoscale op (scale-up target, must be >2) [AUTOSCALE_MAX]")
 
 	flag.Parse()

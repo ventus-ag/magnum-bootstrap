@@ -64,8 +64,14 @@ func (r *runner) enableAutoscalerLabels() {
 	add("auto_scaling_enabled", "true")
 	add("min_node_count", strconv.Itoa(r.cfg.autoscaleMin))
 	add("max_node_count", strconv.Itoa(r.cfg.autoscaleMax))
-	r.log("autoscale: enabling cluster-autoscaler at create (min=%d max=%d) — labels: %s",
-		r.cfg.autoscaleMin, r.cfg.autoscaleMax, r.cfg.extraLabels)
+	// Create with at least the autoscaler floor of workers. Otherwise the autoscaler
+	// scales the nodegroup up to min_node_count right after create, racing the
+	// create-nodecount verify (k8s nodes == nodegroup count).
+	if r.cfg.nodeCount < r.cfg.autoscaleMin {
+		r.cfg.nodeCount = r.cfg.autoscaleMin
+	}
+	r.log("autoscale: enabling cluster-autoscaler at create (min=%d max=%d, workers=%d) — labels: %s",
+		r.cfg.autoscaleMin, r.cfg.autoscaleMax, r.cfg.nodeCount, r.cfg.extraLabels)
 }
 
 // autoscaleCycle proves the cluster-autoscaler scales the worker nodegroup UP
@@ -194,20 +200,20 @@ func (r *runner) waitAutoscalerReady(ctx context.Context, kc *kubernetes.Clients
 // fastTimers are the short scale-down flags injected into the deployed autoscaler
 // so the scale-down phase completes in minutes instead of the ~10m chart defaults.
 //
-// scale-down-delay-after-delete is deliberately NOT short. It is a hard global
-// cooldown the autoscaler waits after any scale-down before the next one, so it
-// serializes the floor walk (e.g. 3→2→1 removes one node per resize). Each
-// resize is a full Magnum cluster stack-update; this autoscaler's Magnum provider
-// does NOT gate on the cluster being UPDATE_IN_PROGRESS, so if the next delete
-// fires before the previous resize's Heat update completes, Heat preempts the
-// in-flight update ("resources.kube_masters: Stack UPDATE cancelled" →
-// UPDATE_FAILED). Keeping this cooldown comfortably longer than a single-node
-// Heat removal (~1–3 min on the real cloud) guarantees each scale-down update
-// reaches UPDATE_COMPLETE before the next begins. unneeded-time stays short so
-// detection is still fast; the cooldown only paces the deletes.
+// NOTE on overlapping resizes: each autoscaler scale-down is a full Magnum cluster
+// stack-update, and this autoscaler's Magnum provider does NOT gate on the cluster
+// being UPDATE_IN_PROGRESS. So two back-to-back scale-down resizes (a multi-node
+// floor walk) can collide — the 2nd preempts the 1st's in-flight Heat update
+// ("Stack UPDATE cancelled" → UPDATE_FAILED). scale-down-delay-after-delete is a
+// global cooldown that would space them, BUT the reconciler re-applies the
+// autoscaler Helm release on every Heat resize, reverting this patch back to chart
+// defaults mid-walk — so the cooldown is only best-effort and cannot be relied on.
+// The actual guarantee that there is never a 2nd overlapping resize comes from the
+// op driving a SINGLE-NODE scale-down (autoscaleMin == autoscaleMax-1); see
+// autoscale-min. These timers just keep the single scale-down prompt.
 var fastTimers = map[string]string{
 	"scale-down-delay-after-add":     "20s",
-	"scale-down-delay-after-delete":  "4m",
+	"scale-down-delay-after-delete":  "20s",
 	"scale-down-delay-after-failure": "20s",
 	"scale-down-unneeded-time":       "20s",
 	"scan-interval":                  "10s",
