@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,35 @@ const refreshRetries = 2
 
 // refreshRetryDelay is the pause between refresh retry attempts.
 const refreshRetryDelay = 15 * time.Second
+
+// defaultRefreshTimeout bounds a single Pulumi refresh attempt. A refresh has no
+// natural deadline of its own, and during a create (or a rotation while the API
+// is down) the Kubernetes provider's Read calls can block on an unreachable API
+// server for the better part of an hour — long enough that the whole reconcile
+// budget is consumed and the killed refresh subprocess leaves a stale Pulumi
+// lock behind, wedging every subsequent run. Bounding each attempt lets a hung
+// refresh fall back to "continue without refresh" quickly (refresh only syncs
+// Pulumi-managed K8s/Helm state; host drift is still detected by module Run()).
+const defaultRefreshTimeout = 5 * time.Minute
+
+// refreshTimeoutEnv lets ops override the per-attempt refresh timeout (seconds).
+// 0 disables the bound (restores the old unbounded behavior).
+const refreshTimeoutEnv = "MAGNUM_RECONCILE_REFRESH_TIMEOUT_SECONDS"
+
+// resolveRefreshTimeout reads refreshTimeoutEnv (seconds), falling back to
+// defaultRefreshTimeout. A non-negative integer is required; anything else uses
+// the default. A value of 0 means "no per-attempt timeout".
+func resolveRefreshTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv(refreshTimeoutEnv))
+	if v == "" {
+		return defaultRefreshTimeout
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return defaultRefreshTimeout
+	}
+	return time.Duration(secs) * time.Second
+}
 
 func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
 	if parallelism < 1 {
@@ -143,6 +173,7 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			refreshOpts = append(refreshOpts, optrefresh.DebugLogging(*pulumiDebugOpts))
 		}
 
+		refreshTimeout := resolveRefreshTimeout()
 		var refreshRes auto.RefreshResult
 		var refreshErr error
 		for attempt := 0; attempt <= refreshRetries; attempt++ {
@@ -153,11 +184,26 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 				}
 				time.Sleep(refreshRetryDelay)
 			}
+			// Bound each attempt so a refresh that blocks on an unreachable API
+			// can't burn the whole reconcile budget (and leave a stale lock).
+			// The parent ctx is passed to runWithAutoCancel so its pulumi cancel
+			// still runs even after attemptCtx fires; only stack.Refresh uses the
+			// deadline-bounded attemptCtx.
+			attemptCtx := ctx
+			cancelAttempt := func() {}
+			if refreshTimeout > 0 {
+				attemptCtx, cancelAttempt = context.WithTimeout(ctx, refreshTimeout)
+			}
 			refreshRes, refreshErr = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "refresh", func() (auto.RefreshResult, error) {
-				return stack.Refresh(ctx, refreshOpts...)
+				return stack.Refresh(attemptCtx, refreshOpts...)
 			})
+			cancelAttempt()
 			if refreshErr == nil {
 				break
+			}
+			if refreshTimeout > 0 && attemptCtx.Err() != nil && ctx.Err() == nil && req.Logger != nil {
+				req.Logger.Warnf("pulumi refresh attempt timed out stack=%s timeout=%s",
+					cfg.StackName(), refreshTimeout)
 			}
 		}
 		stopHeartbeat()
@@ -260,7 +306,16 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			upRes, err = stack.Up(ctx, retryOpts...)
 			stopHeartbeat()
 		}
-		upRes, err = stack.Up(ctx, upOpts...)
+		// Wrap the initial up so a stale Pulumi lock (left by an earlier run
+		// whose process is now dead) is auto-cancelled and retried, instead of
+		// failing the reconcile. Without this, a run-once (refresh=false) that
+		// inherits a stale lock can never self-heal — it never reaches the
+		// refresh path's recovery — and every subsequent run wedges on the same
+		// lock. runWithAutoCancel only cancels when the lock owner pid is dead;
+		// a genuinely active run is left alone.
+		upRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "up", func() (auto.UpResult, error) {
+			return stack.Up(ctx, upOpts...)
+		})
 		stopHeartbeat()
 		if err != nil {
 			executor := host.NewExecutor(true, req.Logger)
