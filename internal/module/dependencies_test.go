@@ -64,10 +64,16 @@ func TestMasterDependencyContracts(t *testing.T) {
 	assertDependsOn(t, reconcilePlan, registry, "heat-container-agent", "start-services")
 	assertDependsOn(t, reconcilePlan, registry, "health", "services", "heat-container-agent", "proxy-env")
 	assertDependsOn(t, reconcilePlan, registry, "cluster-rbac", "health")
-	assertDependsOn(t, reconcilePlan, registry, "cluster-cleanup-deprecated", "cluster-rbac")
+	// Safe-migration ordering: the replacement Helm flannel installs BEFORE the
+	// legacy kube-system flannel is removed, so cluster-flannel sits between
+	// cluster-rbac and cluster-cleanup-deprecated (cleanup depends on flannel,
+	// not the reverse). This is what prevents the CNI-outage window.
+	assertDependsOn(t, reconcilePlan, registry, "cluster-flannel", "cluster-rbac")
+	assertDependsOn(t, reconcilePlan, registry, "cluster-cleanup-deprecated", "cluster-flannel", "cluster-rbac")
 
+	// cluster-flannel is intentionally NOT in this list: it is UPSTREAM of the
+	// cleanup phase, not downstream of it.
 	for _, addon := range []string{
-		"cluster-flannel",
 		"cluster-coredns",
 		"cluster-occm",
 		"cluster-cinder-csi",
