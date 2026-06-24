@@ -21,8 +21,9 @@ import (
 //   - K8s 1.32-1.34: containerd 2.1.x (officially supports 1.32-1.35)
 //   - K8s < 1.32: containerd 1.7.x LTS (officially supports through 1.35, LTS until Sep 2026)
 var containerdVersions = map[string]string{
-	"1.35": "2.2.2",
-	"1.32": "2.1.6",
+	"1.36": "2.3.2",
+	"1.35": "2.2.5",
+	"1.32": "2.1.9",
 	"1.31": "1.7.30",
 }
 

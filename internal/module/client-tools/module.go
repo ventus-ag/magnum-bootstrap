@@ -42,7 +42,7 @@ type installState struct {
 	HelmCopySHA256    string `json:"helmCopySha256"`
 }
 
-const helmVersion = "v3.20.2"
+const helmVersion = "v3.21.2"
 
 func (Module) PhaseID() string {
 	return "client-tools"
