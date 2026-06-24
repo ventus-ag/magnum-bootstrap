@@ -204,9 +204,6 @@ type SharedConfig struct {
 
 	// Post-install
 	PostInstallManifestURL string `json:"postInstallManifestUrl"`
-
-	// Master index (0 = first master, cluster addons only run on master-0)
-	MasterIndex int `json:"masterIndex"`
 }
 
 type MasterConfig struct {

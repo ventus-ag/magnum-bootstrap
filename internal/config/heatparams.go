@@ -117,7 +117,6 @@ func Load(path string) (Config, error) {
 			OSAutoUpgradeEnabled: parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
 
 			PostInstallManifestURL: raw["POST_INSTALL_MANIFEST_URL"],
-			MasterIndex:            parseInt(raw["MASTER_INDEX"]),
 		},
 		Trigger: TriggerConfig{
 			CARotationID: strings.TrimSpace(raw["CA_ROTATION_ID"]),

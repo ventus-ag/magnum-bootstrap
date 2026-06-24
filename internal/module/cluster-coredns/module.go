@@ -125,6 +125,36 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			"nodeSelector": map[string]interface{}{
 				"kubernetes.io/os": "linux",
 			},
+			// Soft pod anti-affinity so the 2 replicas spread across
+			// distinct nodes for HA (survive one node down), without
+			// wedging Pending on single-node clusters or when the HPA
+			// scales beyond the node count. Matches kubeadm's default.
+			"affinity": map[string]interface{}{
+				"podAntiAffinity": map[string]interface{}{
+					"preferredDuringSchedulingIgnoredDuringExecution": []interface{}{
+						map[string]interface{}{
+							"weight": 100,
+							"podAffinityTerm": map[string]interface{}{
+								"topologyKey": "kubernetes.io/hostname",
+								"labelSelector": map[string]interface{}{
+									"matchExpressions": []interface{}{
+										map[string]interface{}{
+											"key":      "app.kubernetes.io/name",
+											"operator": "In",
+											"values":   []interface{}{"coredns"},
+										},
+										map[string]interface{}{
+											"key":      "app.kubernetes.io/instance",
+											"operator": "In",
+											"values":   []interface{}{"coredns"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 			"securityContext": map[string]interface{}{
 				"capabilities": map[string]interface{}{
 					"add": []interface{}{"NET_BIND_SERVICE"},
