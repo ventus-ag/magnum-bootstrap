@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/buildinfo"
 )
 
 type Role string
@@ -287,6 +289,19 @@ func (c Config) StackName() string {
 		base = "unknown"
 	}
 	return "node-" + sanitizeIdentifier(base)
+}
+
+// EffectiveReconcilerVersion is the version recorded in state and the Pulumi
+// reconcilerVersion tag. The launcher now auto-upgrades to the latest release,
+// so RECONCILER_VERSION from heat-params is usually empty; prefer the version
+// embedded in this binary at build time (the truthful running version). Fall
+// back to the heat-params value for dev/test builds where buildinfo.Version is
+// the untagged "dev" sentinel.
+func (c Config) EffectiveReconcilerVersion() string {
+	if buildinfo.IsTaggedRelease() {
+		return buildinfo.Version
+	}
+	return c.Shared.ReconcilerVersion
 }
 
 func (c Config) GenerationToken() string {

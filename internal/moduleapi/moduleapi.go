@@ -183,7 +183,7 @@ func NewHeatParamsComponent(ctx *pulumi.Context, name string, cfg config.Config,
 		"noProxy":    pulumi.String(cfg.Shared.NoProxy),
 
 		// Reconciler metadata
-		"reconcilerVersion": pulumi.String(cfg.Shared.ReconcilerVersion),
+		"reconcilerVersion": pulumi.String(cfg.EffectiveReconcilerVersion()),
 
 		// Trigger tokens
 		"caRotationId": pulumi.String(cfg.Trigger.CARotationID),

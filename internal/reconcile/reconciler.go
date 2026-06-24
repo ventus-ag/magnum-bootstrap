@@ -58,7 +58,7 @@ const refreshRetryDelay = 15 * time.Second
 
 func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled bool, parallelism int, cfg config.Config, runtimePaths paths.Paths, reconcilePlan plan.Plan, req moduleapi.Request, eventCh chan<- events.EngineEvent) (result.Result, state.State, error) {
 	if parallelism < 1 {
-		parallelism = 10
+		parallelism = config.AutoParallelism()
 	}
 
 	metadata := pulumipkg.BuildMetadata(cfg, reconcilePlan, mode, diff, runtimePaths.HeatParamsFile)
@@ -811,7 +811,7 @@ func formatUpdateChangeSummary(summary *map[string]int) string {
 func attemptedState(cfg config.Config, req moduleapi.Request, reconcilePlan plan.Plan) state.State {
 	return state.State{
 		LastAttemptedGeneration:        cfg.GenerationToken(),
-		LastAttemptedReconcilerVersion: cfg.Shared.ReconcilerVersion,
+		LastAttemptedReconcilerVersion: cfg.EffectiveReconcilerVersion(),
 		LastKubeTag:                    cfg.Shared.KubeTag,
 		LastCARotationID:               effectiveCARotationStateID(cfg, req.PreviousCARotationID),
 		LastRole:                       cfg.Role().String(),
@@ -825,8 +825,8 @@ func successfulState(cfg config.Config, req moduleapi.Request, reconcilePlan pla
 	return state.State{
 		LastAttemptedGeneration:         cfg.GenerationToken(),
 		LastSuccessfulGeneration:        cfg.GenerationToken(),
-		LastAttemptedReconcilerVersion:  cfg.Shared.ReconcilerVersion,
-		LastSuccessfulReconcilerVersion: cfg.Shared.ReconcilerVersion,
+		LastAttemptedReconcilerVersion:  cfg.EffectiveReconcilerVersion(),
+		LastSuccessfulReconcilerVersion: cfg.EffectiveReconcilerVersion(),
 		LastKubeTag:                     cfg.Shared.KubeTag,
 		LastCARotationID:                effectiveCARotationStateID(cfg, req.PreviousCARotationID),
 		LastRole:                        cfg.Role().String(),

@@ -11,8 +11,6 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/plan"
 )
 
-const defaultPhaseParallelism = 10
-
 type phaseRunResult struct {
 	phaseID string
 	result  moduleapi.Result
@@ -31,7 +29,7 @@ type phaseRunHandler func(phase plan.Phase, mod module.Module, runResult phaseRu
 // the Pulumi DependsOn construction used for resource registration.
 func runPhaseDAG(ctx context.Context, phases []plan.Phase, registry map[string]module.Module, cfg config.Config, req moduleapi.Request, parallelism int, onPhaseDone phaseRunHandler) (map[string]phaseRunResult, error) {
 	if parallelism < 1 {
-		parallelism = defaultPhaseParallelism
+		parallelism = config.AutoParallelism()
 	}
 
 	phaseIndex := make(map[string]int, len(phases))

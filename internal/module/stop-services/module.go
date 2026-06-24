@@ -78,13 +78,17 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			if executor.SystemctlIsActive(svc) {
 				stopResult, _ := (hostresource.SystemdServiceSpec{Unit: svc, SkipIfMissing: true, Active: hostresource.BoolPtr(false)}).Apply(executor)
 				// Remove container and image so podman pulls fresh on restart.
+				// `-q` returns one ID per line; a service can have several
+				// (stale + current). Pass each as its own arg — feeding the whole
+				// newline-joined blob to podman rm/rmi yields
+				// `parsing reference "<id1>\n<id2>": invalid reference format`.
 				containerID, _ := executor.RunCapture("podman", "ps", "--filter", "name="+svc, "-a", "-q")
-				if containerID != "" {
-					_ = executor.Run("podman", "rm", containerID)
+				if ids := strings.Fields(containerID); len(ids) > 0 {
+					_ = executor.Run("podman", append([]string{"rm"}, ids...)...)
 				}
 				imageID, _ := executor.RunCapture("podman", "images", "--filter", "reference=*"+svc+"*", "-a", "-q")
-				if imageID != "" {
-					_ = executor.Run("podman", "rmi", imageID)
+				if ids := strings.Fields(imageID); len(ids) > 0 {
+					_ = executor.Run("podman", append([]string{"rmi"}, ids...)...)
 				}
 				changes = append(changes, stopResult.Changes...)
 				changes = append(changes, host.Change{Action: host.ActionOther, Summary: fmt.Sprintf("clean %s container/image", svc)})

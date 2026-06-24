@@ -120,7 +120,7 @@ func addRunFlags(cmd *cobra.Command, f *runFlags, refreshDefault bool) {
 	cmd.Flags().BoolVar(&f.allowPartial, "allow-partial", false, "allow missing phase implementations and run only implemented modules")
 	cmd.Flags().BoolVar(&f.refresh, "refresh", refreshDefault, "run pulumi refresh before preview or up to sync state with actual node state")
 	cmd.Flags().StringVar(&f.targetPhase, "target-phase", "", "run only the specified phase (empty means all phases in the plan)")
-	cmd.Flags().IntVar(&f.parallelism, "parallelism", 10, "maximum number of phases to execute in parallel")
+	cmd.Flags().IntVar(&f.parallelism, "parallelism", 0, "maximum number of phases/Pulumi operations to run in parallel (0 = auto-scale to host RAM and CPU)")
 	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
 	cmd.Flags().StringVar(&f.backendURL, "backend-url", "", "override Pulumi backend URL (default: $MAGNUM_PULUMI_BACKEND_URL or file:///var/lib/magnum/pulumi)")
 	cmd.Flags().StringVar(&f.heatParamsFile, "heat-params-file", "", "override heat-params file path (default: $MAGNUM_RECONCILE_HEAT_PARAMS_FILE or /etc/sysconfig/heat-params)")
@@ -388,6 +388,16 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	logger.Infof("recorded running state runStateFile=%s", runtimePaths.RunStateFile)
 
 	// previousState was already loaded above for Operation() detection.
+
+	// Resolve parallelism. 0 (the default) means auto-scale to host RAM/CPU so
+	// small nodes (2 GiB single-master) serialize the Pulumi/Helm work instead of
+	// OOM-killing the node mid-run, while large nodes stay fast.
+	if f.parallelism <= 0 {
+		f.parallelism = config.AutoParallelism()
+		logger.Infof("resolved parallelism=%d (auto)", f.parallelism)
+	} else {
+		logger.Infof("resolved parallelism=%d (explicit)", f.parallelism)
+	}
 
 	// Always stream Pulumi resource-level events so create/update/delete
 	// operations are visible. The --diff flag controls property-level diffs.

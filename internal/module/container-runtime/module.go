@@ -310,7 +310,13 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			return nil, false, err
 		}
 		changes = append(changes, dirResult.Changes...)
-		dropin := "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\n"
+		// TimeoutStartSec: containerd.service is Type=notify, so `systemctl start`
+		// waits for READY=1. On a small/loaded node, containerd's start-time
+		// snapshot/image recovery can exceed systemd's 90s default and the job
+		// fails ("Job for containerd.service failed because a timeout was
+		// exceeded") even though it would have come up — fail the whole upgrade.
+		// Give it generous headroom.
+		dropin := "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\nTimeoutStartSec=300\n"
 		fileResult, err := (hostresource.FileSpec{Path: dropinDir + "/10-exec-start.conf", Content: []byte(dropin), Mode: 0o644}).Apply(executor)
 		if err != nil {
 			return nil, false, err
@@ -723,7 +729,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				return nil, err
 			}
 			dropinOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dropinDirRes)
-			dropinRes, err := hostsdk.RegisterFileSpec(ctx, name+"-containerd-dropin", hostresource.FileSpec{Path: "/etc/systemd/system/containerd.service.d/10-exec-start.conf", Content: []byte("[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\n"), Mode: 0o644}, dropinOpts...)
+			dropinRes, err := hostsdk.RegisterFileSpec(ctx, name+"-containerd-dropin", hostresource.FileSpec{Path: "/etc/systemd/system/containerd.service.d/10-exec-start.conf", Content: []byte("[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd\nTimeoutStartSec=300\n"), Mode: 0o644}, dropinOpts...)
 			if err != nil {
 				return nil, err
 			}
