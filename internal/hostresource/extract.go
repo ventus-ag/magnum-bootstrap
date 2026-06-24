@@ -24,7 +24,12 @@ func (spec ExtractTarSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 	if spec.isSatisfied() {
 		return ApplyResult{}, nil
 	}
-	if err := executor.Run("tar", "--unlink-first", "-C", spec.Destination, "-xzf", spec.ArchivePath); err != nil {
+	// Plain extract: callers stage into a scratch dir and install the binary
+	// via an atomic CopySpec, so nothing here overwrites a live daemon binary.
+	// `--unlink-first` must NOT be used: archives carrying a directory member
+	// (e.g. helm's linux-amd64/) fail on re-extract over an existing non-empty
+	// dir with "Cannot unlink: Directory not empty".
+	if err := executor.Run("tar", "-C", spec.Destination, "-xzf", spec.ArchivePath); err != nil {
 		return ApplyResult{}, fmt.Errorf("extract tar %s: %w", spec.ArchivePath, err)
 	}
 	if spec.ChmodExecutables {

@@ -194,13 +194,32 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		changes = append(changes, usrLocalTarget.Changes...)
 
 		if useV2Layout {
-			// containerd 2.x: tarball has a bin/ directory; extract straight into
-			// the usr/local root (== /usr/local on both OSes).
+			// containerd 2.x: tarball has bin/ at the archive root. Unpack to a
+			// writable scratch dir, then copy into the usr/local root. This phase
+			// runs before stop-services, so the *running* containerd binary must be
+			// replaced atomically: a straight `tar -C usrLocalRoot` overwrite hits
+			// ETXTBSY ("text file busy"), and `tar --unlink-first` fails on the
+			// pre-existing non-empty bin/ directory ("Cannot unlink: Directory not
+			// empty"). `cp --remove-destination` unlinks each destination file first,
+			// so the new binary lands at the path while the old inode stays mapped
+			// for the live process — same approach as the 1.x path below.
+			scratch := "/srv/magnum/containerd-bundle"
+			if err := executor.Run("rm", "-rf", scratch); err != nil {
+				return nil, false, fmt.Errorf("clean containerd scratch dir: %w", err)
+			}
+			scratchDir, err := (hostresource.DirectorySpec{Path: scratch, Mode: 0o755}).Apply(executor)
+			if err != nil {
+				return nil, false, fmt.Errorf("create containerd scratch dir: %w", err)
+			}
+			changes = append(changes, scratchDir.Changes...)
 			if err := executor.Run("tar", "xzf", localPath,
-				"-C", usrLocalRoot,
-				"--no-same-owner", "--touch", "--no-same-permissions", "--unlink-first",
+				"-C", scratch,
+				"--no-same-owner", "--touch", "--no-same-permissions",
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
+			}
+			if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/.", usrLocalRoot); err != nil {
+				return nil, false, fmt.Errorf("install containerd files -> %s: %w", usrLocalRoot, err)
 			}
 		} else {
 			// containerd 1.x cri-containerd-cni bundle: unpack to a scratch dir on
