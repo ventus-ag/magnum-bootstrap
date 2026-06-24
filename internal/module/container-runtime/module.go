@@ -198,7 +198,7 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 			// the usr/local root (== /usr/local on both OSes).
 			if err := executor.Run("tar", "xzf", localPath,
 				"-C", usrLocalRoot,
-				"--no-same-owner", "--touch", "--no-same-permissions",
+				"--no-same-owner", "--touch", "--no-same-permissions", "--unlink-first",
 			); err != nil {
 				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
 			}
@@ -243,7 +243,10 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 					return nil, false, fmt.Errorf("ensure containerd install dir %s: %w", p.dst, err)
 				}
 				changes = append(changes, dstDir.Changes...)
-				if err := executor.Run("cp", "-a", scratch+"/"+p.tree+"/.", p.dst); err != nil {
+				// Existing containerd shim binaries may still be mapped by live
+				// processes after Docker/containerd is stopped. Unlink before copy so
+				// the old inode can remain executable while the new file lands at path.
+				if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/"+p.tree+"/.", p.dst); err != nil {
 					return nil, false, fmt.Errorf("install containerd files %s -> %s: %w", p.tree, p.dst, err)
 				}
 			}

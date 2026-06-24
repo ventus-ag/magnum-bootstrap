@@ -24,7 +24,7 @@ func (spec ExtractTarSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 	if spec.isSatisfied() {
 		return ApplyResult{}, nil
 	}
-	if err := executor.Run("tar", "-C", spec.Destination, "-xzf", spec.ArchivePath); err != nil {
+	if err := executor.Run("tar", "--unlink-first", "-C", spec.Destination, "-xzf", spec.ArchivePath); err != nil {
 		return ApplyResult{}, fmt.Errorf("extract tar %s: %w", spec.ArchivePath, err)
 	}
 	if spec.ChmodExecutables {

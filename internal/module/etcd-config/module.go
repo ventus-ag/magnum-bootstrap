@@ -436,13 +436,27 @@ func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, 
 		changes = append(changes, *dl.Change)
 	}
 
-	if dl.Changed && executor.Apply {
+	if executor.Apply {
 		tmpDir := etcdDir + "/tmp"
-		_ = executor.Run("mkdir", "-p", tmpDir)
-		_ = executor.Run("tar", "-C", tmpDir, "-xzf", tgzPath)
-		_ = executor.Run("cp", fmt.Sprintf("%s/etcd-v%s-linux-amd64/etcdctl", tmpDir, etcdVersion), "/usr/local/bin/")
-		_ = executor.Run("chmod", "+x", "/usr/local/bin/etcdctl")
+		if err := executor.Run("rm", "-rf", tmpDir); err != nil {
+			return nil, fmt.Errorf("clean etcdctl tmp dir: %w", err)
+		}
+		if err := executor.Run("mkdir", "-p", tmpDir); err != nil {
+			return nil, fmt.Errorf("create etcdctl tmp dir: %w", err)
+		}
+		if err := executor.Run("tar", "-C", tmpDir, "-xzf", tgzPath); err != nil {
+			return nil, fmt.Errorf("extract etcdctl: %w", err)
+		}
+		action := host.ActionReplace
+		if _, err := os.Stat("/usr/local/bin/etcdctl"); os.IsNotExist(err) {
+			action = host.ActionCreate
+		}
+		if err := host.CopyFileAtomic(fmt.Sprintf("%s/etcd-v%s-linux-amd64/etcdctl", tmpDir, etcdVersion), "/usr/local/bin/etcdctl", 0o755); err != nil {
+			return nil, fmt.Errorf("install etcdctl: %w", err)
+		}
 		_ = executor.Run("rm", "-rf", tmpDir)
+
+		changes = append(changes, host.Change{Action: action, Path: "/usr/local/bin/etcdctl", Summary: fmt.Sprintf("install etcdctl %s", etcdVersion)})
 	}
 
 	return changes, nil
