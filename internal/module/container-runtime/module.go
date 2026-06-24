@@ -39,6 +39,16 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
 
+	// Detect a genuine cgroup-driver FLIP before we overwrite the runtime config.
+	// ResolveCgroupDriver preserves the on-disk driver unless our app explicitly
+	// defines CGROUP_DRIVER, so a difference here means the operator asked to
+	// change it. A driver change must restart kubelet AND the runtime together,
+	// or they sit in a mismatched window where runc rejects every new pod sandbox
+	// (`expected cgroupsPath to be of format "slice:prefix:name"`).
+	priorCgroupDriver := config.ExistingCgroupDriver()
+	desiredCgroupDriver := cfg.ResolveCgroupDriver()
+	cgroupDriverFlipped := priorCgroupDriver != "" && !strings.EqualFold(priorCgroupDriver, desiredCgroupDriver)
+
 	configChanged := false
 	if cfg.Shared.ContainerRuntime == "containerd" {
 		cs, changed, err := reconcileContainerd(ctx, cfg, executor)
@@ -64,6 +74,18 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			req.Restarts.Add("containerd", "container-runtime config changed")
 		} else {
 			req.Restarts.Add("docker", "container-runtime config changed")
+		}
+	}
+
+	// On a genuine cgroup-driver flip, the runtime's config necessarily changed
+	// (handled above) — but kubelet must restart too so it emits cgroup paths in
+	// the SAME format the runtime now expects. kube-master-config also rewrites
+	// kubelet-config (which would trigger this), but signal it explicitly here so
+	// the flip is safe even if the kubelet config text is otherwise unchanged.
+	if cgroupDriverFlipped && req.Restarts != nil {
+		req.Restarts.Add("kubelet", "cgroup driver flip "+priorCgroupDriver+"->"+desiredCgroupDriver)
+		if req.Logger != nil {
+			req.Logger.Infof("container-runtime: cgroup driver flipping %s->%s; restarting kubelet with the runtime", priorCgroupDriver, desiredCgroupDriver)
 		}
 	}
 

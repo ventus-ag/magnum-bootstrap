@@ -346,7 +346,72 @@ func (c Config) ResolveCgroupDriver() string {
 	if c.Shared.CgroupDriver != "" {
 		return c.Shared.CgroupDriver
 	}
+	// Preserve the driver an EXISTING cluster already runs. The bootstrap
+	// heat-params do not carry CGROUP_DRIVER, so without this we would detect
+	// "systemd" on every cgroup-v2 node and silently FLIP a live cgroupfs
+	// cluster to systemd. That flip makes kubelet and containerd disagree
+	// during the reconcile window — runc then rejects every new pod sandbox
+	// with `expected cgroupsPath to be of format "slice:prefix:name" for
+	// systemd cgroups` — and churns every running pod on the node. cgroup
+	// driver is a node-local concern (kubelet and containerd on the SAME node
+	// must agree; different nodes may differ), so keeping what the node already
+	// uses is correct and non-disruptive. Only a genuinely fresh node (no
+	// existing kubelet/containerd config) falls through to the host default.
+	if existing := ExistingCgroupDriver(); existing != "" {
+		return existing
+	}
 	return detectCgroupDriver()
+}
+
+// ExistingCgroupDriver reads the cgroup driver already configured on the node,
+// preferring the kubelet config (authoritative for kubelet's runtime behavior)
+// and falling back to the containerd setting. Returns "" when neither exists
+// (a fresh node), so a new cluster still gets the detected default. Callers also
+// use it to detect a genuine driver FLIP (resolved value != on-disk value) so
+// they can restart kubelet alongside containerd.
+func ExistingCgroupDriver() string {
+	if d := cgroupDriverFromKubeletConfig("/etc/kubernetes/kubelet-config.yaml"); d != "" {
+		return d
+	}
+	return cgroupDriverFromContainerdConfig("/etc/containerd/config.toml")
+}
+
+func cgroupDriverFromKubeletConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "cgroupDriver:") {
+			continue
+		}
+		v := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "cgroupDriver:")), "\"'")
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func cgroupDriverFromContainerdConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		l := strings.TrimSpace(line)
+		if !strings.HasPrefix(l, "SystemdCgroup") {
+			continue
+		}
+		if strings.Contains(l, "true") {
+			return "systemd"
+		}
+		if strings.Contains(l, "false") {
+			return "cgroupfs"
+		}
+	}
+	return ""
 }
 
 func detectCgroupDriver() string {
