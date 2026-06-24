@@ -126,9 +126,17 @@ func loadPrivateKey(path string) (crypto.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read private key %s: %w", path, err)
 	}
+	key, err := loadPrivateKeyPEM(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, path)
+	}
+	return key, nil
+}
+
+func loadPrivateKeyPEM(data []byte) (crypto.PrivateKey, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
-		return nil, fmt.Errorf("invalid private key PEM %s", path)
+		return nil, fmt.Errorf("invalid private key PEM")
 	}
 
 	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
@@ -141,7 +149,23 @@ func loadPrivateKey(path string) (crypto.PrivateKey, error) {
 		return key, nil
 	}
 
-	return nil, fmt.Errorf("unsupported private key %s", path)
+	return nil, fmt.Errorf("unsupported private key")
+}
+
+// KeyPEMMatchesCertFile reports whether the PEM-encoded private key's public
+// half matches the public key in the certificate at certPath. Returns false if
+// either input cannot be read or parsed — callers treat false as "this key is
+// not provably the partner of that certificate, so do not install it".
+func KeyPEMMatchesCertFile(keyPEM []byte, certPath string) bool {
+	cert, err := loadCertificate(certPath)
+	if err != nil {
+		return false
+	}
+	key, err := loadPrivateKeyPEM(keyPEM)
+	if err != nil {
+		return false
+	}
+	return publicKeysMatch(cert.PublicKey, publicKey(key))
 }
 
 func publicKey(key crypto.PrivateKey) crypto.PublicKey {

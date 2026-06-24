@@ -276,13 +276,23 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 
 	var changes []host.Change
 
-	// Format only if not already xfs.
-	if executor.Apply {
-		fstype, _ := executor.RunCapture("blkid", "-s", "TYPE", "-o", "value", devicePath)
-		if strings.TrimSpace(fstype) != "xfs" {
-			_ = executor.Run("mkfs.xfs", "-f", devicePath)
-			changes = append(changes, host.Change{Action: host.ActionCreate, Path: devicePath, Summary: "format etcd volume as xfs"})
+	// Format ONLY a genuinely blank device. NEVER reformat a device that
+	// already carries a filesystem: on a pre-existing cluster this volume holds
+	// the live etcd member data (WAL + snapshots), and wiping it is total etcd
+	// data / quorum loss. The old `blkid != "xfs"` guard ignored blkid's error
+	// and force-formatted (`-f`) any non-xfs OR unreadable device. `lsblk
+	// FSTYPE` reliably reports the on-disk fs (empty == truly blank).
+	fstype, _ := executor.RunCapture("lsblk", "-ndo", "FSTYPE", devicePath)
+	fstype = strings.TrimSpace(fstype)
+	if fstype == "" {
+		if executor.Apply {
+			// No `-f`: let mkfs refuse if it detects a signature lsblk missed.
+			if err := executor.Run("mkfs.xfs", devicePath); err != nil {
+				return nil, fmt.Errorf("format blank etcd volume %s: %w", devicePath, err)
+			}
 		}
+		fstype = "xfs"
+		changes = append(changes, host.Change{Action: host.ActionCreate, Path: devicePath, Summary: fmt.Sprintf("format blank %s as xfs", devicePath)})
 	}
 
 	dirResult, err := (hostresource.DirectorySpec{Path: "/var/lib/etcd", Mode: 0o755}).Apply(executor)
@@ -291,7 +301,8 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	}
 	changes = append(changes, dirResult.Changes...)
 
-	fstabLine := fmt.Sprintf("%s /var/lib/etcd xfs defaults 0 0", devicePath)
+	// Use the actual on-disk fstype (an older cluster's etcd volume may be ext4).
+	fstabLine := fmt.Sprintf("%s /var/lib/etcd %s defaults 0 0", devicePath, fstype)
 	lineResult, err := (hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return nil, err

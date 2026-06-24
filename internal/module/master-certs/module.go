@@ -182,21 +182,27 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		changes = append(changes, certResult.Changes...)
 	}
 
-	// Write service account keys.
-	if cfg.Shared.KubeServiceAccountKey != "" {
-		fileResult, err := (hostresource.FileSpec{Path: certDir + "/service_account.key", Content: []byte(cfg.Shared.KubeServiceAccountKey + "\n"), Mode: 0o440}).Apply(executor)
-		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		changes = append(changes, fileResult.Changes...)
+	// Write service account signing keys — ONLY if absent. The SA keypair
+	// (service_account.key = public verify key for kube-apiserver,
+	// service_account_private.key = private signing key for
+	// kube-controller-manager) is established at cluster creation and must stay
+	// IDENTICAL across the cluster's entire life. Overwriting a live key with a
+	// stale or different heat-param value invalidates EVERY existing
+	// ServiceAccount token cluster-wide (all in-cluster API clients get 401
+	// until their pods restart). Once on disk the local key is authoritative; a
+	// genuinely fresh node (resize) has none and correctly seeds from
+	// heat-params. This is not a key we rotate here, so absent-only is safe for
+	// upgrade and CA rotation alike.
+	saChanges, err := writeSAKeyIfAbsent(executor, certDir+"/service_account.key", cfg.Shared.KubeServiceAccountKey)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
-	if cfg.Shared.KubeServiceAccountPrivateKey != "" {
-		fileResult, err := (hostresource.FileSpec{Path: certDir + "/service_account_private.key", Content: []byte(cfg.Shared.KubeServiceAccountPrivateKey + "\n"), Mode: 0o440}).Apply(executor)
-		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		changes = append(changes, fileResult.Changes...)
+	changes = append(changes, saChanges...)
+	saPrivChanges, err := writeSAKeyIfAbsent(executor, certDir+"/service_account_private.key", cfg.Shared.KubeServiceAccountPrivateKey)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
+	changes = append(changes, saPrivChanges...)
 
 	// Create etcd and kube users/groups and set permissions.
 	// useradd/groupadd/usermod may fail if the user/group already exists — log
@@ -269,6 +275,27 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		Changes: changes,
 		Outputs: map[string]string{"certDir": certDir},
 	}, nil
+}
+
+// writeSAKeyIfAbsent writes a service-account signing key from heat-params only
+// when the file does not already exist (or is empty). An existing non-empty key
+// is the cluster's live, authoritative SA material and is left untouched — see
+// the call site for why overwriting it is catastrophic.
+func writeSAKeyIfAbsent(executor *host.Executor, path, content string) ([]host.Change, error) {
+	if strings.TrimSpace(content) == "" {
+		return nil, nil
+	}
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		if executor.Logger != nil {
+			executor.Logger.Infof("master-certificates: %s present, preserving live service-account key (not overwriting from heat-params)", path)
+		}
+		return nil, nil
+	}
+	result, err := (hostresource.FileSpec{Path: path, Content: []byte(content + "\n"), Mode: 0o440}).Apply(executor)
+	if err != nil {
+		return nil, err
+	}
+	return result.Changes, nil
 }
 
 type sanSet struct {

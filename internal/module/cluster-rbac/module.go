@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"os"
+	"strings"
 
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
@@ -261,16 +262,31 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
-	// Secret: os-trustee
+	// Secret: os-trustee. os-certAuthority is the CA bundle OCCM / Cinder-CSI use
+	// to trust Keystone's TLS. NEVER overwrite an existing bundle with an empty
+	// value (e.g. local CA files transiently unreadable) — that breaks every
+	// OpenStack API call from the cloud controllers. Resolve from local files
+	// first; if unavailable, preserve whatever the live Secret already holds.
 	caBundle := ""
-	if data, err := os.ReadFile("/etc/kubernetes/ca-bundle.crt"); err == nil {
+	if data, err := os.ReadFile("/etc/kubernetes/ca-bundle.crt"); err == nil && len(data) > 0 {
 		caBundle = base64.StdEncoding.EncodeToString(data)
-	} else if data, err := os.ReadFile("/etc/kubernetes/certs/ca.crt"); err == nil {
+	} else if data, err := os.ReadFile("/etc/kubernetes/certs/ca.crt"); err == nil && len(data) > 0 {
 		// Fallback: use the cluster CA cert if the bundle is not yet available.
 		caBundle = base64.StdEncoding.EncodeToString(data)
 	}
-	// If both paths fail, continue with empty CA bundle — certs may not be
-	// generated yet during early cluster creation.
+	if caBundle == "" {
+		// Last resort: keep the bundle already stored in the live os-trustee
+		// Secret rather than clobbering it with empty. The Secret's .data value
+		// is already base64-encoded, so reuse it verbatim.
+		probe := host.NewExecutor(false, nil)
+		if existing, err := probe.RunCapture("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+			"get", "secret", "os-trustee", "-n", "kube-system",
+			"-o", "jsonpath={.data.os-certAuthority}"); err == nil {
+			caBundle = strings.TrimSpace(existing)
+		}
+	}
+	// If every source fails, continue with an empty CA bundle — certs may not be
+	// generated yet during very early cluster creation (no live Secret to harm).
 	_, err = corev1.NewSecret(ctx, name+"-os-trustee", &corev1.SecretArgs{
 		Metadata: mergeMetadata("os-trustee", "kube-system"),
 		StringData: pulumi.StringMap{

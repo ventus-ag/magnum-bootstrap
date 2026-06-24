@@ -16,8 +16,14 @@ type Resource struct {
 	pulumi.ResourceState
 }
 
-func (Module) PhaseID() string        { return "cluster-flannel" }
-func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
+func (Module) PhaseID() string { return "cluster-flannel" }
+
+// Depends on cluster-rbac (not cluster-cleanup-deprecated): the replacement
+// Helm flannel must be installed BEFORE the legacy kube-system flannel is
+// removed, so cluster-cleanup-deprecated now depends on THIS module and runs
+// after it. Reversing the old edge is what closes the CNI-outage window where
+// the legacy CNI was deleted before its replacement existed.
+func (Module) Dependencies() []string { return []string{"cluster-rbac"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	return clusterhelm.RunNoop(ctx, cfg, req, cfg.Shared.NetworkDriver == "flannel", "flannel", "kube-flannel")

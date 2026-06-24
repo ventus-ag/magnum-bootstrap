@@ -82,18 +82,37 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, dirResult.Changes...)
 
-	// Format only if not already xfs.
-	fstype, _ := executor.RunCapture("blkid", "-s", "TYPE", "-o", "value", devicePath)
-	if strings.TrimSpace(fstype) != "xfs" {
-		if err := executor.Run("mkfs.xfs", "-f", devicePath); err != nil {
-			return moduleapi.Result{}, fmt.Errorf("format storage volume: %w", err)
+	// Format ONLY a genuinely blank device. A populated volume — xfs from a
+	// prior run, or ext4/other from an older (e.g. Ussuri) cluster — must NEVER
+	// be reformatted: /var/lib/containerd holds the live container image store,
+	// and wiping it leaves containerd's metadata referencing missing content
+	// ("blob not found" on every new pod sandbox; only already-running
+	// containers survive, until they restart).
+	//
+	// The previous guard `blkid TYPE != "xfs"` was unsafe: blkid's error was
+	// ignored, so a transient failure (empty output) OR a perfectly good
+	// non-xfs volume both fell through to a destructive `mkfs.xfs -f`. `lsblk
+	// FSTYPE` reliably reports the on-disk filesystem (empty == truly blank),
+	// regardless of mount state.
+	fstype, _ := executor.RunCapture("lsblk", "-ndo", "FSTYPE", devicePath)
+	fstype = strings.TrimSpace(fstype)
+	formatted := false
+	if fstype == "" {
+		// No filesystem signature → safe to create one. No `-f`: let mkfs
+		// refuse if it detects a signature lsblk somehow missed (defence in
+		// depth — fail loudly rather than destroy data).
+		if err := executor.Run("mkfs.xfs", devicePath); err != nil {
+			return moduleapi.Result{}, fmt.Errorf("format blank storage volume %s: %w", devicePath, err)
 		}
+		fstype = "xfs"
+		formatted = true
 		changes = append(changes, host.Change{Action: host.ActionCreate, Path: devicePath,
-			Summary: fmt.Sprintf("format %s as xfs", devicePath)})
+			Summary: fmt.Sprintf("format blank %s as xfs", devicePath)})
 	}
 
-	// Ensure fstab entry.
-	fstabLine := fmt.Sprintf("%s %s xfs defaults 0 0", devicePath, storageDir)
+	// Ensure fstab entry. Use the actual on-disk fstype (an older cluster's
+	// volume may be ext4), not a hardcoded "xfs" that would fail to mount it.
+	fstabLine := fmt.Sprintf("%s %s %s defaults 0 0", devicePath, storageDir, fstype)
 	lineResult, err := (hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return moduleapi.Result{}, err
@@ -111,7 +130,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	// Restore SELinux context only if we just formatted — Fedora CoreOS only
 	// (Ubuntu uses AppArmor; restorecon is absent / a no-op there).
-	if cfg.IsFCoS() && strings.TrimSpace(fstype) != "xfs" {
+	if cfg.IsFCoS() && formatted {
 		_ = executor.Run("restorecon", "-R", storageDir)
 	}
 
