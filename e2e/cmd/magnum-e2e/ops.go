@@ -222,11 +222,12 @@ const ladderScenario = "version-ladder"
 // is CREATEd at rung[0] and upgraded through each subsequent rung, re-running the
 // cloud-controller smoke (LB serves traffic + Cinder PVC resize) at every step.
 // Each entry is a version-pinned Magnum cluster-template name (kube_tag baked in);
-// all eight exist on the ventus cloud (Upper-Austria-M1). The jumps are
+// all nine exist on the ventus cloud (Upper-Austria-M1). The jumps are
 // deliberately multi-minor (e.g. 1.23→1.28) to stress aggressive upgrades.
 var defaultVersionLadder = []string{
 	"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10",
 	"v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3",
+	"v1.36.2",
 }
 
 // climbLadder is the per-upgrade target ladder shared by the lifecycle scenarios

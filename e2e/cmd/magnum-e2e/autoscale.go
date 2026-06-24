@@ -23,7 +23,7 @@ const (
 )
 
 // controlPlaneLabels mark a control-plane node. Both keys are checked because the
-// label was renamed master→control-plane at k8s 1.25 (the ladder spans 1.20→1.35),
+// label was renamed master→control-plane at k8s 1.25 (the ladder spans 1.20→1.36),
 // and Magnum control-plane nodes are frequently schedulable (untainted), so a
 // worker-only workload must explicitly exclude them — otherwise a balloon pod
 // lands on a master and the autoscaler under-scales the worker nodegroup.

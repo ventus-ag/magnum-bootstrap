@@ -151,7 +151,7 @@ jobs:
       CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
       UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
       # version-ladder upgrade walk (ordered template list). Empty => the driver's
-      # built-in 1.20→1.35 ladder (used when SCENARIO=version-ladder). Ignored by
+      # built-in 1.20→1.36 ladder (used when SCENARIO=version-ladder). Ignored by
       # other scenarios.
       UPGRADE_LADDER: ${{ vars.MAGNUM_UPGRADE_LADDER }}
       # KEYPAIR optional — the tool auto-creates an ephemeral keypair if unset.

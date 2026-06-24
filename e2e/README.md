@@ -290,7 +290,7 @@ on its own:
 ```bash
 # Built-in ladder (zero-config on the ventus cloud): create at v1.20.12, then
 #   upgrade → cloud-smoke → autoscale through v1.23.17, v1.28.4, v1.30.10,
-#   v1.32.2, v1.33.10, v1.34.6, v1.35.3 (7 multi-minor upgrades): nginx LB-serves
+#   v1.32.2, v1.33.10, v1.34.6, v1.35.3, v1.36.2 (8 multi-minor upgrades): nginx LB-serves
 #   + PVC-resize + autoscaler up>2/down each rung.
 SCENARIO=version-ladder BOOTSTRAP_BINARY=dist/bootstrap go run ./e2e/cmd/magnum-e2e
 

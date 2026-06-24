@@ -134,7 +134,7 @@ func loadConfig() config {
 	flag.StringVar(&c.clusterName, "cluster-name", defName, "cluster name [CLUSTER_NAME]")
 	flag.StringVar(&c.template, "template", envOr("CLUSTER_TEMPLATE", ""), "Magnum cluster template name or UUID [CLUSTER_TEMPLATE]")
 	flag.StringVar(&c.upgradeTemplate, "upgrade-template", envOr("UPGRADE_TEMPLATE", ""), "upgrade target template (default: same as -template) [UPGRADE_TEMPLATE]")
-	flag.StringVar(&c.upgradeLadder, "upgrade-ladder", envOr("UPGRADE_LADDER", ""), "ordered comma-separated upgrade-template ladder for the version-ladder scenario; empty + version-ladder = built-in 1.20→1.35 ladder [UPGRADE_LADDER]")
+	flag.StringVar(&c.upgradeLadder, "upgrade-ladder", envOr("UPGRADE_LADDER", ""), "ordered comma-separated upgrade-template ladder for the version-ladder scenario; empty + version-ladder = built-in 1.20→1.36 ladder [UPGRADE_LADDER]")
 	flag.StringVar(&c.keypair, "keypair", envOr("KEYPAIR", ""), "nova keypair name [KEYPAIR]")
 	flag.StringVar(&c.kubeTag, "kube-tag", envOr("KUBE_TAG", ""), "kube_tag label override; empty = inherit the template's own kube_tag [KUBE_TAG]")
 	flag.StringVar(&c.kubeTagUpgrade, "kube-tag-upgrade", envOr("KUBE_TAG_UPGRADE", ""), "upgrade target version label (informational; version comes from -upgrade-template) [KUBE_TAG_UPGRADE]")
@@ -190,7 +190,7 @@ func loadConfig() config {
 	}
 
 	// version-ladder scenario shapes the create template + upgrade ladder:
-	//   - UPGRADE_LADDER unset → the built-in 1.20→1.35 walk OWNS both the create
+	//   - UPGRADE_LADDER unset → the built-in 1.20→1.36 walk OWNS both the create
 	//     version (ladder[0]) and the upgrade rungs, overriding any generic
 	//     CLUSTER_TEMPLATE so SCENARIO=version-ladder is zero-config in CI (where
 	//     MAGNUM_CLUSTER_TEMPLATE is pinned to a different version for other
@@ -362,7 +362,7 @@ func scenarioRunner(r *runner, scn string) *runner {
 }
 
 // applyLadderDefaults configures the version-ladder create template + upgrade
-// ladder. With UPGRADE_LADDER unset the built-in 1.20→1.35 walk owns BOTH the
+// ladder. With UPGRADE_LADDER unset the built-in 1.20→1.36 walk owns BOTH the
 // create version (ladder[0]) and the upgrade rungs; with it set, CLUSTER_TEMPLATE
 // is the create version and UPGRADE_LADDER the rungs. Idempotent.
 func applyLadderDefaults(c *config) {

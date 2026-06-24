@@ -404,10 +404,10 @@ func TestSetFlags(t *testing.T) {
 	}
 }
 
-// TestDefaultVersionLadder pins the requested 1.20→1.35 walk: 8 version-pinned
+// TestDefaultVersionLadder pins the requested 1.20→1.36 walk: 9 version-pinned
 // rungs in order (rung[0] is the create template, the rest the upgrade ladder).
 func TestDefaultVersionLadder(t *testing.T) {
-	want := []string{"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10", "v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3"}
+	want := []string{"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10", "v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3", "v1.36.2"}
 	if len(defaultVersionLadder) != len(want) {
 		t.Fatalf("defaultVersionLadder has %d rungs, want %d", len(defaultVersionLadder), len(want))
 	}
