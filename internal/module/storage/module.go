@@ -43,6 +43,24 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		storageDir = "/var/lib/docker"
 	}
 
+	// Migrate a legacy docker-runtime volume mount to the containerd path. Old
+	// host-docker clusters mounted the dedicated volume at /var/lib/docker; once
+	// the runtime flips to containerd (config normalization for k8s >= 1.24) the
+	// same device must serve /var/lib/containerd instead. A leftover
+	// /var/lib/docker mount of the *same* device keeps it busy (Pulumi cannot
+	// reclaim the dir → "unlinkat /var/lib/docker: device or resource busy") and
+	// leaves a duplicate fstab entry that double-mounts on boot. Unmount it and
+	// drop its fstab line before the containerd mount below claims the device.
+	// This NEVER deletes content — only an unmount + empty-dir rmdir — because
+	// /var/lib/docker and /var/lib/containerd are frequently the same filesystem.
+	if req.Apply && runtime == "containerd" {
+		mc, err := migrateLegacyDockerMount(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, mc...)
+	}
+
 	// If container runtime is already running and storage is mounted, nothing to do.
 	runtimeService := "containerd"
 	if runtime != "containerd" {
@@ -140,6 +158,83 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
+// migrateLegacyDockerMount removes a stale /var/lib/docker mount left behind by
+// a host-docker cluster after the runtime has flipped to containerd. It is
+// deliberately non-destructive: it unmounts the legacy path and removes the
+// (now empty) mountpoint directory, but NEVER deletes filesystem content —
+// /var/lib/docker and /var/lib/containerd are frequently the same device, so an
+// rm there would wipe the live containerd store.
+func migrateLegacyDockerMount(executor *host.Executor) ([]host.Change, error) {
+	const legacy = "/var/lib/docker"
+	var changes []host.Change
+
+	if executor.IsMountpoint(legacy) {
+		if err := executor.Run("umount", legacy); err != nil {
+			// A busy/double mount may need a lazy detach; it still frees the path.
+			if lerr := executor.Run("umount", "-l", legacy); lerr != nil {
+				return nil, fmt.Errorf("unmount legacy docker volume %s: %w (lazy: %v)", legacy, err, lerr)
+			}
+		}
+		changes = append(changes, host.Change{Action: host.ActionDelete, Path: legacy,
+			Summary: "unmount legacy docker-runtime volume"})
+	}
+
+	fc, err := removeFstabMount(executor, legacy)
+	if err != nil {
+		return nil, err
+	}
+	if fc != nil {
+		changes = append(changes, *fc)
+	}
+
+	// Remove the empty mountpoint dir so a Pulumi path-flip replace is a no-op.
+	// os.Remove only succeeds on an empty dir; if anything is there (a filesystem
+	// still mounted, or leftover files) it fails and we leave it untouched.
+	if !executor.IsMountpoint(legacy) {
+		if err := os.Remove(legacy); err == nil {
+			changes = append(changes, host.Change{Action: host.ActionDelete, Path: legacy,
+				Summary: "remove empty legacy docker mountpoint dir"})
+		}
+	}
+	return changes, nil
+}
+
+// removeFstabMount strips any /etc/fstab line whose mountpoint field equals
+// mountPoint, returning a Change when the file was actually rewritten.
+func removeFstabMount(executor *host.Executor, mountPoint string) (*host.Change, error) {
+	const fstab = "/etc/fstab"
+	data, err := os.ReadFile(fstab)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(string(data), "\n")
+	kept := make([]string, 0, len(lines))
+	removed := false
+	for _, ln := range lines {
+		fields := strings.Fields(ln)
+		if len(fields) >= 2 && fields[1] == mountPoint {
+			removed = true
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	if !removed {
+		return nil, nil
+	}
+	res, err := (hostresource.FileSpec{Path: fstab, Content: []byte(strings.Join(kept, "\n")), Mode: 0o644}).Apply(executor)
+	if err != nil {
+		return nil, err
+	}
+	if !res.Changed {
+		return nil, nil
+	}
+	return &host.Change{Action: host.ActionUpdate, Path: fstab,
+		Summary: "remove legacy " + mountPoint + " fstab entry"}, nil
+}
+
 func findDevicePath(cfg config.Config, executor *host.Executor, logger *logging.Logger) (string, error) {
 	if !cfg.Shared.EnableCinder {
 		path, err := filepath.EvalSymlinks("/dev/disk/by-label/ephemeral0")
@@ -209,7 +304,16 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if heat.Cfg.Shared.DockerVolumeSize > 0 {
 		childOpts := append(opts, pulumi.Parent(res))
 		storageDir := storageDirForRuntime(heat.Cfg)
-		dirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir", hostresource.DirectorySpec{Path: storageDir, Mode: 0o755}, childOpts...)
+		// RetainOnDelete: the storage dir is a live mountpoint. When the runtime
+		// flips (host-docker→containerd) its path changes /var/lib/docker →
+		// /var/lib/containerd, which Pulumi treats as a replace (delete old +
+		// create new). Deleting a mounted directory fails with "device or resource
+		// busy" and wedges the whole update. Retaining on delete makes the path
+		// flip a state-only swap; the imperative migrateLegacyDockerMount in Run()
+		// handles the actual unmount/cleanup.
+		dirOpts := append([]pulumi.ResourceOption{}, childOpts...)
+		dirOpts = append(dirOpts, pulumi.RetainOnDelete(true))
+		dirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-dir", hostresource.DirectorySpec{Path: storageDir, Mode: 0o755}, dirOpts...)
 		if err != nil {
 			return nil, err
 		}

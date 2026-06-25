@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 )
 
 func Load(path string) (Config, error) {
@@ -157,6 +159,19 @@ func Load(path string) (Config, error) {
 			TrusteeUsername:   raw["TRUSTEE_USERNAME"],
 			TrusteeDomainID:   raw["TRUSTEE_DOMAIN_ID"],
 		}
+	}
+
+	// Old host-docker clusters predate dockershim removal (Kubernetes 1.24).
+	// CONTAINER_RUNTIME=host-docker means "use the FCoS-baked moby+containerd",
+	// which is non-viable for kubelet >= 1.24: there is no dockershim, kubelet
+	// talks CRI v1 directly to containerd, and the baked containerd is far too
+	// old (1.5, CRI v1alpha2 only). For >= 1.24 the only correct runtime is a
+	// reconciler-managed modern containerd, so ignore the stale label and let
+	// the container-runtime module install + own containerd. Pre-1.24 keeps the
+	// legacy host-docker behavior.
+	if strings.EqualFold(cfg.Shared.ContainerRuntime, "host-docker") &&
+		kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 24) {
+		cfg.Shared.ContainerRuntime = "containerd"
 	}
 
 	return cfg, nil
