@@ -140,6 +140,49 @@ func TestParseHelmOwnershipConflicts(t *testing.T) {
 	}
 }
 
+// TestParseHelmOwnershipConflictsCrossRelease covers Helm's "wrong owner"
+// phrasing (must equal / current value is) where a resource is already owned by
+// a DIFFERENT release and only the release-name differs (namespace matches, so
+// no namespace clause). The original regex matched neither this phrasing nor a
+// single-field conflict, so the auto-repair never fired.
+func TestParseHelmOwnershipConflictsCrossRelease(t *testing.T) {
+	errMsg := `error: Unable to continue with install: ClusterRole "system:metrics-server-aggregated-reader" in namespace "" exists and cannot be imported into the current release: invalid ownership metadata; annotation validation error: key "meta.helm.sh/release-name" must equal "metrics-server": current value is "coredns"`
+
+	conflicts := ParseHelmOwnershipConflicts(errMsg)
+	if len(conflicts) != 1 {
+		t.Fatalf("ParseHelmOwnershipConflicts() returned %d conflicts, want 1", len(conflicts))
+	}
+	if got := conflicts[0]; got != (HelmOwnershipConflict{
+		ReleaseNamespace:  "", // not in the error (namespace already correct) — repair must not clobber it
+		ReleaseName:       "metrics-server",
+		ResourceKind:      "ClusterRole",
+		ResourceNamespace: "",
+		ResourceName:      "system:metrics-server-aggregated-reader",
+	}) {
+		t.Fatalf("unexpected cross-release conflict parsed: %+v", got)
+	}
+}
+
+// TestParseHelmOwnershipConflictsMultiple ensures each resource block is scoped
+// to its own validation errors (the required release-name is read from the same
+// block as the header, not bled across resources).
+func TestParseHelmOwnershipConflictsMultiple(t *testing.T) {
+	errMsg := `Unable to continue with install: ` +
+		`ClusterRole "a" in namespace "" exists and cannot be imported into the current release: invalid ownership metadata; annotation validation error: key "meta.helm.sh/release-name" must equal "metrics-server": current value is "coredns" ` +
+		`ServiceAccount "sa" in namespace "kube-system" exists and cannot be imported into the current release: invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by": must be set to "Helm"; annotation validation error: missing key "meta.helm.sh/release-name": must be set to "npd"; annotation validation error: missing key "meta.helm.sh/release-namespace": must be set to "kube-system"`
+
+	conflicts := ParseHelmOwnershipConflicts(errMsg)
+	if len(conflicts) != 2 {
+		t.Fatalf("got %d conflicts, want 2: %+v", len(conflicts), conflicts)
+	}
+	if conflicts[0].ReleaseName != "metrics-server" || conflicts[0].ResourceName != "a" || conflicts[0].ReleaseNamespace != "" {
+		t.Errorf("conflict[0] wrong: %+v", conflicts[0])
+	}
+	if conflicts[1].ReleaseName != "npd" || conflicts[1].ReleaseNamespace != "kube-system" || conflicts[1].ResourceName != "sa" {
+		t.Errorf("conflict[1] wrong: %+v", conflicts[1])
+	}
+}
+
 func TestPromoteManagedReleasesMarksAdopted(t *testing.T) {
 	oldRoot := helmMarkerRootDir
 	helmMarkerRootDir = t.TempDir()

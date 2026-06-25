@@ -439,7 +439,25 @@ type HelmOwnershipConflict struct {
 // Patterns: `Helm release "NAMESPACE/NAME"` or `Helm Release NAMESPACE/NAME:`
 var helmReleaseRe = regexp.MustCompile(`Helm [Rr]elease "?([a-z0-9-]+)/([a-z0-9-]+)"?`)
 
-var helmOwnershipConflictRe = regexp.MustCompile(`(?s)([A-Za-z][A-Za-z0-9]+) "([^"]+)"(?: in namespace "([^"]*)")? exists and cannot be imported into the current release: invalid ownership metadata;.*?meta\.helm\.sh/release-name": must be set to "([^"]+)"; annotation validation error: .*?meta\.helm\.sh/release-namespace": must be set to "([^"]+)"`)
+// Helm reports two ownership-conflict phrasings, and only the MISMATCHED keys
+// appear — so a single conflict may carry release-name only, release-namespace
+// only, or both:
+//
+//	missing metadata (resource was never Helm-managed):
+//	  ... missing key "meta.helm.sh/release-name": must be set to "X"
+//	wrong owner (resource adopted by a DIFFERENT release):
+//	  ... key "meta.helm.sh/release-name" must equal "X": current value is "Z"
+//
+// helmOwnershipHeaderRe finds each conflicting resource header; the two
+// want-regexes extract the REQUIRED release-name/namespace from that resource's
+// block, tolerating either phrasing and either field being absent. The original
+// single regex only matched the "must be set to" phrasing AND required both
+// fields, so the common cross-release case (e.g. a metrics-server ClusterRole
+// still annotated release-name=coredns, namespace already correct) parsed to
+// nothing and the auto-repair never fired.
+var helmOwnershipHeaderRe = regexp.MustCompile(`([A-Za-z][A-Za-z0-9]+) "([^"]+)"(?: in namespace "([^"]*)")? exists and cannot be imported into the current release: invalid ownership metadata`)
+var helmReleaseNameWantRe = regexp.MustCompile(`meta\.helm\.sh/release-name":?\s*(?:must be set to|must equal)\s*"([^"]+)"`)
+var helmReleaseNamespaceWantRe = regexp.MustCompile(`meta\.helm\.sh/release-namespace":?\s*(?:must be set to|must equal)\s*"([^"]+)"`)
 
 // ParseHelmPatchFailures extracts Helm releases that failed due to patch
 // errors (e.g. "cannot patch", "is invalid") from a Pulumi error message.
@@ -587,16 +605,36 @@ func ParseHelmOwnershipConflicts(errMsg string) []HelmOwnershipConflict {
 	if !strings.Contains(errMsg, "exists and cannot be imported into the current release") || !strings.Contains(errMsg, "invalid ownership metadata") {
 		return nil
 	}
-	matches := helmOwnershipConflictRe.FindAllStringSubmatch(errMsg, -1)
-	seen := make(map[string]bool, len(matches))
-	conflicts := make([]HelmOwnershipConflict, 0, len(matches))
-	for _, m := range matches {
+	headers := helmOwnershipHeaderRe.FindAllStringSubmatchIndex(errMsg, -1)
+	seen := make(map[string]bool, len(headers))
+	conflicts := make([]HelmOwnershipConflict, 0, len(headers))
+	for i, h := range headers {
+		kind := errMsg[h[2]:h[3]]
+		resName := errMsg[h[4]:h[5]]
+		resNs := ""
+		if h[6] >= 0 { // optional "in namespace" group matched
+			resNs = errMsg[h[6]:h[7]]
+		}
+		// The block for this resource runs from the end of its header to the
+		// start of the next header (or end of string). Only this block's
+		// validation errors describe this resource's required ownership.
+		blockEnd := len(errMsg)
+		if i+1 < len(headers) {
+			blockEnd = headers[i+1][0]
+		}
+		block := errMsg[h[1]:blockEnd]
+
+		relName := firstSubmatch(helmReleaseNameWantRe, block)
+		relNs := firstSubmatch(helmReleaseNamespaceWantRe, block)
+		if relName == "" && relNs == "" {
+			continue // nothing actionable for this resource
+		}
 		conflict := HelmOwnershipConflict{
-			ResourceKind:      m[1],
-			ResourceName:      m[2],
-			ResourceNamespace: strings.TrimSpace(m[3]),
-			ReleaseName:       m[4],
-			ReleaseNamespace:  m[5],
+			ResourceKind:      kind,
+			ResourceName:      resName,
+			ResourceNamespace: strings.TrimSpace(resNs),
+			ReleaseName:       relName,
+			ReleaseNamespace:  relNs,
 		}
 		key := strings.Join([]string{conflict.ReleaseNamespace, conflict.ReleaseName, conflict.ResourceKind, conflict.ResourceNamespace, conflict.ResourceName}, "/")
 		if seen[key] {
@@ -608,6 +646,14 @@ func ParseHelmOwnershipConflicts(errMsg string) []HelmOwnershipConflict {
 	return conflicts
 }
 
+func firstSubmatch(re *regexp.Regexp, s string) string {
+	m := re.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 // RepairHelmOwnershipConflicts patches the expected Helm labels/annotations
 // onto the conflicting live resources so Helm can adopt them on retry.
 func RepairHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwnershipConflict) []HelmOwnershipConflict {
@@ -617,18 +663,32 @@ func RepairHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwner
 	var repaired []HelmOwnershipConflict
 	for _, conflict := range conflicts {
 		resourceRef := strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
-		labelArgs := []string{"label"}
-		annotateArgs := []string{"annotate"}
+		nsFlag := []string{}
 		if conflict.ResourceNamespace != "" {
-			labelArgs = append(labelArgs, "-n", conflict.ResourceNamespace)
-			annotateArgs = append(annotateArgs, "-n", conflict.ResourceNamespace)
+			nsFlag = []string{"-n", conflict.ResourceNamespace}
 		}
+		labelArgs := append([]string{"label"}, nsFlag...)
 		labelArgs = append(labelArgs, resourceRef, "app.kubernetes.io/managed-by=Helm", "--overwrite")
-		annotateArgs = append(annotateArgs, resourceRef,
-			"meta.helm.sh/release-name="+conflict.ReleaseName,
-			"meta.helm.sh/release-namespace="+conflict.ReleaseNamespace,
-			"--overwrite",
-		)
+
+		// Patch ONLY the annotations the conflict reported as wrong. In the
+		// cross-release case Helm flags release-name only (the namespace already
+		// matches); setting release-namespace="" here would clobber a correct
+		// value and break adoption.
+		annotateArgs := append([]string{"annotate"}, nsFlag...)
+		annotateArgs = append(annotateArgs, resourceRef)
+		annotated := false
+		if conflict.ReleaseName != "" {
+			annotateArgs = append(annotateArgs, "meta.helm.sh/release-name="+conflict.ReleaseName)
+			annotated = true
+		}
+		if conflict.ReleaseNamespace != "" {
+			annotateArgs = append(annotateArgs, "meta.helm.sh/release-namespace="+conflict.ReleaseNamespace)
+			annotated = true
+		}
+		if !annotated {
+			continue
+		}
+		annotateArgs = append(annotateArgs, "--overwrite")
 		if executor.Logger != nil {
 			executor.Logger.Warnf("helm ownership repair: patching %s %s for release %s/%s", conflict.ResourceKind, resourceRef, conflict.ReleaseNamespace, conflict.ReleaseName)
 		}

@@ -317,7 +317,16 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			return stack.Up(ctx, upOpts...)
 		})
 		stopHeartbeat()
-		if err != nil {
+		// Recover from Helm failures across MULTIPLE classes in one run. Each
+		// branch below repairs one class; a repaired retry can expose a DIFFERENT
+		// class (e.g. ownership repair → "no deployed releases"). The branches run
+		// top-to-bottom, so a class surfaced by a later branch that belongs to an
+		// earlier one would otherwise never be retried in this run. Loop the whole
+		// cascade until the error clears or stops changing (no progress), bounded
+		// so a persistently-failing class cannot spin forever.
+		const maxHelmRecoveryPasses = 6
+		for helmPass := 0; err != nil && helmPass < maxHelmRecoveryPasses; helmPass++ {
+			prevErr := err.Error()
 			executor := host.NewExecutor(true, req.Logger)
 			// Check if the failure is a Helm release patch error. These
 			// happen during chart version upgrades when the strategic merge
@@ -487,12 +496,18 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 					}
 				}
 			}
-			if err != nil {
-				if req.Logger != nil {
-					req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
-				}
-				return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
+			if err == nil {
+				break
 			}
+			if err.Error() == prevErr {
+				break // no recovery branch made progress this pass; stop retrying
+			}
+		}
+		if err != nil {
+			if req.Logger != nil {
+				req.Logger.Errorf("pulumi up failed stack=%s duration=%s err=%v", cfg.StackName(), formatDuration(time.Since(start)), err)
+			}
+			return extractFailureResult(acc, mode, cfg, runtimePaths, reconcilePlan, req, err)
 		}
 		if req.Logger != nil {
 			req.Logger.Infof("pulumi up completed stack=%s duration=%s changes=%s",
