@@ -120,9 +120,10 @@ type SharedConfig struct {
 	NoProxy                   string `json:"noProxy"`
 
 	// Container runtime
-	CgroupDriver         string `json:"cgroupDriver"`
-	UsePodman            bool   `json:"usePodman"`
-	ContainerInfraPrefix string `json:"containerInfraPrefix"`
+	CgroupDriver          string `json:"cgroupDriver"`
+	UsePodman             bool   `json:"usePodman"`
+	ContainerInfraPrefix  string `json:"containerInfraPrefix"`
+	HeatContainerAgentTag string `json:"heatContainerAgentTag"`
 
 	// Node identity
 	KubeNodeIP       string `json:"kubeNodeIp"`

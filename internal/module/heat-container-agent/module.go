@@ -3,6 +3,8 @@ package heatcontaineragent
 import (
 	"context"
 	"fmt"
+	"os"
+	"regexp"
 	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -16,6 +18,17 @@ import (
 
 const unitName = "heat-container-agent"
 
+// agentUnitPath is the systemd unit ignition writes at first boot. ignition runs
+// only once (user_data_update_policy: IGNORE in the Heat templates), so the baked
+// image tag never changes on its own — the reconciler converges it here.
+const agentUnitPath = "/etc/systemd/system/heat-container-agent.service"
+
+// agentImageRef matches the "<prefix>heat-container-agent:<tag>" token on the
+// podman pull + run lines. The token is whitespace/quote/backslash delimited;
+// the "--name heat-container-agent" / "podman stop heat-container-agent" lines
+// carry no colon, so they are not matched.
+var agentImageRef = regexp.MustCompile(`[^\s'"\\]*heat-container-agent:[^\s'"\\]+`)
+
 type Module struct{}
 
 type Resource struct {
@@ -25,8 +38,19 @@ type Resource struct {
 func (Module) PhaseID() string        { return "heat-container-agent" }
 func (Module) Dependencies() []string { return []string{"start-services"} }
 
-func (Module) Run(_ context.Context, _ config.Config, req moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)
+	var changes []host.Change
+
+	// Converge the agent image tag toward the desired heat-params value so an
+	// agent version bump (e.g. ussuri -> victoria) lands without replacing the
+	// node. No-op when the tag is empty (older heat-params lack the key).
+	tagChanges, err := reconcileAgentImage(executor, cfg, req)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
+	changes = append(changes, tagChanges...)
+
 	result, err := (hostresource.SystemdServiceSpec{
 		Unit:    unitName,
 		Enabled: hostresource.BoolPtr(true),
@@ -35,13 +59,94 @@ func (Module) Run(_ context.Context, _ config.Config, req moduleapi.Request) (mo
 	if err != nil {
 		return moduleapi.Result{}, fmt.Errorf("reconcile %s: %w", unitName, err)
 	}
+	changes = append(changes, result.Changes...)
+
 	if req.Apply && !executor.WaitForSystemctlActive(unitName, 30*time.Second, 2*time.Second) {
 		return moduleapi.Result{}, fmt.Errorf("service %s did not become active", unitName)
 	}
 	return moduleapi.Result{
-		Changes: result.Changes,
+		Changes: changes,
 		Outputs: map[string]string{"service": unitName},
 	}, nil
+}
+
+// reconcileAgentImage rewrites the agent unit's image reference to the desired
+// "<ContainerInfraPrefix>heat-container-agent:<HeatContainerAgentTag>" and pulls
+// it. The restart is deferred to a periodic run: run-once executes UNDER the
+// heat-container-agent (a Heat SoftwareDeployment), so restarting it mid-run
+// would kill the in-flight heat-config-notify signal and wedge the Heat update.
+func reconcileAgentImage(executor *host.Executor, cfg config.Config, req moduleapi.Request) ([]host.Change, error) {
+	tag := cfg.Shared.HeatContainerAgentTag
+	if tag == "" {
+		return nil, nil
+	}
+	desiredRef := cfg.Shared.ContainerInfraPrefix + "heat-container-agent:" + tag
+
+	content, err := os.ReadFile(agentUnitPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logf(req, "warn", "agent unit %s not found; skipping image convergence", agentUnitPath)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", agentUnitPath, err)
+	}
+
+	// An unexpected unit format (no recognizable image token) should be visible
+	// but must not wedge the whole node reconcile — the agent may be running fine.
+	if !agentImageRef.Match(content) {
+		logf(req, "warn", "agent unit %s has no recognizable heat-container-agent image reference; skipping tag convergence", agentUnitPath)
+		return nil, nil
+	}
+
+	newContent := agentImageRef.ReplaceAll(content, []byte(desiredRef))
+	if string(newContent) == string(content) {
+		return nil, nil // already at the desired image reference
+	}
+
+	// Pull first; on failure leave the unit untouched so a missing image can
+	// never wedge the agent on a later restart.
+	if err := executor.Run("podman", "pull", desiredRef); err != nil {
+		logf(req, "warn", "podman pull %s failed; leaving agent image unchanged: %v", desiredRef, err)
+		return nil, nil
+	}
+
+	ch, err := executor.EnsureFile(agentUnitPath, newContent, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("write %s: %w", agentUnitPath, err)
+	}
+	if err := executor.Systemctl("daemon-reload"); err != nil {
+		return nil, fmt.Errorf("daemon-reload after agent unit rewrite: %w", err)
+	}
+
+	var changes []host.Change
+	if ch != nil {
+		changes = append(changes, *ch)
+	}
+
+	if req.Periodic {
+		if err := executor.Systemctl(host.ActionRestart, unitName); err != nil {
+			return nil, fmt.Errorf("restart %s: %w", unitName, err)
+		}
+		if req.Apply && !executor.WaitForSystemctlActive(unitName, 30*time.Second, 2*time.Second) {
+			return nil, fmt.Errorf("service %s did not become active after image update", unitName)
+		}
+		logf(req, "info", "heat-container-agent image updated to %s and restarted", desiredRef)
+	} else {
+		logf(req, "info", "heat-container-agent image staged to %s; restart deferred to periodic run", desiredRef)
+	}
+
+	return changes, nil
+}
+
+func logf(req moduleapi.Request, level, format string, args ...any) {
+	if req.Logger == nil {
+		return
+	}
+	if level == "warn" {
+		req.Logger.Warnf(format, args...)
+		return
+	}
+	req.Logger.Infof(format, args...)
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, _ *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {

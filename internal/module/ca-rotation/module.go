@@ -47,6 +47,12 @@ var (
 func (Module) PhaseID() string        { return "ca-rotation" }
 func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
+// RetryPolicy opts CA rotation out of the default per-module retry: a rotation
+// failure is usually deterministic (cert/Barbican/keypair mismatch) rather than
+// transient, and its slow path is a 7.5min API health wait — retrying would
+// double that before failing without improving the odds of success.
+func (Module) RetryPolicy() moduleapi.RetryPolicy { return moduleapi.RetryPolicy{MaxAttempts: 1} }
+
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	rotationID, lastAppliedRotationID, err := resolveCARotationIDs(cfg, req, coord.MarkerPath)
 	if err != nil {

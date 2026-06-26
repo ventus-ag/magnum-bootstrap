@@ -12,6 +12,8 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module"
+	carotation "github.com/ventus-ag/magnum-bootstrap/internal/module/ca-rotation"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/storage"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/internal/plan"
 )
@@ -190,4 +192,142 @@ func phases(ids ...string) []plan.Phase {
 		out = append(out, plan.Phase{ID: id})
 	}
 	return out
+}
+
+// countingModule fails its first failUntil Run() calls, then succeeds, tracking
+// the number of invocations so retry behavior can be asserted.
+type countingModule struct {
+	failUntil int
+	calls     int
+}
+
+func (m *countingModule) PhaseID() string        { return "stub" }
+func (m *countingModule) Dependencies() []string { return nil }
+func (m *countingModule) Run(context.Context, config.Config, moduleapi.Request) (moduleapi.Result, error) {
+	m.calls++
+	if m.calls <= m.failUntil {
+		return moduleapi.Result{}, errors.New("boom")
+	}
+	return moduleapi.Result{}, nil
+}
+func (m *countingModule) Register(*gopulumi.Context, string, *moduleapi.HeatParamsComponent, ...gopulumi.ResourceOption) (gopulumi.Resource, error) {
+	return nil, nil
+}
+
+// retryOverride adds a per-module RetryPolicy override (Retryable interface).
+type retryOverride struct {
+	countingModule
+	policy moduleapi.RetryPolicy
+}
+
+func (m *retryOverride) RetryPolicy() moduleapi.RetryPolicy { return m.policy }
+
+func TestRunModuleWithRetrySucceedsAfterRetries(t *testing.T) {
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "3")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &countingModule{failUntil: 2}
+
+	_, err := runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if err != nil {
+		t.Fatalf("expected success after retries, got %v", err)
+	}
+	if mod.calls != 3 {
+		t.Fatalf("expected 3 Run() calls, got %d", mod.calls)
+	}
+}
+
+func TestRunModuleWithRetryFailsAfterMaxAttempts(t *testing.T) {
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "2")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &countingModule{failUntil: 99}
+
+	_, err := runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if err == nil {
+		t.Fatal("expected failure after exhausting attempts")
+	}
+	if mod.calls != 2 {
+		t.Fatalf("expected 2 Run() calls, got %d", mod.calls)
+	}
+}
+
+func TestRunModuleWithRetryNoRetryWhenSingleAttempt(t *testing.T) {
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "1")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &countingModule{failUntil: 99}
+
+	_, err := runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if mod.calls != 1 {
+		t.Fatalf("expected exactly 1 Run() call, got %d", mod.calls)
+	}
+}
+
+func TestRunModuleWithRetryClampsOverrideBelowOne(t *testing.T) {
+	// A module override of MaxAttempts<1 is clamped to a single attempt.
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "5")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &retryOverride{countingModule: countingModule{failUntil: 99}, policy: moduleapi.RetryPolicy{MaxAttempts: 0}}
+
+	_, _ = runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if mod.calls != 1 {
+		t.Fatalf("expected override<1 to clamp to 1 Run() call, got %d", mod.calls)
+	}
+}
+
+func TestRunModuleWithRetryIgnoresInvalidEnv(t *testing.T) {
+	// env=0 is invalid (rejected by the n>=1 guard) → falls back to default 2.
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "0")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &countingModule{failUntil: 99}
+
+	_, _ = runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if mod.calls != 2 {
+		t.Fatalf("expected invalid env to fall back to default 2 Run() calls, got %d", mod.calls)
+	}
+}
+
+func TestRunModuleWithRetryPerModuleOverrideBeatsDefault(t *testing.T) {
+	// Default would allow only a single attempt; the module override raises it.
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "1")
+	t.Setenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS", "0")
+	mod := &retryOverride{countingModule: countingModule{failUntil: 2}, policy: moduleapi.RetryPolicy{MaxAttempts: 3}}
+
+	_, err := runModuleWithRetry(context.Background(), config.Config{}, moduleapi.Request{}, "stub", mod)
+	if err != nil {
+		t.Fatalf("expected override to allow success, got %v", err)
+	}
+	if mod.calls != 3 {
+		t.Fatalf("expected 3 Run() calls from override, got %d", mod.calls)
+	}
+}
+
+func TestDisruptiveModulesOptOutOfRetry(t *testing.T) {
+	// Even with a high global default, storage and ca-rotation must resolve to a
+	// single attempt (their failures are deterministic + their waits are long).
+	t.Setenv("MAGNUM_MODULE_MAX_ATTEMPTS", "5")
+	for _, mod := range []module.Module{storage.Module{}, carotation.Module{}} {
+		if p := moduleapi.ResolveRetryPolicy(mod); p.MaxAttempts != 1 {
+			t.Errorf("%s: expected MaxAttempts=1 (opted out), got %d", mod.PhaseID(), p.MaxAttempts)
+		}
+	}
+}
+
+func TestRunModuleWithRetryCancelAbortsDelay(t *testing.T) {
+	mod := &retryOverride{countingModule: countingModule{failUntil: 99}, policy: moduleapi.RetryPolicy{MaxAttempts: 5, Delay: time.Hour}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	start := time.Now()
+	_, err := runModuleWithRetry(ctx, config.Config{}, moduleapi.Request{}, "stub", mod)
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("expected cancel to abort the retry delay, took %s", elapsed)
+	}
+	if mod.calls != 1 {
+		t.Fatalf("expected 1 Run() call before cancel abort, got %d", mod.calls)
+	}
 }

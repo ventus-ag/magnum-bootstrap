@@ -2,7 +2,10 @@ package moduleapi
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -113,6 +116,63 @@ type Result struct {
 	Changes  []host.Change
 	Outputs  map[string]string
 	Warnings []string
+}
+
+// Default per-module retry tunables. A transient module Run() failure (API not
+// yet up, a brief network blip, a slow mount) is retried silently before the
+// reconcile is failed to Heat. Overridable per run via the env vars below and
+// per module via the Retryable interface.
+const (
+	defaultModuleMaxAttempts = 2
+	defaultModuleRetryDelay  = 3 * time.Second
+)
+
+// RetryPolicy controls how a module's Run() is retried on error.
+type RetryPolicy struct {
+	MaxAttempts int           // total attempts including the first; <=1 disables retry
+	Delay       time.Duration // pause between attempts
+}
+
+// Retryable is an OPTIONAL interface a Module may implement to override the
+// default retry policy — e.g. a disruptive module returning {MaxAttempts: 1} to
+// opt out of automatic retries.
+type Retryable interface {
+	RetryPolicy() RetryPolicy
+}
+
+// DefaultRetryPolicy is the policy applied to every module that does not
+// implement Retryable. Tunable via MAGNUM_MODULE_MAX_ATTEMPTS (default 2) and
+// MAGNUM_MODULE_RETRY_DELAY_SECONDS (default 3).
+func DefaultRetryPolicy() RetryPolicy {
+	p := RetryPolicy{MaxAttempts: defaultModuleMaxAttempts, Delay: defaultModuleRetryDelay}
+	if v := os.Getenv("MAGNUM_MODULE_MAX_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			p.MaxAttempts = n
+		}
+	}
+	if v := os.Getenv("MAGNUM_MODULE_RETRY_DELAY_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			p.Delay = time.Duration(n) * time.Second
+		}
+	}
+	return p
+}
+
+// ResolveRetryPolicy returns the effective policy for mod: the module's own
+// override if it implements Retryable, otherwise the default. The result is
+// clamped to MaxAttempts >= 1 and Delay >= 0.
+func ResolveRetryPolicy(mod Module) RetryPolicy {
+	p := DefaultRetryPolicy()
+	if r, ok := mod.(Retryable); ok {
+		p = r.RetryPolicy()
+	}
+	if p.MaxAttempts < 1 {
+		p.MaxAttempts = 1
+	}
+	if p.Delay < 0 {
+		p.Delay = 0
+	}
+	return p
 }
 
 // HeatParamsComponent is a Pulumi component resource that wraps the parsed

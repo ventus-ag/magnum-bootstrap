@@ -55,9 +55,10 @@ func Load(path string) (Config, error) {
 			HTTPSProxy:                raw["HTTPS_PROXY"],
 			NoProxy:                   raw["NO_PROXY"],
 
-			CgroupDriver:         raw["CGROUP_DRIVER"],
-			UsePodman:            parseBool(raw["USE_PODMAN"]),
-			ContainerInfraPrefix: raw["CONTAINER_INFRA_PREFIX"],
+			CgroupDriver:          raw["CGROUP_DRIVER"],
+			UsePodman:             parseBool(raw["USE_PODMAN"]),
+			ContainerInfraPrefix:  raw["CONTAINER_INFRA_PREFIX"],
+			HeatContainerAgentTag: raw["HEAT_CONTAINER_AGENT_TAG"],
 
 			KubeNodeIP:       raw["KUBE_NODE_IP"],
 			KubeNodePublicIP: raw["KUBE_NODE_PUBLIC_IP"],

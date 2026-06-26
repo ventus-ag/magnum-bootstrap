@@ -25,6 +25,13 @@ type Resource struct {
 }
 
 func (Module) PhaseID() string { return "storage" }
+
+// RetryPolicy opts storage out of the default per-module retry: its failure mode
+// is a ~30min Cinder device-attach wait that is deterministic (a missing volume
+// will not appear within a second 30min wait), so retrying only doubles the time
+// before a doomed run fails to Heat.
+func (Module) RetryPolicy() moduleapi.RetryPolicy { return moduleapi.RetryPolicy{MaxAttempts: 1} }
+
 func (Module) Dependencies() []string {
 	return []string{"container-runtime", "stop-services"}
 }

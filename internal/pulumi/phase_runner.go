@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module"
@@ -87,7 +88,7 @@ func runPhaseDAG(ctx context.Context, phases []plan.Phase, registry map[string]m
 				if req.Logger != nil {
 					req.Logger.Infof("running phase=%s apply=%t", phaseID, req.Apply)
 				}
-				res, err := task.mod.Run(runCtx, cfg, req)
+				res, err := runModuleWithRetry(runCtx, cfg, req, phaseID, task.mod)
 				resultCh <- phaseRunResult{phaseID: phaseID, result: res, err: err}
 			}(phaseID, task)
 		}
@@ -154,4 +155,38 @@ func sortPhaseIDs(ids []string, phaseIndex map[string]int) {
 	sort.SliceStable(ids, func(i, j int) bool {
 		return phaseIndex[ids[i]] < phaseIndex[ids[j]]
 	})
+}
+
+// runModuleWithRetry runs a module's Run() honoring its effective RetryPolicy.
+// A transient failure is retried silently (with a bounded delay) before the
+// error is surfaced; only the final attempt's failure reaches the accumulator
+// and Heat. Modules are idempotent by design, so re-running Run() is safe. The
+// delay respects ctx cancellation so a module never sleeps through retries after
+// a sibling failure has already doomed the run.
+func runModuleWithRetry(ctx context.Context, cfg config.Config, req moduleapi.Request, phaseID string, mod module.Module) (moduleapi.Result, error) {
+	policy := moduleapi.ResolveRetryPolicy(mod)
+	var res moduleapi.Result
+	var err error
+	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+		res, err = mod.Run(ctx, cfg, req)
+		if err == nil || attempt == policy.MaxAttempts {
+			return res, err
+		}
+		if req.Logger != nil {
+			req.Logger.Warnf("phase=%s attempt %d/%d failed: %v; retrying in %s",
+				phaseID, attempt, policy.MaxAttempts, err, policy.Delay)
+		}
+		if policy.Delay <= 0 {
+			if ctx.Err() != nil {
+				return res, err // run already cancelled by a sibling failure
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return res, err
+		case <-time.After(policy.Delay):
+		}
+	}
+	return res, err
 }
