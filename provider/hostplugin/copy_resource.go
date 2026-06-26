@@ -87,16 +87,17 @@ func (*Copy) Diff(_ context.Context, req infer.DiffRequest[CopyArgs, CopyState])
 	if err != nil {
 		return infer.DiffResponse{}, err
 	}
-	sourceData, err := os.ReadFile(spec.Source)
+	sourceData, desiredHash, sourceExists, err := readSource(spec.Source)
 	if err != nil {
 		return infer.DiffResponse{}, err
 	}
-	desiredHash := hostresource.BytesSHA256(sourceData)
 	detailed := map[string]providerpkg.PropertyDiff{}
 	if req.ID != spec.Path {
 		detailed["path"] = providerpkg.PropertyDiff{Kind: providerpkg.UpdateReplace, InputDiff: true}
 	}
-	if req.State.Source != spec.Source || req.State.SourceSHA256 != desiredHash {
+	// Only compare source hashes when the source is readable; during preview it
+	// may not exist yet (produced by an upstream resource that has not applied).
+	if req.State.Source != spec.Source || (sourceExists && req.State.SourceSHA256 != desiredHash) {
 		detailed["source"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: true}
 	}
 	if req.State.Mode != modeString(spec.Mode) {
@@ -113,7 +114,7 @@ func (*Copy) Diff(_ context.Context, req infer.DiffRequest[CopyArgs, CopyState])
 			if observed.Mode != modeString(spec.Mode) {
 				detailed["mode"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
 			}
-			if !observed.MatchesSource {
+			if sourceExists && !observed.MatchesSource {
 				detailed["source"] = providerpkg.PropertyDiff{Kind: providerpkg.Update, InputDiff: false}
 			}
 		}
@@ -134,13 +135,29 @@ func copySpec(args CopyArgs) (hostresource.CopySpec, error) {
 	return hostresource.CopySpec{Source: args.Source, Path: args.Path, Mode: mode}, nil
 }
 
+// readSource reads a Copy's source file, tolerating absence. During preview the
+// source is frequently produced by an upstream resource (e.g. an ExtractTar)
+// that has not applied yet; a missing source must NOT fail preview. Returns
+// exists=false (and empty data/hash) when the source is not present, and only a
+// real I/O error otherwise.
+func readSource(path string) (data []byte, sha256 string, exists bool, err error) {
+	data, err = os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", false, nil
+		}
+		return nil, "", false, err
+	}
+	return data, hostresource.BytesSHA256(data), true, nil
+}
+
 func copyStateFromSpec(spec hostresource.CopySpec) (CopyState, error) {
 	state := CopyState{Source: spec.Source, Path: spec.Path, Mode: modeString(spec.Mode)}
-	sourceData, err := os.ReadFile(spec.Source)
+	sourceData, sha, _, err := readSource(spec.Source)
 	if err != nil {
 		return CopyState{}, err
 	}
-	state.SourceSHA256 = hostresource.BytesSHA256(sourceData)
+	state.SourceSHA256 = sha
 	observed, err := observeCopy(spec, sourceData)
 	if err != nil {
 		return CopyState{}, err
