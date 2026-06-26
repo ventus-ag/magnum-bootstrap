@@ -33,7 +33,7 @@ on:
         default: create ca-rotate upgrade
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
-        default: victoria-ca-rotation
+        default: stable/victoria
       run_multimaster:
         description: Also run the multi-master FCoS tier
         type: boolean
@@ -116,7 +116,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
-          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'stable/victoria' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
 
@@ -223,7 +223,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
-          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'stable/victoria' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
 
@@ -306,7 +306,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
-          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'victoria-ca-rotation' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'stable/victoria' }}
           path: magnum
           token: ${{ secrets.RW_PAT_TOKEN }}
 

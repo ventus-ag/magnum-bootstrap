@@ -15,7 +15,7 @@
 #   RW_PAT_TOKEN / GITHUB_TOKEN  PAT with read access to the private repos (required)
 #   BOOTSTRAP_REF                magnum-bootstrap branch/tag           (default main)
 #   MAGNUM_REPO                  forked driver repo name under ORG     (default magnum)
-#   MAGNUM_REF                   forked driver branch/tag              (default victoria-ca-rotation)
+#   MAGNUM_REF                   forked driver branch/tag              (default stable/victoria)
 #   MAGNUM_DIR                   local dir for the driver checkout     (default magnum_victoria)
 #   ORG                          GitHub org                            (default ventus-ag)
 #   RUNNER_USER                  runner user                           (default SUDO_USER/ubuntu)
@@ -29,7 +29,7 @@ set -euo pipefail
 ORG="${ORG:-ventus-ag}"
 BOOTSTRAP_REF="${BOOTSTRAP_REF:-${REF:-main}}"
 MAGNUM_REPO="${MAGNUM_REPO:-magnum}"
-MAGNUM_REF="${MAGNUM_REF:-victoria-ca-rotation}"
+MAGNUM_REF="${MAGNUM_REF:-stable/victoria}"
 MAGNUM_DIR="${MAGNUM_DIR:-magnum_victoria}"
 TOKEN="${RW_PAT_TOKEN:-${GITHUB_TOKEN:-}}"
 RUNNER_USER="${RUNNER_USER:-${SUDO_USER:-ubuntu}}"

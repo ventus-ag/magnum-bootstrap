@@ -461,7 +461,7 @@ the current job since a just-added `kvm` group won't apply mid-session.
 Checkout of the two repos:
 - `magnum-bootstrap` — the current repo, default `GITHUB_TOKEN`.
 - the forked driver — `repository: ventus-ag/magnum` (override with
-  `vars.MAGNUM_REPO`), `ref: victoria-ca-rotation` (override with the
+  `vars.MAGNUM_REPO`), `ref: stable/victoria` (override with the
   `magnum_ref` dispatch input or `vars.MAGNUM_REF`), checked out to
   `magnum_victoria/`, using `secrets.RW_PAT_TOKEN` for cross-repo private access.
 
