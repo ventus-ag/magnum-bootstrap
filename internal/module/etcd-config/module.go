@@ -14,6 +14,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
@@ -382,7 +383,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/sysconfig/heat-params
 ExecStartPre=mkdir -p /var/lib/etcd
-ExecStartPre=-/bin/podman rm etcd
+%s
 ExecStart=/bin/podman run \
     --name etcd \
     --volume /etc/pki/ca-trust/extracted/pem:/etc/ssl/certs:ro,z \
@@ -401,7 +402,7 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-`, containerImage, etcdTag(cfg))
+`, kubecommon.PodmanResetExecStartPre("/bin/podman", "etcd"), containerImage, etcdTag(cfg))
 }
 
 func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, error) {

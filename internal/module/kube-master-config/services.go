@@ -8,6 +8,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
@@ -80,7 +81,7 @@ EnvironmentFile=/etc/sysconfig/heat-params
 EnvironmentFile=/etc/kubernetes/config
 EnvironmentFile=/etc/kubernetes/apiserver
 ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-apiserver
+%s
 ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-apiserver \
     --net host \
     --volume /etc/kubernetes:/etc/kubernetes:ro,z \
@@ -99,7 +100,7 @@ RestartSec=10
 TimeoutStartSec=10min
 [Install]
 WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
+`, kubecommon.PodmanResetExecStartPre("/usr/bin/podman", "kube-apiserver"), prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
 
 func controllerManagerService(cfg config.Config) string {
@@ -115,7 +116,7 @@ EnvironmentFile=/etc/sysconfig/heat-params
 EnvironmentFile=/etc/kubernetes/config
 EnvironmentFile=/etc/kubernetes/controller-manager
 ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-controller-manager
+%s
 ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-controller-manager \
     --net host \
     --volume /etc/kubernetes:/etc/kubernetes:ro,z \
@@ -134,7 +135,7 @@ RestartSec=10
 TimeoutStartSec=10min
 [Install]
 WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
+`, kubecommon.PodmanResetExecStartPre("/usr/bin/podman", "kube-controller-manager"), prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
 
 func schedulerService(cfg config.Config) string {
@@ -150,7 +151,7 @@ EnvironmentFile=/etc/sysconfig/heat-params
 EnvironmentFile=/etc/kubernetes/config
 EnvironmentFile=/etc/kubernetes/scheduler
 ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-scheduler
+%s
 ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-scheduler \
     --net host \
     --volume /etc/kubernetes:/etc/kubernetes:ro,z \
@@ -169,7 +170,7 @@ RestartSec=10
 TimeoutStartSec=10min
 [Install]
 WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
+`, kubecommon.PodmanResetExecStartPre("/usr/bin/podman", "kube-scheduler"), prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
 
 func kubeletService() string {
@@ -213,7 +214,7 @@ EnvironmentFile=/etc/sysconfig/heat-params
 EnvironmentFile=/etc/kubernetes/config
 EnvironmentFile=/etc/kubernetes/proxy
 ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-proxy
+%s
 ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-proxy \
     --privileged \
     --net host \
@@ -235,5 +236,5 @@ RestartSec=10
 TimeoutStartSec=10min
 [Install]
 WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
+`, kubecommon.PodmanResetExecStartPre("/usr/bin/podman", "kube-proxy"), prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }

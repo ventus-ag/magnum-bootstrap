@@ -8,6 +8,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
 
@@ -100,7 +101,7 @@ EnvironmentFile=/etc/sysconfig/heat-params
 EnvironmentFile=/etc/kubernetes/config
 EnvironmentFile=/etc/kubernetes/proxy
 ExecStartPre=/bin/mkdir -p /etc/kubernetes/
-ExecStartPre=-/usr/bin/podman rm kube-proxy
+%s
 ExecStart=/bin/bash -c '/usr/bin/podman run --name kube-proxy \
     --privileged \
     --net host \
@@ -121,5 +122,5 @@ RestartSec=10
 TimeoutStartSec=10min
 [Install]
 WantedBy=multi-user.target
-`, prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
+`, kubecommon.PodmanResetExecStartPre("/usr/bin/podman", "kube-proxy"), prefix, cfg.Shared.Arch, cfg.Shared.KubeTag)
 }
