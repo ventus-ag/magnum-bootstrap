@@ -29,9 +29,9 @@ func TestRemoveContainerRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removed, err := removeContainerRecord(path, orphan)
+	removed, err := removeStorageRecord(path, orphan)
 	if err != nil {
-		t.Fatalf("removeContainerRecord: %v", err)
+		t.Fatalf("removeStorageRecord: %v", err)
 	}
 	if !removed {
 		t.Fatal("expected removed=true")
@@ -69,9 +69,9 @@ func TestRemoveContainerRecordAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removed, err := removeContainerRecord(path, "doesnotexist")
+	removed, err := removeStorageRecord(path, "doesnotexist")
 	if err != nil {
-		t.Fatalf("removeContainerRecord: %v", err)
+		t.Fatalf("removeStorageRecord: %v", err)
 	}
 	if removed {
 		t.Fatal("expected removed=false when id absent")
@@ -84,7 +84,7 @@ func TestRemoveContainerRecordAbsent(t *testing.T) {
 }
 
 func TestRemoveContainerRecordMissingFile(t *testing.T) {
-	removed, err := removeContainerRecord(filepath.Join(t.TempDir(), "nope.json"), "x")
+	removed, err := removeStorageRecord(filepath.Join(t.TempDir(), "nope.json"), "x")
 	if err != nil {
 		t.Fatalf("missing file must be a no-op, got err: %v", err)
 	}

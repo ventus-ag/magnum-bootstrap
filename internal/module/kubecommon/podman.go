@@ -99,7 +99,7 @@ func HealPodmanStorageOrphans(executor *host.Executor, names ...string) ([]host.
 				Summary: fmt.Sprintf("would scrub corrupt podman storage container %s (%s)", o.name, short(o.id))})
 			continue
 		}
-		scrubbed, err := scrubStorageContainer(store, o.id)
+		scrubbed, err := scrubStorageEntry(store, "containers", o.id)
 		if err != nil {
 			return changes, fmt.Errorf("heal podman storage orphan %s (%s): %w", o.name, short(o.id), err)
 		}
@@ -187,32 +187,120 @@ func podmanStorePaths(executor *host.Executor) storePaths {
 	return sp
 }
 
-func scrubStorageContainer(store storePaths, id string) (bool, error) {
+// HealPodmanCorruptImages removes podman images whose on-disk metadata is
+// corrupt, so the kube unit's `podman run` re-pulls a fresh copy on next start.
+//
+// A lost image manifest makes `podman run <ref>` fail with
+//
+//	Error: error reading image "<id>" as image: error locating item named
+//	    "manifest" for image with ID "<id>": file does not exist
+//
+// podman resolves the unit's image tag to that cached, unreadable image and
+// never re-pulls, so the unit crash-loops (status=125) — the same class of
+// c/storage damage as the container orphan, but in the image store. `podman rmi
+// -f` clears it even when the manifest is gone; the unit's default run pull
+// policy ("missing") then pulls a fresh image. On these nodes podman only holds
+// the small control-plane image set (addons run under containerd), so scanning
+// every podman image is cheap.
+//
+// Safety: only images that FAIL `podman image inspect` are removed. A healthy
+// image inspects fine, so a healthy node is a no-op and an in-use image (which
+// inspects fine and would refuse `rmi`) is never touched.
+func HealPodmanCorruptImages(executor *host.Executor) ([]host.Change, error) {
+	ids := listImageIDs(executor)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	var changes []host.Change
+	store := podmanStorePaths(executor)
+	for _, id := range ids {
+		if imageReadable(executor, id) {
+			continue
+		}
+
+		_ = executor.Run("podman", "rmi", "-f", id)
+		if !imageExists(executor, id) {
+			changes = append(changes, host.Change{Action: host.ActionOther,
+				Summary: fmt.Sprintf("removed corrupt podman image %s", short(id))})
+			continue
+		}
+
+		// rmi couldn't remove it (manifest gone on old podman): scrub the store.
+		if !executor.Apply {
+			changes = append(changes, host.Change{Action: host.ActionOther,
+				Summary: fmt.Sprintf("would scrub corrupt podman image %s", short(id))})
+			continue
+		}
+		scrubbed, err := scrubStorageEntry(store, "images", id)
+		if err != nil {
+			return changes, fmt.Errorf("heal corrupt podman image %s: %w", short(id), err)
+		}
+		if scrubbed {
+			changes = append(changes, host.Change{Action: host.ActionOther,
+				Summary: fmt.Sprintf("scrubbed corrupt podman image %s", short(id))})
+		}
+	}
+	return changes, nil
+}
+
+func listImageIDs(executor *host.Executor) []string {
+	out, err := executor.RunCapture("podman", "images", "-a", "--no-trunc", "--format", "{{.ID}}")
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		id := strings.TrimSpace(line)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func imageReadable(executor *host.Executor, id string) bool {
+	_, err := executor.RunCapture("podman", "image", "inspect", id)
+	return err == nil
+}
+
+func imageExists(executor *host.Executor, id string) bool {
+	return executor.Run("podman", "image", "exists", id) == nil
+}
+
+// scrubStorageEntry drops a corrupt c/storage entry (kind = "containers" or
+// "images") that podman itself cannot remove, by deleting its record from
+// <store>/<driver>-<kind>/<kind>.json and removing its metadata dir. The
+// c/storage lock for that store is held across the edit.
+func scrubStorageEntry(store storePaths, kind, id string) (bool, error) {
 	scrubbed := false
 	for _, root := range []string{store.graphRoot, store.runRoot} {
 		if root == "" {
 			continue
 		}
-		dir := filepath.Join(root, store.driver+"-containers")
+		dir := filepath.Join(root, store.driver+"-"+kind)
 
 		// Hold the c/storage lock across the read-modify-write so a concurrent
-		// podman operation on another container can't lose our edit (or vice
-		// versa). containers/storage uses fcntl POSIX locks on containers.lock,
-		// which interoperate with the fcntl lock taken here. Best-effort: if the
-		// lock can't be taken the scrub still proceeds (an already-wedged node
-		// that needs healing is better repaired racily than not at all).
-		err := withStorageLock(dir, func() error {
-			removed, err := removeContainerRecord(filepath.Join(dir, "containers.json"), id)
+		// podman operation can't lose our edit (or vice versa). containers/
+		// storage uses fcntl POSIX locks on <kind>.lock, which interoperate with
+		// the fcntl lock taken here. Best-effort: if the lock can't be taken the
+		// scrub still proceeds (an already-wedged node that needs healing is
+		// better repaired racily than not at all).
+		err := withStorageLock(dir, kind+".lock", func() error {
+			removed, err := removeStorageRecord(filepath.Join(dir, kind+".json"), id)
 			if err != nil {
 				return err
 			}
 			if removed {
 				scrubbed = true
 			}
-			ctrDir := filepath.Join(dir, id)
-			if _, err := os.Stat(ctrDir); err == nil {
-				if err := os.RemoveAll(ctrDir); err != nil {
-					return fmt.Errorf("remove %s: %w", ctrDir, err)
+			entryDir := filepath.Join(dir, id)
+			if _, err := os.Stat(entryDir); err == nil {
+				if err := os.RemoveAll(entryDir); err != nil {
+					return fmt.Errorf("remove %s: %w", entryDir, err)
 				}
 				scrubbed = true
 			}
@@ -225,12 +313,12 @@ func scrubStorageContainer(store storePaths, id string) (bool, error) {
 	return scrubbed, nil
 }
 
-// withStorageLock runs fn while holding an exclusive fcntl lock on the
-// containers.lock in dir, matching containers/storage's own locking so the
-// repair is mutually exclusive with concurrent podman operations. If the lock
-// file can't be opened or locked (e.g. dir absent), fn runs unlocked.
-func withStorageLock(dir string, fn func() error) error {
-	f, err := os.OpenFile(filepath.Join(dir, "containers.lock"), os.O_RDWR|os.O_CREATE, 0o644)
+// withStorageLock runs fn while holding an exclusive fcntl lock on lockName in
+// dir, matching containers/storage's own locking so the repair is mutually
+// exclusive with concurrent podman operations. If the lock file can't be opened
+// or locked (e.g. dir absent), fn runs unlocked.
+func withStorageLock(dir, lockName string, fn func() error) error {
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return fn()
 	}
@@ -246,10 +334,11 @@ func withStorageLock(dir string, fn func() error) error {
 	return fn()
 }
 
-// removeContainerRecord drops the container with the given id from a c/storage
-// containers.json. Surviving records are kept as raw bytes so their exact shape
-// and field order are preserved; only the deleted record is dropped.
-func removeContainerRecord(path, id string) (bool, error) {
+// removeStorageRecord drops the entry with the given id from a c/storage
+// containers.json or images.json (both are arrays of objects keyed by "id").
+// Surviving records are kept as raw bytes so their exact shape and field order
+// are preserved; only the deleted record is dropped.
+func removeStorageRecord(path, id string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

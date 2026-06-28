@@ -47,6 +47,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			return moduleapi.Result{}, err
 		}
 		changes = append(changes, healChanges...)
+
+		// Also clear corrupt podman images (lost manifest) so the unit re-pulls
+		// instead of crash-looping on an unreadable cached image. No-op unless
+		// an image actually fails inspect.
+		imgChanges, err := kubecommon.HealPodmanCorruptImages(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, imgChanges...)
 	}
 
 	// Wait for CA key if cert-manager API is enabled (controller-manager needs it).
