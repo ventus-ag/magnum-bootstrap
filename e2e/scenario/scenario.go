@@ -241,6 +241,9 @@ func (c Config) pairs() []KV {
 	put("CONTAINER_RUNTIME", c.ContainerRuntime)
 	put("USE_PODMAN", b(c.UsePodman))
 	put("CONTAINER_INFRA_PREFIX", "")
+	// heat-container-agent image tag the reconciler converges (empty = leave the
+	// node's baked agent tag untouched). See heat-container-agent module.
+	put("HEAT_CONTAINER_AGENT_TAG", "")
 	put("REGION_NAME", "RegionOne")
 	put("HTTP_PROXY", "")
 	put("HTTPS_PROXY", "")

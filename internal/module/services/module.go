@@ -37,6 +37,18 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{}, err
 	}
 
+	// Self-heal podman storage orphans before (re)starting. No-op unless a kube
+	// container's name is squatted by a storage-only orphan with a lost layer
+	// (podman <= 3.1.x can't `rm` it, so the unit crash-loops on "name already
+	// in use" forever). Only acts when such an orphan is actually present.
+	if req.Apply {
+		healChanges, err := kubecommon.HealPodmanStorageOrphans(executor, podmanContainerNames(cfg)...)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, healChanges...)
+	}
+
 	// Wait for CA key if cert-manager API is enabled (controller-manager needs it).
 	if cfg.Role() == config.RoleMaster && cfg.Shared.CertManagerAPI && req.Apply {
 		caKeyPath := "/etc/kubernetes/certs/ca.key"
@@ -257,6 +269,24 @@ func serviceReadyTimeout(service string) time.Duration {
 	default:
 		return 30 * time.Second
 	}
+}
+
+// podmanContainerNames lists the kube containers that run under podman on this
+// node (container name == unit name). etcd always runs under podman on masters;
+// the kube control-plane / proxy containers only when UsePodman is set. These
+// are the names HealPodmanStorageOrphans guards against storage-layer orphans.
+func podmanContainerNames(cfg config.Config) []string {
+	if cfg.Role() == config.RoleMaster {
+		names := []string{"etcd"}
+		if cfg.Shared.UsePodman {
+			names = append(names, "kube-apiserver", "kube-controller-manager", "kube-scheduler", "kube-proxy")
+		}
+		return names
+	}
+	if cfg.Shared.UsePodman {
+		return []string{"kube-proxy"}
+	}
+	return nil
 }
 
 func desiredServices(cfg config.Config) []string {
