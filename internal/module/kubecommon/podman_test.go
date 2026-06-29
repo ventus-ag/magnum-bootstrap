@@ -7,6 +7,43 @@ import (
 	"testing"
 )
 
+func TestCollectImageIDs(t *testing.T) {
+	const corrupt = "b6a454c5a800d201daacead6ff195ec6049fe6dc086621b0670bca912efaf389"
+	const good = "1111111111111111111111111111111111111111111111111111111111111111"
+
+	// Real-world failure: `podman images` prints good IDs on stdout, exits
+	// non-zero, and names the corrupt image only on stderr.
+	stdout := good + "\n" + good + "\n" // duplicate => deduped
+	stderr := `Error: error retrieving label for image "` + corrupt + `": ` +
+		`you may need to remove the image to resolve the error: error reading image "` + corrupt +
+		`" as image: error locating item named "manifest" for image with ID "` + corrupt + `": file does not exist`
+
+	ids := collectImageIDs(stdout, stderr)
+
+	has := func(want string) bool {
+		for _, id := range ids {
+			if id == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(good) {
+		t.Errorf("missing good image id from stdout; got %v", ids)
+	}
+	if !has(corrupt) {
+		t.Errorf("missing corrupt image id from stderr (the heal target); got %v", ids)
+	}
+	if len(ids) != 2 {
+		t.Errorf("expected 2 deduped ids, got %d: %v", len(ids), ids)
+	}
+
+	// No images at all => empty.
+	if got := collectImageIDs("", ""); len(got) != 0 {
+		t.Errorf("expected no ids, got %v", got)
+	}
+}
+
 func TestPodmanResetExecStartPre(t *testing.T) {
 	got := PodmanResetExecStartPre("/usr/bin/podman", "kube-controller-manager")
 	want := "ExecStartPre=-/usr/bin/podman rm -f kube-controller-manager\n" +

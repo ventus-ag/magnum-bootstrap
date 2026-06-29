@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -207,57 +208,86 @@ func podmanStorePaths(executor *host.Executor) storePaths {
 // image inspects fine, so a healthy node is a no-op and an in-use image (which
 // inspects fine and would refuse `rmi`) is never touched.
 func HealPodmanCorruptImages(executor *host.Executor) ([]host.Change, error) {
-	ids := listImageIDs(executor)
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
 	var changes []host.Change
 	store := podmanStorePaths(executor)
-	for _, id := range ids {
-		if imageReadable(executor, id) {
-			continue
+
+	// A single corrupt image makes `podman images` exit non-zero, and podman may
+	// abort the listing after the first bad entry — so heal in rounds, re-listing
+	// after each removal until the listing is clean or no further progress is
+	// made. maxRounds bounds it against an un-healable entry.
+	const maxRounds = 8
+	for round := 0; round < maxRounds; round++ {
+		stdout, stderr, _ := executor.RunCaptureBoth("podman", "images", "-a", "--no-trunc", "--format", "{{.ID}}")
+		ids := collectImageIDs(stdout, stderr)
+		if len(ids) == 0 {
+			return changes, nil
 		}
 
-		_ = executor.Run("podman", "rmi", "-f", id)
-		if !imageExists(executor, id) {
-			changes = append(changes, host.Change{Action: host.ActionOther,
-				Summary: fmt.Sprintf("removed corrupt podman image %s", short(id))})
-			continue
+		healed := false
+		for _, id := range ids {
+			if imageReadable(executor, id) {
+				continue
+			}
+
+			_ = executor.Run("podman", "rmi", "-f", id)
+			if !imageExists(executor, id) {
+				changes = append(changes, host.Change{Action: host.ActionOther,
+					Summary: fmt.Sprintf("removed corrupt podman image %s", short(id))})
+				healed = true
+				continue
+			}
+
+			// rmi couldn't remove it (manifest gone on old podman): scrub the store.
+			if !executor.Apply {
+				changes = append(changes, host.Change{Action: host.ActionOther,
+					Summary: fmt.Sprintf("would scrub corrupt podman image %s", short(id))})
+				continue
+			}
+			scrubbed, err := scrubStorageEntry(store, "images", id)
+			if err != nil {
+				return changes, fmt.Errorf("heal corrupt podman image %s: %w", short(id), err)
+			}
+			if scrubbed {
+				changes = append(changes, host.Change{Action: host.ActionOther,
+					Summary: fmt.Sprintf("scrubbed corrupt podman image %s", short(id))})
+				healed = true
+			}
 		}
 
-		// rmi couldn't remove it (manifest gone on old podman): scrub the store.
-		if !executor.Apply {
-			changes = append(changes, host.Change{Action: host.ActionOther,
-				Summary: fmt.Sprintf("would scrub corrupt podman image %s", short(id))})
-			continue
-		}
-		scrubbed, err := scrubStorageEntry(store, "images", id)
-		if err != nil {
-			return changes, fmt.Errorf("heal corrupt podman image %s: %w", short(id), err)
-		}
-		if scrubbed {
-			changes = append(changes, host.Change{Action: host.ActionOther,
-				Summary: fmt.Sprintf("scrubbed corrupt podman image %s", short(id))})
+		// Nothing healed this round: either the listing is clean (done) or the
+		// remaining corrupt entry can't be removed (avoid spinning). Stop.
+		if !healed {
+			break
 		}
 	}
 	return changes, nil
 }
 
-func listImageIDs(executor *host.Executor) []string {
-	out, err := executor.RunCapture("podman", "images", "-a", "--no-trunc", "--format", "{{.ID}}")
-	if err != nil {
-		return nil
-	}
+// imageIDPattern matches a full (untruncated) container image ID: 64 hex chars.
+var imageIDPattern = regexp.MustCompile(`[0-9a-f]{64}`)
+
+// collectImageIDs returns the deduped set of image IDs from a
+// `podman images --no-trunc --format {{.ID}}` invocation. It parses the good IDs
+// from stdout AND any image IDs named on stderr: a corrupt image is omitted from
+// stdout but reported on stderr (e.g. `error reading image "<sha>"`), so without
+// the stderr scan the corrupt entry — the only one that needs healing — would be
+// invisible.
+func collectImageIDs(stdout, stderr string) []string {
 	seen := map[string]bool{}
 	var ids []string
-	for _, line := range strings.Split(out, "\n") {
-		id := strings.TrimSpace(line)
+	add := func(id string) {
+		id = strings.TrimSpace(id)
 		if id == "" || seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
 		ids = append(ids, id)
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		add(line)
+	}
+	for _, id := range imageIDPattern.FindAllString(stderr, -1) {
+		add(id)
 	}
 	return ids
 }

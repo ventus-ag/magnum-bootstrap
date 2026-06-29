@@ -254,6 +254,25 @@ func (e *Executor) RunCapture(name string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// RunCaptureBoth runs a command and returns trimmed stdout and stderr
+// separately, regardless of exit status (err is the process error, non-nil on
+// non-zero exit). Unlike RunCapture, it does not discard stdout when the command
+// fails — needed when a command can partially succeed yet name the offending
+// item only on stderr (e.g. `podman images` exits non-zero but prints the
+// corrupt image's ID on stderr). Always runs, including in dry-run, since it is
+// read-only.
+func (e *Executor) RunCaptureBoth(name string, args ...string) (stdout, stderr string, err error) {
+	cmd := exec.Command(name, args...)
+	var so, se bytes.Buffer
+	cmd.Stdout = &so
+	cmd.Stderr = &se
+	err = cmd.Run()
+	if e.Logger != nil && se.Len() > 0 {
+		e.Logger.Infof("%s %s stderr=%s", name, strings.Join(args, " "), strings.TrimSpace(se.String()))
+	}
+	return strings.TrimSpace(so.String()), strings.TrimSpace(se.String()), err
+}
+
 // Systemctl runs a systemctl command. Skipped in dry-run mode for mutating
 // actions (daemon-reload, enable, disable, start, stop, restart) but always
 // runs for read-only actions (is-active, is-enabled, status).
