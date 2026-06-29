@@ -34,7 +34,7 @@ type Resource struct {
 func (Module) PhaseID() string        { return "zincati" }
 func (Module) Dependencies() []string { return []string{"prereq-validation"} }
 
-func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)
 
 	// Zincati is only available on Fedora CoreOS. Skip silently on other OS.
@@ -54,6 +54,20 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes = append(changes, legacyResult.Changes...)
 
 	enabled := cfg.Shared.OSAutoUpgradeEnabled
+
+	// When auto-upgrade is on, make sure the node can verify current FCoS stable
+	// commit signatures. Old nodes (e.g. FCoS 34) lack the newer Fedora signing
+	// keys the re-signed ostree repo uses, so zincati would otherwise wedge at
+	// "Can't check signature: public key not found". Fetches only keys newer than
+	// the node's own release; a current node installs none. Best-effort.
+	if enabled {
+		keyChanges, err := installFedoraGPGKeys(ctx, executor, req.Logger)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, keyChanges...)
+	}
+
 	content := buildConfig(enabled, cfg.ResolveNodeIP())
 	configResource := hostresource.FileSpec{
 		Path:    configPath,

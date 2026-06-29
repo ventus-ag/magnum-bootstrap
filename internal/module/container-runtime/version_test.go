@@ -47,6 +47,57 @@ func TestContainerdTarballURLLayout(t *testing.T) {
 	}
 }
 
+func TestParseGlibcVersion(t *testing.T) {
+	cases := []struct {
+		in           string
+		major, minor int
+		ok           bool
+	}{
+		{"2.33", 2, 33, true},
+		{"2.35-0ubuntu3.4", 2, 35, true},
+		{"2.34", 2, 34, true},
+		{"3.0", 3, 0, true},
+		{"glibc", 0, 0, false},
+		{"", 0, 0, false},
+		{"2", 0, 0, false},
+	}
+	for _, c := range cases {
+		maj, min, ok := parseGlibcVersion(c.in)
+		if ok != c.ok || (ok && (maj != c.major || min != c.minor)) {
+			t.Errorf("parseGlibcVersion(%q) = (%d,%d,%v), want (%d,%d,%v)", c.in, maj, min, ok, c.major, c.minor, c.ok)
+		}
+	}
+}
+
+func TestContainerdMinorLine(t *testing.T) {
+	cases := map[string]string{
+		"2.1.4":  "2.1",
+		"2.2.1":  "2.2",
+		"1.7.30": "1.7",
+		"2.1":    "2.1",
+		"bogus":  "",
+	}
+	for in, want := range cases {
+		if got := containerdMinorLine(in); got != want {
+			t.Errorf("containerdMinorLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestNerdctlFullStaticMappings guards that every static containerd 2.x line we
+// advertise keys on the bundled containerd's own minor line — so version-match
+// after install (which reads `containerd --version`) lines up with the map.
+func TestNerdctlFullStaticMappings(t *testing.T) {
+	for line, st := range nerdctlFullStatic {
+		if got := containerdMinorLine(st.containerdVersion); got != line {
+			t.Errorf("nerdctlFullStatic[%q] bundles containerd %q (line %q); key mismatch", line, st.containerdVersion, got)
+		}
+		if nerdctlFullURL(st.nerdctlVersion) == "" {
+			t.Errorf("nerdctlFullStatic[%q]: empty nerdctl-full URL", line)
+		}
+	}
+}
+
 func TestPauseImageResolvesAcrossRange(t *testing.T) {
 	if len(pauseImageVersions) == 0 {
 		t.Fatal("pauseImageVersions is empty")

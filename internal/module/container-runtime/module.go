@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -25,6 +27,153 @@ var containerdVersions = map[string]string{
 	"1.35": "2.2.5",
 	"1.32": "2.1.9",
 	"1.31": "1.7.30",
+}
+
+// minGlibcMinorForContainerd2 is the host glibc minor version (the MM in 2.MM)
+// required to run the official containerd 2.x release binaries. Those binaries
+// are dynamically linked against GLIBC_2.34, so a node on older glibc (for
+// example Fedora CoreOS 34, glibc 2.33) cannot exec them at all — containerd
+// dies with "/usr/local/bin/containerd: /lib64/libc.so.6: version
+// `GLIBC_2.34' not found". Such nodes must install a statically linked build.
+const minGlibcMinorForContainerd2 = 34
+
+// staticContainerdFallback is the statically linked containerd 1.7.x LTS release
+// (cri-containerd-cni bundle) used on old-glibc nodes when no static containerd
+// 2.x bundle is known for the desired 2.x line. It is fully static (runs on any
+// glibc) and its CRI plugin officially supports Kubernetes through 1.35.
+const staticContainerdFallback = "1.7.30"
+
+// nerdctlFullStatic maps a containerd 2.x minor line ("2.1", "2.2", ...) to the
+// nerdctl-full release that ships a statically linked containerd of that line,
+// plus the exact containerd version that bundle contains. nerdctl-full is the
+// only prebuilt source of static containerd 2.x binaries; the official
+// containerd release tarballs are dynamically linked (GLIBC_2.34). Used to keep
+// containerd 2.x running on old-glibc nodes (e.g. in-place k8s 1.32+ upgrades of
+// Fedora CoreOS 34). The bundled containerd patch may trail the version map's
+// preferred 2.x patch — acceptable; it stays on the same 2.x line.
+var nerdctlFullStatic = map[string]struct{ nerdctlVersion, containerdVersion string }{
+	"2.1": {nerdctlVersion: "2.1.6", containerdVersion: "2.1.4"},
+	"2.2": {nerdctlVersion: "2.2.2", containerdVersion: "2.2.1"},
+	"2.3": {nerdctlVersion: "2.3.4", containerdVersion: "2.3.2"},
+}
+
+// containerdSelection describes the containerd artifact to install on this node.
+type containerdSelection struct {
+	version       string // containerd version, matched against `containerd --version`
+	url           string // tarball URL to download
+	v2Layout      bool   // install under /usr/local (containerd 2.x, official or static)
+	staticNerdctl bool   // source is a nerdctl-full bundle (extract only needed binaries)
+}
+
+// selectContainerd picks the containerd artifact for the node's Kubernetes
+// version. On nodes whose glibc is too old to run the dynamically linked
+// official containerd 2.x binaries it substitutes a statically linked source:
+// a nerdctl-full bundle for the same 2.x line when one is known, otherwise the
+// static containerd 1.7.x LTS cri bundle (supported through k8s 1.35).
+func selectContainerd(kubeTag string) containerdSelection {
+	version := config.LookupByKubeVersion(containerdVersions, kubeTag)
+	major, _, ok := parseContainerdMajor(version)
+	v2 := ok && major >= 2
+
+	if v2 && !hostGlibcAtLeastMinor(minGlibcMinorForContainerd2) {
+		if st, ok := nerdctlFullStatic[containerdMinorLine(version)]; ok {
+			return containerdSelection{
+				version:       st.containerdVersion,
+				url:           nerdctlFullURL(st.nerdctlVersion),
+				v2Layout:      true,
+				staticNerdctl: true,
+			}
+		}
+		return containerdSelection{
+			version:  staticContainerdFallback,
+			url:      containerdTarballURL(staticContainerdFallback, false),
+			v2Layout: false,
+		}
+	}
+
+	return containerdSelection{
+		version:  version,
+		url:      containerdTarballURL(version, v2),
+		v2Layout: v2,
+	}
+}
+
+// containerdMinorLine returns the "major.minor" line of a containerd version
+// (e.g. "2.1.4" -> "2.1"). Returns "" if the version is not in major.minor form.
+func containerdMinorLine(version string) string {
+	first := strings.IndexByte(version, '.')
+	if first < 1 {
+		return ""
+	}
+	second := strings.IndexByte(version[first+1:], '.')
+	if second < 1 {
+		return version // already "major.minor"
+	}
+	return version[:first+1+second]
+}
+
+// nerdctlFullURL builds the nerdctl-full bundle URL for a nerdctl release.
+func nerdctlFullURL(nerdctlVersion string) string {
+	return fmt.Sprintf(
+		"https://github.com/containerd/nerdctl/releases/download/v%s/nerdctl-full-%s-linux-amd64.tar.gz",
+		nerdctlVersion, nerdctlVersion,
+	)
+}
+
+// hostGlibcAtLeastMinor reports whether the host glibc is at least 2.<minMinor>.
+// It parses the first line of `ldd --version`, whose final whitespace-separated
+// token is the glibc version (e.g. "ldd (GNU libc) 2.33" or
+// "ldd (Ubuntu GLIBC 2.35-0ubuntu3.4) 2.35"). On any exec/parse failure it
+// returns true (assume a modern glibc) so detection problems never force the
+// static fallback on nodes that can run the official binaries; the case we guard
+// is a positively detected old glibc.
+func hostGlibcAtLeastMinor(minMinor int) bool {
+	out, err := exec.Command("ldd", "--version").Output()
+	if err != nil {
+		return true
+	}
+	first := string(out)
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	fields := strings.Fields(first)
+	if len(fields) == 0 {
+		return true
+	}
+	major, minor, ok := parseGlibcVersion(fields[len(fields)-1])
+	if !ok {
+		return true
+	}
+	if major != 2 {
+		return major > 2
+	}
+	return minor >= minMinor
+}
+
+// parseGlibcVersion extracts the major and minor from a glibc version token such
+// as "2.33" or "2.35-0ubuntu3.4".
+func parseGlibcVersion(s string) (major, minor int, ok bool) {
+	dot := strings.IndexByte(s, '.')
+	if dot < 1 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(s[:dot])
+	if err != nil {
+		return 0, 0, false
+	}
+	rest := s[dot+1:]
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, 0, false
+	}
+	minor, err = strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 type Module struct{}
@@ -131,35 +280,30 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 		changes = append(changes, res.Changes...)
 	}
 
-	// Select containerd version by Kubernetes version.
-	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
-	useV2Layout := false
-	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
-		useV2Layout = true
-	}
-
-	// Determine tarball URL and install layout.
+	// Select the containerd artifact for this Kubernetes version. On old-glibc
+	// nodes selectContainerd swaps the dynamically linked official containerd 2.x
+	// for a statically linked source (nerdctl-full for the same 2.x line, or the
+	// static 1.7.x LTS cri bundle) so the binary can actually exec.
 	//
-	// containerd 1.x published "cri-containerd-cni-VERSION-linux-amd64.tar.gz"
-	// which extracts to "/" and includes binaries, CNI, runc, systemd unit, and
-	// a default config.toml.
-	//
-	// containerd 2.x dropped the cri-containerd-cni bundle. It publishes
-	// "containerd-VERSION-linux-amd64.tar.gz" which contains only the containerd
-	// binaries under "bin/" and must be extracted to "/usr/local". CNI plugins
-	// and runc are installed separately (CNI is handled by the network driver
-	// module).
-	var tarballURL string
-	if useV2Layout {
-		tarballURL = fmt.Sprintf(
-			"https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz",
-			containerdVersion, containerdVersion,
-		)
-	} else {
-		tarballURL = fmt.Sprintf(
-			"https://github.com/containerd/containerd/releases/download/v%s/cri-containerd-cni-%s-linux-amd64.tar.gz",
-			containerdVersion, containerdVersion,
-		)
+	// Layouts:
+	//   - containerd 1.x cri-containerd-cni bundle: extracts to "/" and includes
+	//     binaries, CNI, runc, systemd unit, default config.toml.
+	//   - containerd 2.x official tarball: only containerd binaries under "bin/",
+	//     installed to "/usr/local"; CNI/runc handled separately.
+	//   - nerdctl-full bundle: static containerd 2.x; we extract only the
+	//     containerd binaries (+ static runc) we need (the bundle is ~260MB).
+	wantedVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
+	sel := selectContainerd(cfg.Shared.KubeTag)
+	containerdVersion := sel.version
+	useV2Layout := sel.v2Layout
+	tarballURL := sel.url
+	if sel.version != wantedVersion && executor.Logger != nil {
+		source := "cri-bundle 1.7.x"
+		if sel.staticNerdctl {
+			source = "nerdctl-full"
+		}
+		executor.Logger.Infof("container-runtime: host glibc too old for dynamically linked containerd %s; installing static containerd %s (%s)",
+			wantedVersion, sel.version, source)
 	}
 
 	// Check if the desired version is already installed. If a different
@@ -235,14 +379,53 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 				return nil, false, fmt.Errorf("create containerd scratch dir: %w", err)
 			}
 			changes = append(changes, scratchDir.Changes...)
-			if err := executor.Run("tar", "xzf", localPath,
-				"-C", scratch,
-				"--no-same-owner", "--touch", "--no-same-permissions",
-			); err != nil {
-				return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
-			}
-			if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/.", usrLocalRoot); err != nil {
-				return nil, false, fmt.Errorf("install containerd files -> %s: %w", usrLocalRoot, err)
+			if sel.staticNerdctl {
+				// nerdctl-full is ~260MB and ships buildkit/CNI/stargz/etc. under
+				// bin,lib,libexec,share. Extract only the static containerd binaries we
+				// install. runc is placed in sbin so it precedes any older (possibly
+				// dynamically linked, glibc-incompatible) runc earlier in the systemd
+				// PATH (/usr/local/sbin before /usr/local/bin).
+				if err := executor.Run("tar", "xzf", localPath,
+					"-C", scratch,
+					"--no-same-owner", "--touch", "--no-same-permissions",
+					"bin/containerd", "bin/containerd-shim-runc-v2", "bin/ctr", "bin/runc",
+				); err != nil {
+					return nil, false, fmt.Errorf("extract nerdctl-full containerd binaries: %w", err)
+				}
+				binDst := usrLocalRoot + "/bin"
+				binDir, err := (hostresource.DirectorySpec{Path: binDst, Mode: 0o755}).Apply(executor)
+				if err != nil {
+					return nil, false, fmt.Errorf("ensure containerd bin dir %s: %w", binDst, err)
+				}
+				changes = append(changes, binDir.Changes...)
+				for _, b := range []string{"containerd", "containerd-shim-runc-v2", "ctr"} {
+					if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/bin/"+b, binDst+"/"); err != nil {
+						return nil, false, fmt.Errorf("install %s -> %s: %w", b, binDst, err)
+					}
+				}
+				sbinDst := usrLocalRoot + "/sbin"
+				sbinDir, err := (hostresource.DirectorySpec{Path: sbinDst, Mode: 0o755}).Apply(executor)
+				if err != nil {
+					return nil, false, fmt.Errorf("ensure runc sbin dir %s: %w", sbinDst, err)
+				}
+				changes = append(changes, sbinDir.Changes...)
+				if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/bin/runc", sbinDst+"/runc"); err != nil {
+					return nil, false, fmt.Errorf("install runc -> %s: %w", sbinDst, err)
+				}
+				if err := executor.Run("rm", "-rf", scratch); err != nil {
+					return nil, false, fmt.Errorf("remove containerd scratch dir: %w", err)
+				}
+			} else {
+				// containerd 2.x official tarball: bin/ at the archive root.
+				if err := executor.Run("tar", "xzf", localPath,
+					"-C", scratch,
+					"--no-same-owner", "--touch", "--no-same-permissions",
+				); err != nil {
+					return nil, false, fmt.Errorf("extract containerd tarball: %w", err)
+				}
+				if err := executor.Run("cp", "-a", "--remove-destination", scratch+"/.", usrLocalRoot); err != nil {
+					return nil, false, fmt.Errorf("install containerd files -> %s: %w", usrLocalRoot, err)
+				}
 			}
 		} else {
 			// containerd 1.x cri-containerd-cni bundle: unpack to a scratch dir on
@@ -683,11 +866,9 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 	childOpts := hostresource.ChildResourceOptions(res, opts...)
 
-	containerdVersion := config.LookupByKubeVersion(containerdVersions, cfg.Shared.KubeTag)
-	useV2Layout := false
-	if major, _, ok := parseContainerdMajor(containerdVersion); ok && major >= 2 {
-		useV2Layout = true
-	}
+	sel := selectContainerd(cfg.Shared.KubeTag)
+	containerdVersion := sel.version
+	useV2Layout := sel.v2Layout
 
 	if cfg.Shared.ContainerRuntime == "containerd" {
 		var tarballRes pulumi.Resource
@@ -705,7 +886,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				return nil, err
 			}
 		}
-		tarballRes, err = hostsdk.RegisterDownloadSpec(ctx, name+"-tarball", hostresource.DownloadSpec{URL: containerdTarballURL(containerdVersion, useV2Layout), Path: "/srv/magnum/containerd.tar.gz", Mode: 0o644, Retries: 5}, childOpts...)
+		tarballRes, err = hostsdk.RegisterDownloadSpec(ctx, name+"-tarball", hostresource.DownloadSpec{URL: sel.url, Path: "/srv/magnum/containerd.tar.gz", Mode: 0o644, Retries: 5}, childOpts...)
 		if err != nil {
 			return nil, err
 		}
