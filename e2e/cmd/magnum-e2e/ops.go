@@ -175,10 +175,14 @@ var scenarios = map[string]scenarioDef{
 		upgradeLadder: climbLadder,
 	},
 	// ubuntu-upgrade — k8s_ubuntu_v1 driver lifecycle: create 1.29 → upgrade 1.31
-	// (a 2-minor cluster upgrade; the ±1 skew guard is nodepool-only) → cloud-smoke.
+	// (a 2-minor cluster upgrade; the ±1 skew guard is nodepool-only) →
+	// ca-rotate → verify-sa → cloud-smoke. The rotation is deliberately here:
+	// Ubuntu is the second OS and this is the only tier that ever exercises
+	// the disruptive CA-rotation path on it (cloud-init provisioning, units
+	// under /lib/systemd, podman control plane).
 	"ubuntu-upgrade": {
 		masters: 1, workers: 1,
-		ops:             "upgrade,cloud-smoke",
+		ops:             "upgrade,ca-rotate,verify-sa,cloud-smoke",
 		template:        ubuntuTemplate129,
 		upgradeTemplate: ubuntuTemplate131,
 		sshUser:         "ubuntu",

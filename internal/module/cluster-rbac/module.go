@@ -267,22 +267,28 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	// value (e.g. local CA files transiently unreadable) — that breaks every
 	// OpenStack API call from the cloud controllers. Resolve from local files
 	// first; if unavailable, preserve whatever the live Secret already holds.
+	// The value must be the RAW PEM: StringData is base64-encoded by
+	// Kubernetes itself, so pre-encoding here would store base64-of-base64 —
+	// consumers decoding .data would get base64 text instead of a CA bundle
+	// (legacy bash created this secret with --from-file, i.e. raw PEM).
 	caBundle := ""
 	if data, err := os.ReadFile("/etc/kubernetes/ca-bundle.crt"); err == nil && len(data) > 0 {
-		caBundle = base64.StdEncoding.EncodeToString(data)
+		caBundle = string(data)
 	} else if data, err := os.ReadFile("/etc/kubernetes/certs/ca.crt"); err == nil && len(data) > 0 {
 		// Fallback: use the cluster CA cert if the bundle is not yet available.
-		caBundle = base64.StdEncoding.EncodeToString(data)
+		caBundle = string(data)
 	}
 	if caBundle == "" {
 		// Last resort: keep the bundle already stored in the live os-trustee
-		// Secret rather than clobbering it with empty. The Secret's .data value
-		// is already base64-encoded, so reuse it verbatim.
+		// Secret rather than clobbering it with empty. The .data value is
+		// base64(stored value) — decode it back to the raw value before it
+		// goes through StringData again, or every rescue would stack one more
+		// encoding layer onto the bundle it claims to preserve.
 		probe := host.NewExecutor(false, nil)
 		if existing, err := probe.RunCapture("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
 			"get", "secret", "os-trustee", "-n", "kube-system",
 			"-o", "jsonpath={.data.os-certAuthority}"); err == nil {
-			caBundle = strings.TrimSpace(existing)
+			caBundle = normalizeCABundle(strings.TrimSpace(existing))
 		}
 	}
 	// If every source fails, continue with an empty CA bundle — certs may not be
@@ -321,4 +327,26 @@ func registerEmpty(ctx *pulumi.Context, name string, opts ...pulumi.ResourceOpti
 		return nil, err
 	}
 	return res, nil
+}
+
+// normalizeCABundle peels base64 layers off a value read from the live
+// secret's .data until it looks like PEM. One decode undoes Kubernetes' own
+// storage encoding; additional rounds heal values double-encoded by earlier
+// buggy runs. Returns the input unchanged if it never decodes to PEM.
+func normalizeCABundle(value string) string {
+	current := value
+	for range 3 {
+		if strings.Contains(current, "-----BEGIN") {
+			return current
+		}
+		decoded, err := base64.StdEncoding.DecodeString(current)
+		if err != nil {
+			return current
+		}
+		current = string(decoded)
+	}
+	if strings.Contains(current, "-----BEGIN") {
+		return current
+	}
+	return value
 }

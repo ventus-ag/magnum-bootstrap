@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"time"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/fsatomic"
 )
 
 type State struct {
@@ -46,5 +48,5 @@ func Write(path string, state State) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+	return fsatomic.WriteFile(path, data, 0o600)
 }

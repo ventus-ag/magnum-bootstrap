@@ -29,8 +29,8 @@ on:
         description: Upgrade target version
         default: v1.31.4
       scenarios:
-        description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade)"
-        default: create ca-rotate upgrade
+        description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade, periodic)"
+        default: create ca-rotate upgrade periodic
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
         default: stable/victoria
@@ -46,6 +46,13 @@ on:
         description: Run e2e-fcos against the real magnumhost Pulumi provider (instead of the legacy bridge)
         type: boolean
         default: false
+      run_old_fcos:
+        description: Also run the pinned pre-composefs FCoS image tier
+        type: boolean
+        default: false
+      fcos_version:
+        description: "Pinned FCoS build for the old-image tier (empty = default pre-composefs build)"
+        default: ""
       masters:
         description: Multi-master node count (multimaster tier)
         default: "3"
@@ -210,11 +217,16 @@ jobs:
           - name: pinned
             kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
             kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
-            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
+            workers: 0
+          # One worker VM on the latest entry only (TCG makes each extra VM
+          # expensive): without it the worker reconcile path (worker-certs,
+          # kube-worker-config, registry) has ZERO per-PR coverage.
           - name: latest
             kube_tag: v1.31.4
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
-            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade' }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
+            workers: 1
     steps:
       - name: Checkout magnum-bootstrap
         uses: actions/checkout@v4
@@ -261,6 +273,7 @@ jobs:
           KUBE_TAG: ${{ matrix.kube_tag }}
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ matrix.scenarios }}
+          WORKERS: ${{ matrix.workers }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: |
           chmod +x "$PREBUILT_BOOTSTRAP" "$PREBUILT_HOST_PROVIDER" || true
@@ -281,6 +294,89 @@ jobs:
         if: always()
         run: |
           WD="${{ runner.temp }}/fcos-e2e-${{ matrix.name }}"
+          pkill -f "$WD" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "$WD" 2>/dev/null || true
+          rm -rf "$WD" || true
+
+  # ---------------------------------------------------------------------------
+  # e2e-fcos-oldimage — same single-master suite on a PINNED pre-composefs FCoS
+  # build. Prod still runs the older image family; the per-PR tier only ever
+  # tests the latest stable, so the "must work on both" claim needs this job.
+  # Nightly + dispatch (run_old_fcos) only — TCG makes a third per-PR VM run
+  # too expensive.
+  # ---------------------------------------------------------------------------
+  e2e-fcos-oldimage:
+    name: e2e-fcos-oldimage
+    needs: [build, resolve]
+    runs-on: self-hosted
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_old_fcos == 'true')
+    steps:
+      - name: Checkout magnum-bootstrap
+        uses: actions/checkout@v4
+
+      - name: Checkout forked driver (ventus-ag/magnum)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MAGNUM_REPO || 'ventus-ag/magnum' }}
+          ref: ${{ github.event.inputs.magnum_ref || vars.MAGNUM_REF || 'stable/victoria' }}
+          path: magnum
+          token: ${{ secrets.RW_PAT_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-dist
+          path: ${{ runner.temp }}/prebuilt
+
+      - name: Provision runner (idempotent self-config)
+        if: ${{ vars.E2E_SELF_PROVISION != 'false' }}
+        run: |
+          sudo SKIP_GO=1 SKIP_PREFLIGHT=1 ./e2e/vm/runner-setup.sh
+          sudo chmod 0666 /dev/kvm || true
+
+      - name: Runner preflight
+        run: ./e2e/vm/runner-preflight.sh
+
+      - name: Run Fedora CoreOS e2e (pinned pre-composefs image)
+        env:
+          VICTORIA_DIR: ${{ github.workspace }}/magnum
+          PREBUILT_BOOTSTRAP: ${{ runner.temp }}/prebuilt/bootstrap
+          PREBUILT_HOST_PROVIDER: ${{ runner.temp }}/prebuilt/pulumi-resource-magnumhost
+          USE_HOST_PROVIDER: "false"
+          # Last pre-composefs stable build family (mutable /usr symlink
+          # semantics, older glibc) — the image generation prod still runs.
+          FCOS_VERSION: ${{ github.event.inputs.fcos_version || '38.20231027.3.2' }}
+          KUBE_TAG: v1.30.5
+          KUBE_TAG_UPGRADE: v1.31.4
+          SCENARIOS: create ca-rotate upgrade periodic
+          WORKDIR: ${{ runner.temp }}/fcos-e2e-oldimage
+        run: |
+          chmod +x "$PREBUILT_BOOTSTRAP" "$PREBUILT_HOST_PROVIDER" || true
+          ./e2e/vm/run-fcos-e2e.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcos-e2e-oldimage-diag
+          path: |
+            ${{ runner.temp }}/fcos-e2e-oldimage/console.*.log
+            ${{ runner.temp }}/fcos-e2e-oldimage/heat-params.*
+            ${{ runner.temp }}/fcos-e2e-oldimage/ignition.*.json
+          if-no-files-found: ignore
+
+      - name: Clean up VMs and workdir
+        if: always()
+        run: |
+          WD="${{ runner.temp }}/fcos-e2e-oldimage"
           pkill -f "$WD" 2>/dev/null || true
           sleep 2
           pkill -9 -f "$WD" 2>/dev/null || true

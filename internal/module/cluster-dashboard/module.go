@@ -64,6 +64,24 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		},
 	}
 
+	// Per-component values; CONTAINER_INFRA_PREFIX redirects the kubernetesui
+	// images to the mirror (chart 7.x has one image per component). The kong
+	// proxy subchart image is third-party and is NOT remapped — full air-gap
+	// for the dashboard needs a kong mirror configured chart-side.
+	component := func(image string) map[string]interface{} {
+		v := map[string]interface{}{"nodeSelector": nodeSelector}
+		if prefix := cfg.Shared.ContainerInfraPrefix; prefix != "" {
+			v["image"] = map[string]interface{}{"repository": prefix + image}
+		}
+		return v
+	}
+	appValues := map[string]interface{}{
+		"scheduling": map[string]interface{}{
+			"nodeSelector": nodeSelector,
+		},
+		"tolerations": tolerations,
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "kubernetes-dashboard",
 		Namespace:   "kubernetes-dashboard",
@@ -71,16 +89,11 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Version:     chartVersion,
 		RepoURL:     "https://kubernetes-retired.github.io/dashboard/",
 		Values: map[string]interface{}{
-			"app": map[string]interface{}{
-				"scheduling": map[string]interface{}{
-					"nodeSelector": nodeSelector,
-				},
-				"tolerations": tolerations,
-			},
-			"auth":           map[string]interface{}{"nodeSelector": nodeSelector},
-			"api":            map[string]interface{}{"nodeSelector": nodeSelector},
-			"web":            map[string]interface{}{"nodeSelector": nodeSelector},
-			"metricsScraper": map[string]interface{}{"nodeSelector": nodeSelector},
+			"app":            appValues,
+			"auth":           component("dashboard-auth"),
+			"api":            component("dashboard-api"),
+			"web":            component("dashboard-web"),
+			"metricsScraper": component("dashboard-metrics-scraper"),
 			"kong": map[string]interface{}{
 				"nodeSelector": nodeSelector,
 				"tolerations":  tolerations,

@@ -1,12 +1,15 @@
 package config
 
 import (
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -196,6 +199,7 @@ type SharedConfig struct {
 	VolumeDriver     string `json:"volumeDriver"`
 	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
 	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
+	ManilaShareType  string `json:"manilaShareType"`
 
 	// NVIDIA GPU Operator (master-0 only, requires GPU nodes)
 	GPUOperatorEnabled bool `json:"gpuOperatorEnabled"`
@@ -329,23 +333,65 @@ func (c Config) IsFirstMaster() bool {
 	return false
 }
 
+var (
+	metadataNodeIPOnce sync.Once
+	metadataNodeIP     string
+	// metadataNodeIPURL is a var for tests.
+	metadataNodeIPURL = "http://169.254.169.254/latest/meta-data/local-ipv4"
+)
+
 // ResolveNodeIP returns KubeNodeIP from config, falling back to the OpenStack
 // metadata service if the config field is empty.
+//
+// The metadata result is fetched once per process and cached: many phases
+// (certs, etcd, kubelet config) call this independently, and a transient
+// metadata failure mid-run would otherwise give them INCONSISTENT node
+// identity — e.g. a cert signed without the node-IP SAN that etcd then
+// advertises. One consistent answer (even a consistent failure) beats a
+// per-call lottery. The fetch validates the HTTP status and that the body is
+// an IP, so an error page can never become the "node IP".
 func (c Config) ResolveNodeIP() string {
 	if c.Shared.KubeNodeIP != "" {
 		return c.Shared.KubeNodeIP
 	}
+	metadataNodeIPOnce.Do(func() {
+		metadataNodeIP = fetchMetadataNodeIP()
+	})
+	return metadataNodeIP
+}
+
+func fetchMetadataNodeIP() string {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://169.254.169.254/latest/meta-data/local-ipv4")
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		ip, err := fetchMetadataNodeIPOnce(client)
+		if err == nil {
+			return ip
+		}
+	}
+	return ""
+}
+
+func fetchMetadataNodeIPOnce(client *http.Client) (string, error) {
+	resp, err := client.Get(metadataNodeIPURL)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata service returned status %d", resp.StatusCode)
 	}
-	return strings.TrimSpace(string(body))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(string(body))
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("metadata service returned %q, not an IP", ip)
+	}
+	return ip, nil
 }
 
 // ResolveCgroupDriver returns the cgroup driver to use.

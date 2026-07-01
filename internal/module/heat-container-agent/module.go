@@ -18,10 +18,21 @@ import (
 
 const unitName = "heat-container-agent"
 
-// agentUnitPath is the systemd unit ignition writes at first boot. ignition runs
-// only once (user_data_update_policy: IGNORE in the Heat templates), so the baked
-// image tag never changes on its own — the reconciler converges it here.
+// agentUnitPath is the systemd unit ignition writes at first boot on Fedora
+// CoreOS. ignition runs only once (user_data_update_policy: IGNORE in the Heat
+// templates), so the baked image tag never changes on its own — the reconciler
+// converges it here. Converged content is always written to this /etc path:
+// it either updates the FCoS unit in place or shadows the Ubuntu vendor unit
+// (systemd gives /etc priority over /lib).
 const agentUnitPath = "/etc/systemd/system/heat-container-agent.service"
+
+// agentUnitReadPaths are probed in order for the current unit content. Ubuntu
+// cloud-init installs the unit under /lib/systemd/system instead of /etc.
+var agentUnitReadPaths = []string{
+	agentUnitPath,
+	"/lib/systemd/system/heat-container-agent.service",
+	"/usr/lib/systemd/system/heat-container-agent.service",
+}
 
 // agentImageRef matches the "<prefix>heat-container-agent:<tag>" token on the
 // podman pull + run lines. The token is whitespace/quote/backslash delimited;
@@ -41,6 +52,17 @@ func (Module) Dependencies() []string { return []string{"start-services"} }
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	var changes []host.Change
+
+	// The agent unit is installed by the image bootstrap (ignition on FCoS,
+	// cloud-init on Ubuntu), never by the reconciler. A node without it (e.g.
+	// a custom image) must not fail the whole phase — there is nothing to
+	// converge and nothing to wait on.
+	if !executor.SystemctlExists(unitName) {
+		logf(req, "warn", "unit %s not known to systemd; skipping heat-container-agent phase", unitName)
+		return moduleapi.Result{
+			Warnings: []string{fmt.Sprintf("unit %s not present on this node; heat-container-agent convergence skipped", unitName)},
+		}, nil
+	}
 
 	// Converge the agent image tag toward the desired heat-params value so an
 	// agent version bump (e.g. ussuri -> victoria) lands without replacing the
@@ -82,19 +104,27 @@ func reconcileAgentImage(executor *host.Executor, cfg config.Config, req modulea
 	}
 	desiredRef := cfg.Shared.ContainerInfraPrefix + "heat-container-agent:" + tag
 
-	content, err := os.ReadFile(agentUnitPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			logf(req, "warn", "agent unit %s not found; skipping image convergence", agentUnitPath)
-			return nil, nil
+	var content []byte
+	var readPath string
+	for _, p := range agentUnitReadPaths {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			content, readPath = data, p
+			break
 		}
-		return nil, fmt.Errorf("read %s: %w", agentUnitPath, err)
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read %s: %w", p, err)
+		}
+	}
+	if readPath == "" {
+		logf(req, "warn", "agent unit not found at any of %v; skipping image convergence", agentUnitReadPaths)
+		return nil, nil
 	}
 
 	// An unexpected unit format (no recognizable image token) should be visible
 	// but must not wedge the whole node reconcile — the agent may be running fine.
 	if !agentImageRef.Match(content) {
-		logf(req, "warn", "agent unit %s has no recognizable heat-container-agent image reference; skipping tag convergence", agentUnitPath)
+		logf(req, "warn", "agent unit %s has no recognizable heat-container-agent image reference; skipping tag convergence", readPath)
 		return nil, nil
 	}
 

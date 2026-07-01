@@ -33,7 +33,7 @@ func (Module) PhaseID() string {
 func (Module) Dependencies() []string { return []string{"master-certificates", "worker-certificates"} }
 
 func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	content, err := buildContent(cfg)
+	content, err := BuildContent(cfg)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
@@ -54,7 +54,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		content string
 		mode    os.FileMode
 	}{
-		{path: "/etc/kubernetes/admin.conf", content: content, mode: 0o644},
+		{path: "/etc/kubernetes/admin.conf", content: content, mode: 0o600},
 		{path: "/root/.kube/config", content: content, mode: 0o600},
 	} {
 		result, err := (hostresource.FileSpec{Path: file.path, Content: []byte(file.content), Mode: file.mode}).Apply(executor)
@@ -122,7 +122,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
-	content, err := buildContent(cfg)
+	content, err := BuildContent(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		path string
 		mode os.FileMode
 	}{
-		{name: "admin-conf", path: "/etc/kubernetes/admin.conf", mode: 0o644},
+		{name: "admin-conf", path: "/etc/kubernetes/admin.conf", mode: 0o600},
 		{name: "root-kubeconfig", path: "/root/.kube/config", mode: 0o600},
 	} {
 		parentDir := filepath.Dir(file.path)
@@ -184,7 +184,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	return res, nil
 }
 
-func buildContent(cfg config.Config) (string, error) {
+// BuildContent renders the admin kubeconfig for this node's role. It is the
+// single source of admin.conf content — ca-rotation writes the same file
+// after installing rotated certs and must render identical bytes, or every
+// rotation is followed by a spurious admin-kubeconfig rewrite on the next
+// reconcile.
+func BuildContent(cfg config.Config) (string, error) {
 	const certDir = "/etc/kubernetes/certs"
 
 	if cfg.Role() == config.RoleMaster {
@@ -200,12 +205,20 @@ func buildContent(cfg config.Config) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		apiPort := cfg.Shared.KubeAPIPort
+		if apiPort == 0 {
+			apiPort = 6443
+		}
+		protocol := "https"
+		if cfg.Shared.TLSDisabled {
+			protocol = "http"
+		}
 		return strings.TrimSpace(fmt.Sprintf(`
 apiVersion: v1
 clusters:
 - cluster:
     certificate-authority-data: %s
-    server: https://127.0.0.1:%d
+    server: %s://127.0.0.1:%d
   name: %s
 contexts:
 - context:
@@ -221,7 +234,7 @@ users:
     as-user-extra: {}
     client-certificate-data: %s
     client-key-data: %s
-`, caData, cfg.Shared.KubeAPIPort, cfg.Shared.ClusterUUID, cfg.Shared.ClusterUUID, adminCert, adminKey)) + "\n", nil
+`, caData, protocol, apiPort, cfg.Shared.ClusterUUID, cfg.Shared.ClusterUUID, adminCert, adminKey)) + "\n", nil
 	}
 
 	if cfg.Worker == nil {

@@ -154,6 +154,9 @@ func RegisterExtractTarSpec(ctx *pulumi.Context, name string, spec hostresource.
 		if spec.ChmodExecutables {
 			args.ChmodExecutables = pulumi.BoolPtr(true)
 		}
+		if spec.StampPath != "" {
+			args.StampPath = pulumi.StringPtr(spec.StampPath)
+		}
 		return NewExtractTar(ctx, name, args, opts...)
 	}
 	return spec.Register(ctx, name, opts...)

@@ -64,6 +64,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 
 	chartVersion := config.LookupByKubeVersion(metricsServerChartVersions, cfg.Shared.KubeVersion)
+	clusterhelm.WarnIfClampedBelow(ctx, "cluster-metrics-server", metricsServerChartVersions, cfg.Shared.KubeVersion)
 
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "metrics-server",

@@ -157,6 +157,12 @@ func (e *Executor) EnsureAbsent(path string) (*Change, error) {
 }
 
 func (e *Executor) EnsureLine(path, line string, mode os.FileMode) (*Change, error) {
+	// Serialize: multiple phases (and the host-provider plugin) append lines
+	// to shared files like /etc/fstab; an unsynchronized read-modify-write
+	// lets the last rename win and silently drop the other writer's line.
+	release := lockSharedFile(path)
+	defer release()
+
 	current, err := os.ReadFile(path)
 	switch {
 	case os.IsNotExist(err):
@@ -182,6 +188,11 @@ func (e *Executor) EnsureLine(path, line string, mode os.FileMode) (*Change, err
 }
 
 func (e *Executor) UpsertExport(path, varName, value string, mode os.FileMode) (*Change, error) {
+	// Same shared-file serialization as EnsureLine (e.g. /etc/bashrc is
+	// written by both the proxy and admin-kubeconfig phases).
+	release := lockSharedFile(path)
+	defer release()
+
 	current, err := os.ReadFile(path)
 	fileMissing := false
 	switch {
@@ -239,6 +250,13 @@ func (e *Executor) Run(name string, args ...string) error {
 // RunCapture executes a command and returns its stdout. Unlike Run it always
 // executes regardless of the Apply flag because callers need the output to
 // make decisions (e.g. checking etcd membership, getting instance IDs).
+// BlockDeviceFstype probes the on-disk filesystem type of a block device.
+// Returns "" for a blank (unformatted) device or on probe failure.
+func (e *Executor) BlockDeviceFstype(devicePath string) string {
+	out, _ := e.RunCapture("lsblk", "-ndo", "FSTYPE", devicePath)
+	return strings.TrimSpace(out)
+}
+
 func (e *Executor) RunCapture(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	var stdout, stderr bytes.Buffer
@@ -393,13 +411,27 @@ func writeFileAtomic(path string, content []byte, mode os.FileMode) error {
 		tmp.Close()
 		return err
 	}
+	// fsync before the rename: without it "atomic" only holds against process
+	// crash, not power loss — a cert or config file could surface empty after
+	// an outage.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func FileSHA256(path string) (string, error) {

@@ -29,7 +29,12 @@ func (spec ModuleLoadSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 		args = append(args, "-a")
 	}
 	args = append(args, spec.Modules...)
-	_ = executor.Run("modprobe", args...)
+	// A module that fails to load must fail the phase — silently reporting
+	// "converged" while br_netfilter/overlay are absent breaks kube-proxy and
+	// the container runtime in ways that surface much later.
+	if err := executor.Run("modprobe", args...); err != nil {
+		return ApplyResult{}, fmt.Errorf("modprobe %s: %w", strings.Join(spec.Modules, " "), err)
+	}
 	content := []byte(strings.Join(spec.Modules, "\n") + "\n")
 	change, err := executor.EnsureFile(spec.Path, content, spec.Mode)
 	if err != nil {

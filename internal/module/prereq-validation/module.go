@@ -75,11 +75,15 @@ func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (mo
 		}
 	}
 
-	// Docker runtime is not CRI-compliant for K8s >= 1.34.
-	if cfg.Shared.ContainerRuntime == "docker" && kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 34) {
+	// Dockershim was removed in Kubernetes 1.24. kubelet >= 1.24 with the
+	// docker runtime needs cri-dockerd, which nothing in this reconciler
+	// installs (and the >= 1.27 kubelet config would point at the containerd
+	// socket anyway) — the node would come up with a broken kubelet after a
+	// long, confusing timeout. Fail fast with the actionable message instead.
+	if cfg.Shared.ContainerRuntime == "docker" && kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 24) {
 		return moduleapi.Result{}, fmt.Errorf(
-			"container runtime \"docker\" is not supported for Kubernetes >= 1.34; " +
-				"use \"containerd\" or another CRI-compliant runtime")
+			"container runtime \"docker\" is not supported for Kubernetes >= 1.24 " +
+				"(dockershim removed, cri-dockerd not provisioned); use \"containerd\"")
 	}
 
 	outputs := map[string]string{

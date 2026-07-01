@@ -75,17 +75,14 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Chart:       "csi-driver-nfs",
 		Version:     nfsChartVersion,
 		RepoURL:     "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts",
-		Values: map[string]interface{}{
-			"controller": map[string]interface{}{
-				"replicas": 2,
-			},
-		},
+		Values:      nfsDriverValues(cfg),
 	}, childOpts...)
 	if err != nil {
 		return nil, err
 	}
 
 	manilaChartVersion := config.LookupByKubeVersion(manilaCSIChartVersions, cfg.Shared.KubeVersion)
+	clusterhelm.WarnIfClampedBelow(ctx, "cluster-manila-csi", manilaCSIChartVersions, cfg.Shared.KubeVersion)
 
 	// Manila CSI plugin via Helm.
 	_, err = clusterhelm.DeployHelmRelease(ctx, name+"-manila-plugin", clusterhelm.HelmReleaseArgs{
@@ -94,19 +91,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		Chart:       "openstack-manila-csi",
 		Version:     manilaChartVersion,
 		RepoURL:     "https://kubernetes.github.io/cloud-provider-openstack",
-		Values: map[string]interface{}{
-			"fullnameOverride": "",
-			"shareProtocols": []interface{}{
-				map[string]interface{}{
-					"protocolSelector": "NFS",
-					"fsGroupPolicy":    "None",
-					"fwdNodePluginEndpoint": map[string]interface{}{
-						"dir":      "/var/lib/kubelet/plugins/csi-nfsplugin",
-						"sockFile": "csi.sock",
-					},
-				},
-			},
-		},
+		Values:      manilaPluginValues(cfg),
 	}, childOpts...)
 	if err != nil {
 		return nil, err
@@ -145,7 +130,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		},
 		Provisioner: pulumi.String("nfs.manila.csi.openstack.org"),
 		Parameters: pulumi.StringMap{
-			"type": pulumi.String("cephfsnfs1"),
+			"type": pulumi.String(manilaShareType(cfg)),
 			"csi.storage.k8s.io/provisioner-secret-name":       pulumi.String("csi-manila-secrets"),
 			"csi.storage.k8s.io/provisioner-secret-namespace":  pulumi.String("kube-system"),
 			"csi.storage.k8s.io/node-stage-secret-name":        pulumi.String("csi-manila-secrets"),
@@ -164,4 +149,87 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+// nfsDriverValues builds csi-driver-nfs chart values. CONTAINER_INFRA_PREFIX
+// redirects the sig-storage sidecar/driver images to the mirror (tags stay
+// chart defaults), consistent with cinder-csi.
+func nfsDriverValues(cfg config.Config) map[string]interface{} {
+	values := map[string]interface{}{
+		"controller": map[string]interface{}{
+			"replicas": 2,
+		},
+	}
+	if prefix := cfg.Shared.ContainerInfraPrefix; prefix != "" {
+		values["image"] = map[string]interface{}{
+			"nfs":                 map[string]interface{}{"repository": prefix + "nfsplugin"},
+			"csiProvisioner":      map[string]interface{}{"repository": prefix + "csi-provisioner"},
+			"csiResizer":          map[string]interface{}{"repository": prefix + "csi-resizer"},
+			"csiSnapshotter":      map[string]interface{}{"repository": prefix + "csi-snapshotter"},
+			"livenessProbe":       map[string]interface{}{"repository": prefix + "livenessprobe"},
+			"nodeDriverRegistrar": map[string]interface{}{"repository": prefix + "csi-node-driver-registrar"},
+		}
+	}
+	return values
+}
+
+// manilaPluginValues builds openstack-manila-csi chart values with the same
+// CONTAINER_INFRA_PREFIX handling.
+func manilaPluginValues(cfg config.Config) map[string]interface{} {
+	values := map[string]interface{}{
+		"fullnameOverride": "",
+		"shareProtocols": []interface{}{
+			map[string]interface{}{
+				"protocolSelector": "NFS",
+				"fsGroupPolicy":    "None",
+				"fwdNodePluginEndpoint": map[string]interface{}{
+					"dir":      "/var/lib/kubelet/plugins/csi-nfsplugin",
+					"sockFile": "csi.sock",
+				},
+			},
+		},
+	}
+	if prefix := cfg.Shared.ContainerInfraPrefix; prefix != "" {
+		values["csimanila"] = map[string]interface{}{
+			"image": map[string]interface{}{
+				"repository": prefix + "manila-csi-plugin",
+			},
+		}
+		registrar := map[string]interface{}{
+			"registrar": map[string]interface{}{
+				"image": map[string]interface{}{
+					"repository": prefix + "csi-node-driver-registrar",
+				},
+			},
+		}
+		values["nodeplugin"] = registrar
+		values["controllerplugin"] = map[string]interface{}{
+			"provisioner": map[string]interface{}{
+				"image": map[string]interface{}{
+					"repository": prefix + "csi-provisioner",
+				},
+			},
+			"snapshotter": map[string]interface{}{
+				"image": map[string]interface{}{
+					"repository": prefix + "csi-snapshotter",
+				},
+			},
+			"resizer": map[string]interface{}{
+				"image": map[string]interface{}{
+					"repository": prefix + "csi-resizer",
+				},
+			},
+		}
+	}
+	return values
+}
+
+// manilaShareType resolves the Manila share type for the StorageClass. The
+// default preserves the ventus cloud's value; other deployments set the
+// MANILA_SHARE_TYPE heat-param.
+func manilaShareType(cfg config.Config) string {
+	if t := cfg.Shared.ManilaShareType; t != "" {
+		return t
+	}
+	return "cephfsnfs1"
 }

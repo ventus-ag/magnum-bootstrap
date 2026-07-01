@@ -2,7 +2,6 @@ package hostplugin
 
 import (
 	"context"
-	"os"
 
 	providerpkg "github.com/pulumi/pulumi-go-provider"
 	"github.com/pulumi/pulumi-go-provider/infer"
@@ -78,17 +77,16 @@ func (*File) Read(_ context.Context, req infer.ReadRequest[FileArgs, FileState])
 	return infer.ReadResponse[FileArgs, FileState]{ID: spec.Path, Inputs: inputs, State: state}, nil
 }
 
-func (*File) Delete(_ context.Context, req infer.DeleteRequest[FileState]) (infer.DeleteResponse, error) {
-	mode, err := parseMode(req.State.Mode)
-	if err != nil {
-		mode = 0o644
-	}
-	spec := hostresource.FileSpec{Path: req.State.Path, Mode: mode, Absent: true}
-	_, err = spec.Apply(newExecutor(true))
-	if os.IsNotExist(err) {
-		return infer.DeleteResponse{}, nil
-	}
-	return infer.DeleteResponse{}, err
+// Delete is deliberately a state-only no-op. Modules register File resources
+// conditionally on observed host state (e.g. cert-api-manager registers
+// ca.key only when shouldWriteCAKey(), cert modules only when the file is
+// readable), so a resource dropping out of the program is routine and must
+// not remove the live file — deleting a working ca.key crashloops
+// kube-controller-manager. Disabling the provider (MAGNUM_USE_HOST_PROVIDER=
+// false) would likewise unregister every managed file at once. Real removal
+// is owned by module Run()/Destroy() logic, matching legacy component behavior.
+func (*File) Delete(_ context.Context, _ infer.DeleteRequest[FileState]) (infer.DeleteResponse, error) {
+	return infer.DeleteResponse{}, nil
 }
 
 func (*File) Diff(_ context.Context, req infer.DiffRequest[FileArgs, FileState]) (infer.DiffResponse, error) {

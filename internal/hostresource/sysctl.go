@@ -31,7 +31,13 @@ func (spec SysctlSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 		if len(args) == 0 {
 			args = []string{"--system"}
 		}
-		_ = executor.Run("sysctl", args...)
+		// Warn, don't fail: `sysctl --system` exits non-zero if ANY file on
+		// the host carries a key the kernel rejects — including files we do
+		// not manage. But swallowing it silently reported "converged" when
+		// our own keys were never applied.
+		if err := executor.Run("sysctl", args...); err != nil && executor.Logger != nil {
+			executor.Logger.Warnf("sysctl reload after writing %s failed (settings may not be applied until reboot): %v", spec.Path, err)
+		}
 	}
 	return result, nil
 }

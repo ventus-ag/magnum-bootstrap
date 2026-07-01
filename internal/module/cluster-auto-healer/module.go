@@ -22,6 +22,11 @@ import (
 var npdImageTags = map[string]string{
 	"1.35": "v1.35.2",
 	"1.34": "v1.34.3",
+	// NPD adopted Kubernetes-aligned versioning at 1.34; before that the
+	// current release line was v0.8.x, compatible with a broad range of
+	// older Kubernetes. Without this floor, <=1.33 clusters clamp UP to the
+	// v1.34 image.
+	"1.20": "v0.8.19",
 }
 
 // autoHealerTags maps Kubernetes minor version to the latest
@@ -61,6 +66,12 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			// Clean up failed NPD release so Pulumi can recreate it cleanly
 			// (e.g. after PSA rejection with old privileged values).
 			clusterhelm.CleanupFailedRelease(executor, "npd", "kube-system")
+			// The auto-healer config (with the trustee password) now lives in
+			// a Secret; remove the legacy bash-era ConfigMap of the same name
+			// so the password stops being configmap-readable. Best-effort —
+			// the new Secret-mounted DaemonSet spec lands in the same up.
+			_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+				"delete", "configmap", "magnum-auto-healer-config", "-n", "kube-system", "--ignore-not-found=true")
 		}
 	}
 	return moduleapi.Result{}, nil
@@ -216,8 +227,11 @@ func registerAutoHealer(ctx *pulumi.Context, name string, cfg config.Config, opt
 		return err
 	}
 
-	// ConfigMap with auto-healer config
-	configYAML := fmt.Sprintf(`cluster-name: %s
+	// Auto-healer config carries the trustee PASSWORD — it belongs in a
+	// Secret, not a ConfigMap readable by anything with configmap read
+	// access. Values are %q-quoted so a password containing quotes/newlines
+	// cannot break out of (or inject into) the YAML document.
+	configYAML := fmt.Sprintf(`cluster-name: %q
 dry-run: false
 monitor-interval: 15s
 check-delay-after-add: 20m
@@ -243,11 +257,11 @@ healthcheck:
         types: ["Ready"]
         ok-values: ["True"]
 openstack:
-  auth-url: %s
-  user-id: %s
-  password: %s
-  trust-id: %s
-  region: %s
+  auth-url: %q
+  user-id: %q
+  password: %q
+  trust-id: %q
+  region: %q
   ca-file: /etc/kubernetes/ca-bundle.crt`,
 		cfg.Shared.ClusterUUID,
 		cfg.Shared.AuthURL,
@@ -257,9 +271,9 @@ openstack:
 		cfg.Shared.RegionName,
 	)
 
-	_, err = corev1.NewConfigMap(ctx, name+"-autohealer-cm", &corev1.ConfigMapArgs{
+	configSecret, err := corev1.NewSecret(ctx, name+"-autohealer-config", &corev1.SecretArgs{
 		Metadata: patchMeta("magnum-auto-healer-config", "kube-system"),
-		Data: pulumi.StringMap{
+		StringData: pulumi.StringMap{
 			"config.yaml": pulumi.String(configYAML),
 		},
 	}, opts...)
@@ -267,7 +281,10 @@ openstack:
 		return err
 	}
 
-	// DaemonSet
+	// DaemonSet — depends on the config Secret so a fresh rollout never races
+	// pods against a not-yet-created mount source. Also cleans up the legacy
+	// ConfigMap of the same name (bash-era location of the trustee password).
+	dsOpts := append(append([]pulumi.ResourceOption{}, opts...), pulumi.DependsOn([]pulumi.Resource{configSecret}))
 	_, err = appsv1.NewDaemonSet(ctx, name+"-autohealer-ds", &appsv1.DaemonSetArgs{
 		Metadata: &metav1.ObjectMetaArgs{
 			Name:      pulumi.String("magnum-auto-healer"),
@@ -339,8 +356,8 @@ openstack:
 					Volumes: corev1.VolumeArray{
 						&corev1.VolumeArgs{
 							Name: pulumi.String("config"),
-							ConfigMap: &corev1.ConfigMapVolumeSourceArgs{
-								Name: pulumi.String("magnum-auto-healer-config"),
+							Secret: &corev1.SecretVolumeSourceArgs{
+								SecretName: pulumi.String("magnum-auto-healer-config"),
 							},
 						},
 						&corev1.VolumeArgs{
@@ -353,6 +370,6 @@ openstack:
 				},
 			},
 		},
-	}, opts...)
+	}, dsOpts...)
 	return err
 }

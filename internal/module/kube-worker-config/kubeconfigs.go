@@ -18,15 +18,7 @@ func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change
 	var changes []host.Change
 	certDir := "/etc/kubernetes/certs"
 
-	masterIP := ""
-	if cfg.Worker != nil {
-		masterIP = cfg.Worker.KubeMasterIP
-	}
-	apiPort := cfg.Shared.KubeAPIPort
-	if apiPort == 0 {
-		apiPort = 6443
-	}
-	kubeMasterURI := fmt.Sprintf("https://%s:%d", masterIP, apiPort)
+	kubeMasterURI := masterURI(cfg)
 
 	// Etcd server IP: fall back to master IP if not set.
 	etcdServerIP := ""
@@ -117,15 +109,7 @@ KUBE_MASTER="--master=%s"
 
 func registerKubeConfigResources(ctx *pulumi.Context, name string, cfg config.Config, opts ...pulumi.ResourceOption) error {
 	certDir := "/etc/kubernetes/certs"
-	masterIP := ""
-	if cfg.Worker != nil {
-		masterIP = cfg.Worker.KubeMasterIP
-	}
-	apiPort := cfg.Shared.KubeAPIPort
-	if apiPort == 0 {
-		apiPort = 6443
-	}
-	kubeMasterURI := fmt.Sprintf("https://%s:%d", masterIP, apiPort)
+	kubeMasterURI := masterURI(cfg)
 	etcdServerIP := ""
 	if cfg.Worker != nil {
 		etcdServerIP = cfg.Worker.EtcdServerIP
@@ -173,4 +157,25 @@ KUBE_MASTER="--master=%s"
 
 func applyWorkerFileResource(executor *host.Executor, spec hostresource.FileSpec) (hostresource.ApplyResult, error) {
 	return spec.Apply(executor)
+}
+
+// masterURI builds the API server URI workers point at. Shared by the Run()
+// write path and the Register() resource path so both render identical
+// kubeconfig content. With TLS disabled the apiserver serves plain HTTP; an
+// https:// URI would make kubelet/kube-proxy fail their TLS handshake and the
+// worker never joins (same scheme rule as admin-kubeconfig).
+func masterURI(cfg config.Config) string {
+	masterIP := ""
+	if cfg.Worker != nil {
+		masterIP = cfg.Worker.KubeMasterIP
+	}
+	apiPort := cfg.Shared.KubeAPIPort
+	if apiPort == 0 {
+		apiPort = 6443
+	}
+	protocol := "https"
+	if cfg.Shared.TLSDisabled {
+		protocol = "http"
+	}
+	return fmt.Sprintf("%s://%s:%d", protocol, masterIP, apiPort)
 }

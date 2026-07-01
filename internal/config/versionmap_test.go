@@ -74,3 +74,33 @@ func TestLookupByKubeVersionEmptyAndMalformed(t *testing.T) {
 		t.Fatalf("malformed version should clamp to lowest, got %q", got)
 	}
 }
+
+func TestLookupIntegerMinorOrdering(t *testing.T) {
+	m := map[string]string{"1.9": "old", "1.24": "mid", "1.31": "new"}
+	// Float compare would sort 1.9 above 1.31 and break all of these.
+	if got := LookupByKubeVersion(m, "v1.31.2"); got != "new" {
+		t.Fatalf("1.31 → %q, want new", got)
+	}
+	if got := LookupByKubeVersion(m, "v1.10.0"); got != "old" {
+		t.Fatalf("1.10 floor → %q, want old", got)
+	}
+	if got := LookupByKubeVersion(m, "v1.25.0"); got != "mid" {
+		t.Fatalf("1.25 floor → %q, want mid", got)
+	}
+	if got := LookupByKubeVersion(m, "v2.0.0"); got != "new" {
+		t.Fatalf("2.0 above-highest → %q, want new", got)
+	}
+}
+
+func TestLookupClampedBelowFlag(t *testing.T) {
+	m := map[string]string{"1.24": "chart-1.24", "1.30": "chart-1.30"}
+	if _, clamped := LookupByKubeVersionClamped(m, "v1.20.12"); !clamped {
+		t.Fatal("v1.20 below lowest entry must report clamped")
+	}
+	if _, clamped := LookupByKubeVersionClamped(m, "v1.24.0"); clamped {
+		t.Fatal("exact lowest entry must not report clamped")
+	}
+	if _, clamped := LookupByKubeVersionClamped(m, "v1.31.0"); clamped {
+		t.Fatal("above highest must not report clamped")
+	}
+}

@@ -8,6 +8,7 @@
 #   apply   <heat-params> <name>  place heat-params, run a reconcile, assert success
 #   assert-ready                  assert the single-node cluster is Ready + core pods up
 #   assert-noop <heat-params> <name>  re-run and assert zero host changes (idempotency)
+#   assert-periodic-heal          inject drift, heal via run-periodic, assert zero-change steady state
 #
 # Files expected under /opt/e2e (scp'd by the host harness):
 #   bootstrap      the freshly built reconciler binary under test
@@ -182,6 +183,54 @@ result_status() {
   # The reconciler writes pretty-printed JSON (`"status": "succeeded"`), so the
   # extraction must tolerate whitespace after the colon.
   grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESULT_FILE" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/'
+}
+
+# run_periodic — like run_reconcile, but through the drift-correction unit
+# (magnum-reconcile-periodic.service → `bootstrap run-periodic`): the code path
+# with refresh enabled and etcd day-2 gating that no other tier exercises.
+run_periodic() {
+  rm -f "$RESULT_FILE"
+  systemctl reset-failed magnum-reconcile-periodic.service 2>/dev/null || true
+  log "periodic run — streaming /var/log/magnum-reconcile.log"
+  touch /var/log/magnum-reconcile.log 2>/dev/null || true
+  ( stdbuf -oL tail -n0 -F /var/log/magnum-reconcile.log 2>/dev/null | sed -u 's/^/    | /' ) &
+  local tail_pid=$! rc=0
+  systemctl start --wait magnum-reconcile-periodic.service || rc=$?
+  sleep 1; pkill -P "$tail_pid" 2>/dev/null || true; kill "$tail_pid" 2>/dev/null || true
+  if [ "$rc" != 0 ]; then
+    err "periodic unit failed (rc=$rc)"
+    journalctl -u magnum-reconcile-periodic.service -n 40 --no-pager 2>/dev/null | sed 's/^/    | /' >&2 || true
+  fi
+  return "$rc"
+}
+
+# cmd_assert_periodic_heal — inject real host drift (crashed control-plane
+# service + content-mangled managed file), run the periodic unit, assert both
+# healed, then assert a second periodic run reports zero host changes.
+cmd_assert_periodic_heal() {
+  local f=/etc/kubernetes/kubelet-config.yaml
+  [ -f "$f" ] || { err "periodic-heal: $f missing (create scenario must run first)"; return 1; }
+  local before; before="$(sha256sum "$f" | awk '{print $1}')"
+  log "periodic-heal: injecting drift (stop kube-scheduler, mangle $f)"
+  systemctl stop kube-scheduler || { err "periodic-heal: could not stop kube-scheduler"; return 1; }
+  echo "# drift injected by e2e" >> "$f"
+
+  run_periodic || { err "periodic heal run failed"; return 1; }
+  [ "$(result_status)" = "succeeded" ] || { err "periodic heal run status=$(result_status)"; return 1; }
+  systemctl is-active kube-scheduler >/dev/null 2>&1 || { err "periodic-heal: kube-scheduler not restarted"; return 1; }
+  local after; after="$(sha256sum "$f" | awk '{print $1}')"
+  [ "$before" = "$after" ] || { err "periodic-heal: $f content drift not healed"; return 1; }
+  log "periodic-heal: drift healed ✅"
+
+  # Steady state: a second periodic run on a converged node must be zero-change
+  # (same strictness as assert-noop).
+  run_periodic || { err "periodic steady-state run failed"; return 1; }
+  if grep -qE '"changed"[[:space:]]*:[[:space:]]*\[' "$RESULT_FILE" 2>/dev/null; then
+    err "periodic steady-state run reported host changes (expected none):"
+    grep -oE '"changed"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$RESULT_FILE" >&2 || true
+    return 1
+  fi
+  log "periodic-heal: zero-change steady state ✅"
 }
 
 cmd_apply() {
@@ -485,6 +534,7 @@ main() {
     assert-ready)     cmd_assert_ready ;;
     assert-node-ready) cmd_assert_node_ready "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
+    assert-periodic-heal) cmd_assert_periodic_heal ;;
     cert-hashes)      cmd_cert_hashes ;;
     dump-state)       cmd_dump_state ;;
     kubelet-version)  cmd_kubelet_version "$@" ;;

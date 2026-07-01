@@ -327,10 +327,18 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		executor := host.NewExecutor(false, nil)
 		devicePath, err := findDevicePath(heat.Cfg, executor, nil)
 		if err == nil && devicePath != "" {
-			fstabLine := fmt.Sprintf("%s %s xfs defaults 0 0", devicePath, storageDir)
-			fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
-			if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
-				return nil, err
+			// Register the fstab line with the real on-disk fstype, exactly as
+			// Run() writes it. A hardcoded "xfs" on an ext4 legacy volume would
+			// add a second, conflicting fstab entry for the same mountpoint —
+			// systemd takes the last one and the mount fails at boot. A blank
+			// (not yet formatted) device is skipped: Run() formats it and writes
+			// the line; registration catches up on the next reconcile.
+			if fstype := executor.BlockDeviceFstype(devicePath); fstype != "" {
+				fstabLine := fmt.Sprintf("%s %s %s defaults 0 0", devicePath, storageDir, fstype)
+				fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
+				if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

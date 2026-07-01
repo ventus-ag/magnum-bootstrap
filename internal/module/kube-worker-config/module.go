@@ -94,7 +94,7 @@ func setupNetwork(cfg config.Config, executor *host.Executor) ([]host.Change, er
 	var changes []host.Change
 
 	if cfg.Shared.NetworkDriver == "flannel" {
-		cs, err := kubecommon.SetupFlannelCNI(executor)
+		cs, err := kubecommon.SetupFlannelCNI(executor, cfg.Shared.Arch)
 		if err != nil {
 			return nil, err
 		}
@@ -257,7 +257,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	if cfg.Shared.NetworkDriver == "flannel" {
-		if err := kubecommon.RegisterFlannelCNI(ctx, name+"-flannel-cni", childOpts...); err != nil {
+		if err := kubecommon.RegisterFlannelCNI(ctx, name+"-flannel-cni", cfg.Shared.Arch, childOpts...); err != nil {
 			return nil, err
 		}
 	}

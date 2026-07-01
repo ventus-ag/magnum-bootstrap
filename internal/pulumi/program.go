@@ -48,6 +48,22 @@ func NewRunAccumulator() *RunAccumulator {
 	return &RunAccumulator{outputs: make(map[string]string)}
 }
 
+// Reset clears all accumulated results. Called at the start of every program
+// execution: the same accumulator instance is shared across stack.Up retries
+// (stale-lock auto-cancel, helm recovery), and without a reset a retried run
+// would report every change twice — and a first-attempt failure would veto a
+// fully successful retry via HasFailure().
+func (a *RunAccumulator) Reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.phaseChanges = nil
+	a.changes = nil
+	a.outputs = make(map[string]string)
+	a.warnings = nil
+	a.failedPhase = ""
+	a.failedErr = nil
+}
+
 func (a *RunAccumulator) RecordPhase(phaseID string, res moduleapi.Result) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -152,6 +168,10 @@ func BuildMetadata(cfg config.Config, reconcilePlan plan.Plan, command string, d
 // Apply=false, up runs set Apply=true.
 func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan plan.Plan, metadata ProgramMetadata, req moduleapi.Request, acc *RunAccumulator, phaseParallelism int) gopulumi.RunFunc {
 	return func(ctx *gopulumi.Context) error {
+		// The program may execute more than once per reconcile (stack.Up
+		// retries after stale-lock recovery or helm recovery); each execution
+		// starts from a clean accumulator.
+		acc.Reset()
 		// Load heat-params dynamically inside the Pulumi execution so the
 		// program is self-contained and always reads the latest file contents.
 		cfg, err := config.Load(heatParamsPath)

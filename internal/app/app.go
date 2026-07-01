@@ -453,23 +453,25 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 		return 1
 	}
 
+	// Bookkeeping failures after a successful reconcile are warnings, not
+	// failures: the node IS converged, and reporting exit 1 here makes Heat
+	// mark a healthy node failed. Lost state only means the next run
+	// re-derives intent and re-converges (reconciliation is idempotent); a
+	// stale journal is overwritten by the next MarkRunning.
 	if mode != "preview" {
 		if err := state.Write(runtimePaths.StateFile, reconcileState); err != nil {
-			writeFailure(runtimePaths.ResultFile, "state", fmt.Sprintf("failed to persist reconciler state: %v", err))
-			logger.Errorf("failed to persist reconciler state: %v", err)
-			fmt.Fprintf(stderr, "failed to persist reconciler state: %v\n", err)
-			return 1
+			logger.Warnf("failed to persist reconciler state (node converged; next run will re-converge): %v", err)
+			runResult.Warnings = append(runResult.Warnings, fmt.Sprintf("failed to persist reconciler state: %v", err))
+		} else {
+			logger.Infof("persisted reconciler state stateFile=%s", runtimePaths.StateFile)
 		}
-		logger.Infof("persisted reconciler state stateFile=%s", runtimePaths.StateFile)
 	} else {
 		logger.Infof("skipped reconciler state persistence for preview mode")
 	}
 
 	if err := journal.MarkCompleted(runtimePaths.RunStateFile, mode, runResult.Summary); err != nil {
-		writeFailure(runtimePaths.ResultFile, "journal", fmt.Sprintf("failed to persist completion state: %v", err))
-		logger.Errorf("failed to persist completion state: %v", err)
-		fmt.Fprintf(stderr, "failed to persist completion state: %v\n", err)
-		return 1
+		logger.Warnf("failed to persist completion state (node converged): %v", err)
+		runResult.Warnings = append(runResult.Warnings, fmt.Sprintf("failed to persist completion state: %v", err))
 	}
 
 	runResult = result.Normalize(runResult)

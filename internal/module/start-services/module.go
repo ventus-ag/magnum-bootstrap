@@ -131,15 +131,20 @@ func nodeIsCordoned(nodeName string, executor *host.Executor, kubectl, kubeconfi
 func buildUncordonService(cfg config.Config) string {
 	kubectl := "/srv/magnum/bin/kubectl"
 	kubeconfig := "/etc/kubernetes/admin.conf"
+	// Reboot-resilience for the upgrade window only: retry until the API
+	// accepts the uncordon, then disable the unit. The legacy bash unit had
+	// Restart=always and stayed enabled — it re-uncordoned the node every 10s
+	// forever, silently defeating any operator `kubectl cordon` and racing
+	// the next upgrade's own drain window.
 	return fmt.Sprintf(`[Unit]
 Description=magnum-uncordon
 After=network.target kubelet.service
 
 [Service]
-Restart=always
+Type=oneshot
 RemainAfterExit=yes
-RestartSec=10
-ExecStart=%s --kubeconfig=%s uncordon %s
+ExecStart=/bin/sh -c 'for i in $(seq 1 120); do %s --kubeconfig=%s uncordon %s && exit 0; sleep 10; done; exit 1'
+ExecStartPost=/usr/bin/systemctl disable uncordon.service
 
 [Install]
 WantedBy=multi-user.target
@@ -156,10 +161,12 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err != nil {
 		return nil, err
 	}
-	serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, fileRes)
-	if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-uncordon-service", hostresource.SystemdServiceSpec{Unit: "uncordon.service", Enabled: hostresource.BoolPtr(true)}, serviceOpts...); err != nil {
-		return nil, err
-	}
+	// Deliberately no SystemdService(Enabled) registration for uncordon: the
+	// unit disables itself after a successful uncordon, and Run() only
+	// enables it during a disruptive cycle. A standing Enabled=true resource
+	// would re-enable it on every reconcile and bring back the perpetual
+	// boot-time uncordon this unit design removes.
+	_ = fileRes
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
 		"operation": pulumi.String(heat.Cfg.Operation().String()),
 	}); err != nil {

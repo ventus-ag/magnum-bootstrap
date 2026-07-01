@@ -250,7 +250,7 @@ All operations (create, upgrade, resize, ca-rotate, periodic) use the **same
 unified phase list** per role.  Each module internally decides whether to act
 based on current vs desired state.
 
-### Master (29 phases)
+### Master (31 phases; also heat-container-agent after start-services, cluster-cleanup-deprecated after cluster-flannel)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|
@@ -284,7 +284,7 @@ based on current vs desired state.
 | 28 | cluster-health | no | Master-0 only, skip on other masters |
 | 29 | zincati | no | Fedora CoreOS OS auto-upgrade settings |
 
-### Worker (16 phases)
+### Worker (17 phases; also heat-container-agent after start-services)
 
 | # | Phase | Disruptive | Notes |
 |---|-------|------------|-------|

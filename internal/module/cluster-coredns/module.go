@@ -80,22 +80,35 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			},
 			"isClusterService":  true,
 			"priorityClassName": "system-cluster-critical",
-			"autoscaling": map[string]interface{}{
+			// The coredns chart's HPA lives under the `hpa` key (a top-level
+			// `autoscaling` block is silently ignored by Helm — DNS then never
+			// scales past replicaCount). Metrics use autoscaling/v2 syntax; the
+			// old targetAverageUtilization form is v2beta1, rejected on modern
+			// clusters. HPA needs metrics-server to act, so it is enabled only
+			// when that addon is on.
+			"hpa": map[string]interface{}{
+				"enabled":     cfg.Shared.MetricsServerEnabled,
 				"minReplicas": 2,
 				"maxReplicas": 10,
 				"metrics": []interface{}{
 					map[string]interface{}{
 						"type": "Resource",
 						"resource": map[string]interface{}{
-							"name":                     "cpu",
-							"targetAverageUtilization": 60,
+							"name": "cpu",
+							"target": map[string]interface{}{
+								"type":               "Utilization",
+								"averageUtilization": 60,
+							},
 						},
 					},
 					map[string]interface{}{
 						"type": "Resource",
 						"resource": map[string]interface{}{
-							"name":                     "memory",
-							"targetAverageUtilization": 60,
+							"name": "memory",
+							"target": map[string]interface{}{
+								"type":               "Utilization",
+								"averageUtilization": 60,
+							},
 						},
 					},
 				},
@@ -210,8 +223,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 							"parameters": "0.0.0.0:9153",
 						},
 						map[string]interface{}{
-							"name":       "forward",
-							"parameters": ". 1.1.1.1 1.0.0.1 /etc/resolv.conf",
+							"name": "forward",
+							// Node-configured resolvers first (sequential
+							// policy), public resolvers only as backstop —
+							// hardcoded 1.1.1.1-first broke split-horizon and
+							// egress-restricted deployments.
+							"parameters":  ". /etc/resolv.conf 1.1.1.1 1.0.0.1",
+							"configBlock": "policy sequential",
 						},
 						corednsCachePlugin(cfg.Shared.KubeTag),
 						map[string]interface{}{

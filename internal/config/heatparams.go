@@ -75,8 +75,13 @@ func Load(path string) (Config, error) {
 			CAKey:                        raw["CA_KEY"],
 			KubeServiceAccountKey:        raw["KUBE_SERVICE_ACCOUNT_KEY"],
 			KubeServiceAccountPrivateKey: raw["KUBE_SERVICE_ACCOUNT_PRIVATE_KEY"],
-			VerifyCA:                     parseBool(raw["VERIFY_CA"]),
-			MagnumURL:                    raw["MAGNUM_URL"],
+			// Secure default: a missing VERIFY_CA means VERIFY, matching
+			// Magnum's own verify_ca default. Heat always writes an explicit
+			// value, so this only affects hand-fed heat-params — where
+			// silently disabling TLS verification to Keystone/Magnum (the
+			// old parseBool default) is the wrong surprise.
+			VerifyCA:  !parseFalse(raw["VERIFY_CA"]),
+			MagnumURL: raw["MAGNUM_URL"],
 
 			DNSServiceIP:     raw["DNS_SERVICE_IP"],
 			DNSClusterDomain: raw["DNS_CLUSTER_DOMAIN"],
@@ -115,6 +120,7 @@ func Load(path string) (Config, error) {
 			VolumeDriver:     raw["VOLUME_DRIVER"],
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
 			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
+			ManilaShareType:  raw["MANILA_SHARE_TYPE"],
 
 			GPUOperatorEnabled:   parseBool(raw["GPU_OPERATOR_ENABLED"]),
 			OSAutoUpgradeEnabled: parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),
@@ -148,18 +154,26 @@ func Load(path string) (Config, error) {
 			EtcdVolumeSize:        parseInt(raw["ETCD_VOLUME_SIZE"]),
 		}
 	case "worker", "minion":
-		cfg.Worker = &WorkerConfig{
-			KubeMasterIP:      raw["KUBE_MASTER_IP"],
-			EtcdServerIP:      raw["ETCD_SERVER_IP"],
-			RegistryEnabled:   parseBool(raw["REGISTRY_ENABLED"]),
-			RegistryPort:      parseInt(raw["REGISTRY_PORT"]),
-			RegistryContainer: raw["REGISTRY_CONTAINER"],
-			RegistryInsecure:  parseBool(raw["REGISTRY_INSECURE"]),
-			RegistryChunksize: parseInt(raw["REGISTRY_CHUNKSIZE"]),
-			SwiftRegion:       raw["SWIFT_REGION"],
-			TrusteeUsername:   raw["TRUSTEE_USERNAME"],
-			TrusteeDomainID:   raw["TRUSTEE_DOMAIN_ID"],
+		cfg.Worker = workerConfigFromRaw(raw)
+	default:
+		// Magnum allows arbitrary nodegroup roles (`--role <anything>`); such
+		// nodegroups are instantiated from kubeminion.yaml and the legacy
+		// bash ran the minion scripts for them regardless of the role string.
+		// Treat any non-empty custom role as a worker instead of bricking the
+		// node with "unable to determine node role". An empty role stays
+		// unknown — that is a genuine misconfiguration.
+		if role != "" {
+			cfg.Worker = workerConfigFromRaw(raw)
 		}
+	}
+
+	// KUBE_VERSION comes from cluster.coe_version, which Heat defaults to a
+	// stale value (v1.18.2) and only syncs when the kube_tag label exists. An
+	// empty/garbage value would floor every version map to its lowest entry
+	// (e.g. metrics-server chart 3.11 on a 1.33 cluster) — fall back to the
+	// authoritative KUBE_TAG instead.
+	if _, ok := parseMajorMinor(cfg.Shared.KubeVersion); !ok {
+		cfg.Shared.KubeVersion = cfg.Shared.KubeTag
 	}
 
 	// Old host-docker clusters predate dockershim removal (Kubernetes 1.24).
@@ -183,6 +197,11 @@ func parseHeatParams(content string) (map[string]string, error) {
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	lineNo := 0
 
+	// Raise the token limit: bufio.Scanner defaults to 64KiB per line, and a
+	// single oversized value (inlined policy JSON, large CA bundle) would
+	// brick every reconcile with an obscure "token too long".
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
 	for scanner.Scan() {
 		lineNo++
 		line := strings.TrimSpace(scanner.Text())
@@ -191,8 +210,12 @@ func parseHeatParams(content string) (map[string]string, error) {
 		}
 
 		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return nil, fmt.Errorf("line %d: missing '='", lineNo)
+		// Tolerate stray non-KEY=VALUE lines (hand-edited file, wrapped
+		// line): skipping one unparseable line loses at most one param and
+		// the next reconcile still runs; hard-failing bricks the node until
+		// someone fixes the file by hand.
+		if !ok || strings.TrimSpace(key) == "" {
+			continue
 		}
 
 		key = strings.TrimSpace(key)
@@ -220,4 +243,19 @@ func decodeValue(v string) string {
 	}
 
 	return v
+}
+
+func workerConfigFromRaw(raw map[string]string) *WorkerConfig {
+	return &WorkerConfig{
+		KubeMasterIP:      raw["KUBE_MASTER_IP"],
+		EtcdServerIP:      raw["ETCD_SERVER_IP"],
+		RegistryEnabled:   parseBool(raw["REGISTRY_ENABLED"]),
+		RegistryPort:      parseInt(raw["REGISTRY_PORT"]),
+		RegistryContainer: raw["REGISTRY_CONTAINER"],
+		RegistryInsecure:  parseBool(raw["REGISTRY_INSECURE"]),
+		RegistryChunksize: parseInt(raw["REGISTRY_CHUNKSIZE"]),
+		SwiftRegion:       raw["SWIFT_REGION"],
+		TrusteeUsername:   raw["TRUSTEE_USERNAME"],
+		TrusteeDomainID:   raw["TRUSTEE_DOMAIN_ID"],
+	}
 }

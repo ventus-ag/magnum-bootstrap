@@ -20,78 +20,106 @@ import (
 // back to the lowest key — the previous behavior gave 1.33/1.34 the 1.7.x (v1
 // layout) containerd instead of the intended 2.x.
 func LookupByKubeVersion(versionMap map[string]string, kubeVersion string) string {
-	v := strings.TrimPrefix(kubeVersion, "v")
-	parts := strings.SplitN(v, ".", 3)
-	if len(parts) < 2 {
-		return boundaryValue(versionMap, false)
+	val, _ := LookupByKubeVersionClamped(versionMap, kubeVersion)
+	return val
+}
+
+// LookupByKubeVersionClamped is LookupByKubeVersion plus a clampedBelow flag:
+// true when the requested version sits BELOW the lowest map entry, i.e. the
+// returned value was designed for a newer Kubernetes than requested (e.g. the
+// OCCM/CSI charts, whose maps start at 1.24, on a v1.20 cluster). Callers use
+// it to log the untested pairing instead of deploying it silently.
+func LookupByKubeVersionClamped(versionMap map[string]string, kubeVersion string) (string, bool) {
+	requested, ok := parseMajorMinor(kubeVersion)
+	if !ok {
+		return boundaryValue(versionMap, false), true
 	}
 
-	minor := parts[0] + "." + parts[1]
-	if val, ok := versionMap[minor]; ok {
-		return val
+	if val, exact := versionMap[strconv.Itoa(requested.major)+"."+strconv.Itoa(requested.minor)]; exact {
+		return val, false
 	}
 
-	// Parse the requested minor as a float for comparison.
-	requested, err := strconv.ParseFloat(minor, 64)
-	if err != nil {
-		return boundaryValue(versionMap, false)
-	}
-
-	// Collect and sort all map keys numerically.
 	type entry struct {
-		num float64
+		ver majorMinor
 		key string
 	}
 	entries := make([]entry, 0, len(versionMap))
 	for k := range versionMap {
-		n, err := strconv.ParseFloat(k, 64)
-		if err != nil {
-			continue
+		if v, ok := parseMajorMinor(k); ok {
+			entries = append(entries, entry{ver: v, key: k})
 		}
-		entries = append(entries, entry{num: n, key: k})
 	}
 	if len(entries) == 0 {
-		return ""
+		return "", false
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].num < entries[j].num })
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ver.less(entries[j].ver) })
 
-	if requested > entries[len(entries)-1].num {
-		return versionMap[entries[len(entries)-1].key]
+	if entries[len(entries)-1].ver.less(requested) {
+		return versionMap[entries[len(entries)-1].key], false
 	}
-	// Nearest key <= requested (floor). Entries are sorted ascending, so walk up
-	// keeping the highest key that does not exceed the requested minor. A version
-	// below the lowest key never advances past entries[0], so it clamps up to the
-	// lowest entry as documented.
+	if requested.less(entries[0].ver) {
+		return versionMap[entries[0].key], true
+	}
+	// Nearest key <= requested (floor). Entries are sorted ascending, so walk
+	// up keeping the highest key that does not exceed the requested minor.
 	chosen := entries[0].key
 	for _, e := range entries {
-		if e.num <= requested {
+		if !requested.less(e.ver) {
 			chosen = e.key
 		} else {
 			break
 		}
 	}
-	return versionMap[chosen]
+	return versionMap[chosen], false
+}
+
+// majorMinor compares Kubernetes versions as integer pairs. A float compare
+// would misorder single- vs double-digit minors ("1.9" > "1.31" as floats).
+type majorMinor struct {
+	major, minor int
+}
+
+func (a majorMinor) less(b majorMinor) bool {
+	if a.major != b.major {
+		return a.major < b.major
+	}
+	return a.minor < b.minor
+}
+
+func parseMajorMinor(version string) (majorMinor, bool) {
+	v := strings.TrimPrefix(strings.TrimSpace(version), "v")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return majorMinor{}, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return majorMinor{}, false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return majorMinor{}, false
+	}
+	return majorMinor{major: major, minor: minor}, true
 }
 
 // boundaryValue returns the highest (upper=true) or lowest (upper=false)
 // entry from the map. Used as a last-resort fallback.
 func boundaryValue(m map[string]string, upper bool) string {
 	type entry struct {
-		num float64
+		ver majorMinor
 		val string
 	}
 	var entries []entry
 	for k, v := range m {
-		n, err := strconv.ParseFloat(k, 64)
-		if err != nil {
-			continue
+		if ver, ok := parseMajorMinor(k); ok {
+			entries = append(entries, entry{ver: ver, val: v})
 		}
-		entries = append(entries, entry{num: n, val: v})
 	}
 	if len(entries) == 0 {
 		return ""
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].num < entries[j].num })
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ver.less(entries[j].ver) })
 	if upper {
 		return entries[len(entries)-1].val
 	}

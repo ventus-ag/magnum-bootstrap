@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -20,6 +19,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
+	adminkubeconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/admin-kubeconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -686,7 +686,12 @@ func (r *runner) chownCerts() error {
 	if err := r.executor.Run("chown", "-R", "kube:kube_etcd", certDir); err != nil {
 		return fmt.Errorf("ca-rotation: chown %s: %w", certDir, err)
 	}
-	if err := r.executor.Run("chown", "-R", "etcd:kube_etcd", etcdCertDir); err != nil {
+	// kube:kube_etcd, same as master-certificates and the legacy rotate
+	// script (etcd reads via the kube_etcd group). An etcd: owner here made
+	// master-certificates re-chown three phases later, report a change, and
+	// signal a second, unserialized full control-plane restart on every
+	// rotation — right after the Lease-serialized one.
+	if err := r.executor.Run("chown", "-R", "kube:kube_etcd", etcdCertDir); err != nil {
 		return fmt.Errorf("ca-rotation: chown %s: %w", etcdCertDir, err)
 	}
 	return nil
@@ -1008,50 +1013,14 @@ func leafFiles(role config.Role) []string {
 // --- admin kubeconfig ------------------------------------------------------
 
 func updateAdminKubeconfig(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
-	apiPort := cfg.Shared.KubeAPIPort
-	if apiPort == 0 {
-		apiPort = 6443
-	}
-	readB64 := func(path string) (string, error) {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", fmt.Errorf("ca-rotation: read %s for admin kubeconfig: %w", path, err)
-		}
-		return base64.StdEncoding.EncodeToString(data), nil
-	}
-	caB64, err := readB64(certDir + "/ca.crt")
+	// Single source of admin.conf content: the admin-kubeconfig module's
+	// builder. A private variant here (different fields/port fallback) meant
+	// every rotation was followed by a spurious admin-kubeconfig rewrite —
+	// and a blanket control-plane restart signal — on the next reconcile.
+	content, err := adminkubeconfig.BuildContent(cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ca-rotation: build admin kubeconfig: %w", err)
 	}
-	adminCertB64, err := readB64(certDir + "/admin.crt")
-	if err != nil {
-		return nil, err
-	}
-	adminKeyB64, err := readB64(certDir + "/admin.key")
-	if err != nil {
-		return nil, err
-	}
-
-	content := fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    certificate-authority-data: %s
-    server: https://127.0.0.1:%d
-  name: %s
-contexts:
-- context:
-    cluster: %s
-    user: admin
-  name: default
-current-context: default
-kind: Config
-preferences: {}
-users:
-- name: admin
-  user:
-    client-certificate-data: %s
-    client-key-data: %s
-`, caB64, apiPort, cfg.Shared.ClusterUUID, cfg.Shared.ClusterUUID, adminCertB64, adminKeyB64)
 
 	var changes []host.Change
 	change, err := executor.EnsureFile(adminConf, []byte(content), 0o600)

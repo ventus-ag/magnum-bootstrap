@@ -2,6 +2,7 @@ package clusterhelm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -466,16 +467,25 @@ func ParseHelmPatchFailures(errMsg string) []HelmReleasePair {
 	if !strings.Contains(errMsg, "cannot patch") && !strings.Contains(errMsg, "is invalid") {
 		return nil
 	}
-	matches := helmReleaseRe.FindAllStringSubmatch(errMsg, -1)
+	// Only force-mark releases named on a LINE that carries the failure
+	// phrase. Matching the whole message marked every release mentioned
+	// anywhere in a multi-error report, and those force markers persist until
+	// the next fully-green up — unrelated releases then get replace-on-upgrade
+	// churn for someone else's patch failure.
 	seen := make(map[string]bool)
 	var releases []HelmReleasePair
-	for _, m := range matches {
-		key := m[1] + "/" + m[2]
-		if seen[key] {
+	for _, line := range strings.Split(errMsg, "\n") {
+		if !strings.Contains(line, "cannot patch") && !strings.Contains(line, "is invalid") {
 			continue
 		}
-		seen[key] = true
-		releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
+		for _, m := range helmReleaseRe.FindAllStringSubmatch(line, -1) {
+			key := m[1] + "/" + m[2]
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
+		}
 	}
 	return releases
 }
@@ -597,6 +607,110 @@ func ResetRemovedAPIRelease(executor *host.Executor, name, namespace string) {
 		_ = executor.Run("kubectl", "delete", "secret", "-n", namespace,
 			"-l", "owner=helm,name="+name, "--ignore-not-found=true")
 	}
+}
+
+// WarnIfClampedBelow logs when an addon's version map has no entry for this
+// (older) Kubernetes version, so the lowest — newer-Kubernetes — entry gets
+// deployed. The pairing usually boots (the e2e ladder creates at v1.20 with
+// 1.24-era charts) but is upstream-untested; deploying it silently hides the
+// risk from the operator.
+func WarnIfClampedBelow(ctx *pulumi.Context, addon string, versionMap map[string]string, kubeVersion string) {
+	if _, clamped := config.LookupByKubeVersionClamped(versionMap, kubeVersion); clamped {
+		_ = ctx.Log.Warn(fmt.Sprintf(
+			"%s: no chart/image entry for Kubernetes %s; deploying the lowest available entry, which targets a newer Kubernetes — untested pairing",
+			addon, kubeVersion), nil)
+	}
+}
+
+// helmPendingOperationPhrase is Helm's error when the release's newest
+// storage record is stuck in a pending-* status — left behind when a previous
+// helm install/upgrade/rollback was killed mid-flight (node reboot, Heat
+// timeout, OOM). Every subsequent upgrade fails with this exact error until
+// the pending record is cleared, so it is a permanent wedge without recovery.
+const helmPendingOperationPhrase = "another operation (install/upgrade/rollback) is in progress"
+
+var helmPendingOperationRe = regexp.MustCompile(`Helm [Rr]elease "?([a-z0-9-]+)/([a-z0-9-]+)"?:[^\n]*another operation \(install/upgrade/rollback\) is in progress`)
+
+// ParseHelmPendingOperations reports whether errMsg is a pending-operation
+// wedge and extracts the affected releases when the error names them. The
+// bool is true whenever the phrase is present, even if no release pair could
+// be parsed — callers then fall back to scanning managed releases.
+func ParseHelmPendingOperations(errMsg string) ([]HelmReleasePair, bool) {
+	if !strings.Contains(errMsg, helmPendingOperationPhrase) {
+		return nil, false
+	}
+	matches := helmPendingOperationRe.FindAllStringSubmatch(errMsg, -1)
+	seen := make(map[string]bool, len(matches))
+	var releases []HelmReleasePair
+	for _, m := range matches {
+		key := m[1] + "/" + m[2]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		releases = append(releases, HelmReleasePair{Namespace: m[1], Name: m[2]})
+	}
+	return releases, true
+}
+
+// PendingOperationManagedReleases scans the managed releases for any whose
+// newest Helm history entry is stuck pending-*. Fallback for pending-operation
+// errors that do not name the release.
+func PendingOperationManagedReleases(executor *host.Executor) []HelmReleasePair {
+	if executor == nil {
+		return nil
+	}
+	var stuck []HelmReleasePair
+	for _, rel := range ManagedReleases() {
+		for _, e := range helmHistory(executor, rel.Name, rel.Namespace) {
+			if strings.HasPrefix(e.Status, "pending-") {
+				stuck = append(stuck, rel)
+				break
+			}
+		}
+	}
+	return stuck
+}
+
+type helmHistoryEntry struct {
+	Revision int    `json:"revision"`
+	Status   string `json:"status"`
+}
+
+func helmHistory(executor *host.Executor, name, namespace string) []helmHistoryEntry {
+	out, err := executor.RunCapture("helm", "history", name, "-n", namespace, "-o", "json")
+	if err != nil {
+		return nil
+	}
+	var entries []helmHistoryEntry
+	if json.Unmarshal([]byte(out), &entries) != nil {
+		return nil
+	}
+	return entries
+}
+
+// ResetPendingOperationRelease clears a release wedged in pending-* by
+// deleting only the pending revisions' storage Secrets
+// (sh.helm.release.v1.<name>.v<revision>). The last *deployed* revision (if
+// any) becomes current again, so the live workload is untouched — unlike
+// `helm uninstall`, which would take the addon (e.g. coredns) down. With no
+// deployed revision left, the next pulumi up installs fresh. Returns true if
+// at least one pending record was removed.
+func ResetPendingOperationRelease(executor *host.Executor, name, namespace string) bool {
+	if executor == nil {
+		return false
+	}
+	cleared := false
+	for _, e := range helmHistory(executor, name, namespace) {
+		if !strings.HasPrefix(e.Status, "pending-") {
+			continue
+		}
+		secret := fmt.Sprintf("sh.helm.release.v1.%s.v%d", name, e.Revision)
+		if executor.Run("kubectl", "delete", "secret", "-n", namespace, secret, "--ignore-not-found=true") == nil {
+			cleared = true
+		}
+	}
+	return cleared
 }
 
 // ParseHelmOwnershipConflicts extracts resources that block a Helm release

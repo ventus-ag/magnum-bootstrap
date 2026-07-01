@@ -3,6 +3,7 @@ package hostresource
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -14,6 +15,12 @@ type ExtractTarSpec struct {
 	Destination      string
 	CheckPaths       []string
 	ChmodExecutables bool
+	// StampPath, when set, records which archive was last extracted. Without
+	// it, satisfaction is judged only by CheckPaths existing — binaries left
+	// by an OLD archive version satisfy the check and a version bump never
+	// re-extracts (the CNI plugins bug). The stamp content is the archive
+	// path, which callers make version-specific.
+	StampPath string
 }
 
 type ExtractTarResource struct {
@@ -35,6 +42,11 @@ func (spec ExtractTarSpec) Apply(executor *host.Executor) (ApplyResult, error) {
 	if spec.ChmodExecutables {
 		if err := executor.Run("chmod", "+x", spec.Destination+"/."); err != nil {
 			return ApplyResult{}, fmt.Errorf("chmod extracted files in %s: %w", spec.Destination, err)
+		}
+	}
+	if spec.StampPath != "" {
+		if _, err := executor.EnsureFile(spec.StampPath, []byte(spec.ArchivePath+"\n"), 0o644); err != nil {
+			return ApplyResult{}, fmt.Errorf("write extract stamp %s: %w", spec.StampPath, err)
 		}
 	}
 	return ApplyResult{
@@ -73,6 +85,12 @@ func (spec ExtractTarSpec) isSatisfied() bool {
 	}
 	for _, path := range spec.CheckPaths {
 		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+	}
+	if spec.StampPath != "" {
+		data, err := os.ReadFile(spec.StampPath)
+		if err != nil || strings.TrimSpace(string(data)) != spec.ArchivePath {
 			return false
 		}
 	}

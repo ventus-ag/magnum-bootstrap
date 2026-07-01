@@ -95,6 +95,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	}
 
 	chartVersion := config.LookupByKubeVersion(cinderCSIChartVersions, cfg.Shared.KubeVersion)
+	clusterhelm.WarnIfClampedBelow(ctx, "cluster-cinder-csi", cinderCSIChartVersions, cfg.Shared.KubeVersion)
 
 	// Chart versions >= 2.33 changed the cloud-config base path from
 	// /etc/kubernetes/ to /etc/config/. The CLOUD_CONFIG env var is

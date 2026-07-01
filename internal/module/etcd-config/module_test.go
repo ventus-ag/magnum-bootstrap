@@ -340,3 +340,45 @@ func TestMemberClientEndpoint(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestMemberMatchesSelfExactness(t *testing.T) {
+	cases := []struct {
+		name         string
+		member       etcdMember
+		instanceName string
+		nodeIP       string
+		want         bool
+	}{
+		{"exact name", etcdMember{name: "c1-master-1"}, "c1-master-1", "", true},
+		{"name prefix collision", etcdMember{name: "c1-master-10"}, "c1-master-1", "", false},
+		{"exact peer IP", etcdMember{peerURL: "https://10.0.0.5:2380"}, "", "10.0.0.5", true},
+		{"peer IP prefix collision", etcdMember{peerURL: "https://10.0.0.57:2380"}, "", "10.0.0.5", false},
+		{"unstarted member by peer URL", etcdMember{name: "", peerURL: "https://10.0.0.5:2380"}, "c1-master-1", "10.0.0.5", true},
+		{"empty identity never matches", etcdMember{name: "", peerURL: ""}, "", "", false},
+		{"http peer on tls-disabled", etcdMember{peerURL: "http://10.0.0.5:2380"}, "", "10.0.0.5", true},
+	}
+	for _, tc := range cases {
+		if got := memberMatchesSelf(tc.member, tc.instanceName, tc.nodeIP); got != tc.want {
+			t.Errorf("%s: memberMatchesSelf=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestEtcdTagMajorMinor(t *testing.T) {
+	if maj, min, ok := etcdTagMajorMinor("3.6.10-0"); !ok || maj != 3 || min != 6 {
+		t.Fatalf("got %d.%d ok=%v", maj, min, ok)
+	}
+	if _, _, ok := etcdTagMajorMinor("garbage"); ok {
+		t.Fatal("garbage must not parse")
+	}
+}
+
+func TestEtcdUnitTagRegex(t *testing.T) {
+	unit := `ExecStart=/bin/podman run \
+    registry.k8s.io/etcd:3.4.13-0 \
+    /usr/local/bin/etcd`
+	m := etcdUnitTagRe.FindStringSubmatch(unit)
+	if m == nil || m[1] != "3.4.13-0" {
+		t.Fatalf("got %v", m)
+	}
+}

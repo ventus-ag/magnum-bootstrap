@@ -86,17 +86,12 @@ func (*Export) Read(_ context.Context, req infer.ReadRequest[ExportArgs, ExportS
 	return infer.ReadResponse[ExportArgs, ExportState]{ID: exportID(spec.Path, spec.VarName), Inputs: inputs, State: state}, nil
 }
 
-func (*Export) Delete(_ context.Context, req infer.DeleteRequest[ExportState]) (infer.DeleteResponse, error) {
-	mode, err := parseMode(req.State.Mode)
-	if err != nil {
-		mode = 0o644
-	}
-	spec := hostresource.ExportSpec{Path: req.State.Path, VarName: req.State.VarName, Value: "", Mode: mode}
-	_, err = spec.Apply(newExecutor(true))
-	if os.IsNotExist(err) {
-		return infer.DeleteResponse{}, nil
-	}
-	return infer.DeleteResponse{}, err
+// Delete is deliberately a state-only no-op, same as File and Directory:
+// unregistration (conditional registration, provider flip-off) must not
+// mutate the host. Modules remove stale exports through their own Run()
+// convergence, matching legacy component behavior.
+func (*Export) Delete(_ context.Context, _ infer.DeleteRequest[ExportState]) (infer.DeleteResponse, error) {
+	return infer.DeleteResponse{}, nil
 }
 
 func (*Export) Diff(_ context.Context, req infer.DiffRequest[ExportArgs, ExportState]) (infer.DiffResponse, error) {

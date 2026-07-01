@@ -3,10 +3,19 @@ package journal
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/fsatomic"
 )
+
+// ErrCorrupt marks a run-state file that exists but does not parse (torn
+// write from a crash or power loss). Callers recover instead of failing: a
+// corrupt journal must never wedge future runs, since Load happens before
+// MarkRunning — the only write that would replace the bad file.
+var ErrCorrupt = errors.New("run state file corrupt")
 
 type RunState struct {
 	Status      string   `json:"status"`
@@ -32,7 +41,7 @@ func Load(path string) (RunState, error) {
 
 	var state RunState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return RunState{}, err
+		return RunState{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	return state, nil
 }
@@ -43,11 +52,22 @@ func Write(path string, state RunState) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+	return fsatomic.WriteFile(path, data, 0o600)
 }
 
 func RecoverInterrupted(path string) (RunState, bool, error) {
 	state, err := Load(path)
+	if errors.Is(err, ErrCorrupt) {
+		state = RunState{
+			Status:      "interrupted",
+			Summary:     "previous run state file was corrupt; marked interrupted",
+			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if werr := Write(path, state); werr != nil {
+			return RunState{}, false, werr
+		}
+		return state, true, nil
+	}
 	if err != nil {
 		return RunState{}, false, err
 	}
@@ -85,7 +105,7 @@ func MarkRunning(path, mode, instance, role, operation string, phases []string) 
 
 func MarkCompleted(path, mode, summary string) error {
 	state, err := Load(path)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrCorrupt) {
 		return err
 	}
 	state.Status = "completed"
@@ -98,7 +118,7 @@ func MarkCompleted(path, mode, summary string) error {
 
 func MarkFailed(path, mode, summary string) error {
 	state, err := Load(path)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrCorrupt) {
 		return err
 	}
 	state.Status = "failed"

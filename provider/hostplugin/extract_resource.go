@@ -17,6 +17,7 @@ type ExtractTarArgs struct {
 	Destination      string   `pulumi:"destination"`
 	CheckPaths       []string `pulumi:"checkPaths"`
 	ChmodExecutables bool     `pulumi:"chmodExecutables,optional"`
+	StampPath        string   `pulumi:"stampPath,optional"`
 }
 
 type ExtractTarState struct {
@@ -100,7 +101,7 @@ func (*ExtractTar) Annotate(a infer.Annotator) {
 }
 
 func extractTarSpec(args ExtractTarArgs) hostresource.ExtractTarSpec {
-	return hostresource.ExtractTarSpec{ArchivePath: args.ArchivePath, Destination: args.Destination, CheckPaths: append([]string(nil), args.CheckPaths...), ChmodExecutables: args.ChmodExecutables}
+	return hostresource.ExtractTarSpec{ArchivePath: args.ArchivePath, Destination: args.Destination, CheckPaths: append([]string(nil), args.CheckPaths...), ChmodExecutables: args.ChmodExecutables, StampPath: args.StampPath}
 }
 
 func extractTarStateFromSpec(spec hostresource.ExtractTarSpec) (ExtractTarState, error) {

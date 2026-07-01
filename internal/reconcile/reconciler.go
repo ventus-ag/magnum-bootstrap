@@ -272,38 +272,33 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 			req.Logger.Infof("running pulumi up stack=%s parallelism=%d diff=%t", cfg.StackName(), parallelism, diff)
 		}
 		stopHeartbeat := startPulumiHeartbeat(ctx, req.Logger, "up", cfg.StackName(), start)
-		upOpts := []optup.Option{
+		// baseUpOpts deliberately excludes EventStreams: the Pulumi SDK closes
+		// user-supplied event channels when an operation finishes, so any retry
+		// (stale-lock or helm recovery) that reused eventCh would make the SDK
+		// send on / close a closed channel and panic in a goroutine outside our
+		// recover. Only the very first attempt streams events; retries fall back
+		// to progress writers.
+		baseUpOpts := []optup.Option{
 			optup.Parallel(parallelism),
 			optup.ProgressStreams(progressWriters...),
 			optup.ErrorProgressStreams(errorProgressWriters...),
 		}
 		if diff {
-			upOpts = append(upOpts, optup.Diff())
-		}
-		if eventCh != nil {
-			upOpts = append(upOpts, optup.EventStreams(eventCh))
+			baseUpOpts = append(baseUpOpts, optup.Diff())
 		}
 		if pulumiDebugOpts != nil {
-			upOpts = append(upOpts, optup.DebugLogging(*pulumiDebugOpts))
+			baseUpOpts = append(baseUpOpts, optup.DebugLogging(*pulumiDebugOpts))
+		}
+		firstUpOpts := baseUpOpts
+		if eventCh != nil {
+			firstUpOpts = append(append([]optup.Option{}, baseUpOpts...), optup.EventStreams(eventCh))
 		}
 		var upRes auto.UpResult
 		var err error
 		retryUp := func(label string) {
-			retryOpts := []optup.Option{
-				optup.Parallel(parallelism),
-				optup.ProgressStreams(progressWriters...),
-				optup.ErrorProgressStreams(errorProgressWriters...),
-			}
-			if diff {
-				retryOpts = append(retryOpts, optup.Diff())
-			}
-			if pulumiDebugOpts != nil {
-				retryOpts = append(retryOpts, optup.DebugLogging(*pulumiDebugOpts))
-			}
-
 			start = time.Now()
 			stopHeartbeat = startPulumiHeartbeat(ctx, req.Logger, label, cfg.StackName(), start)
-			upRes, err = stack.Up(ctx, retryOpts...)
+			upRes, err = stack.Up(ctx, baseUpOpts...)
 			stopHeartbeat()
 		}
 		// Wrap the initial up so a stale Pulumi lock (left by an earlier run
@@ -313,8 +308,14 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		// refresh path's recovery — and every subsequent run wedges on the same
 		// lock. runWithAutoCancel only cancels when the lock owner pid is dead;
 		// a genuinely active run is left alone.
+		upAttempt := 0
 		upRes, err = runWithAutoCancel(ctx, req.Logger, &stack, cfg.StackName(), "up", func() (auto.UpResult, error) {
-			return stack.Up(ctx, upOpts...)
+			opts := firstUpOpts
+			if upAttempt > 0 {
+				opts = baseUpOpts
+			}
+			upAttempt++
+			return stack.Up(ctx, opts...)
 		})
 		stopHeartbeat()
 		// Recover from Helm failures across MULTIPLE classes in one run. Each
@@ -412,6 +413,33 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 						}
 					}
 					retryUp("up (helm removed-api recreate retry)")
+				}
+			}
+			// A previous helm install/upgrade/rollback killed mid-flight (node
+			// reboot, Heat timeout, OOM) leaves the release's newest storage
+			// record in pending-*; Helm then refuses every subsequent operation
+			// with "another operation ... is in progress" — a permanent wedge no
+			// other branch matches. Recover by deleting only the pending
+			// revision Secrets: the last deployed revision becomes current again
+			// (live workload untouched), or a fresh install happens if nothing
+			// was ever deployed.
+			if err != nil {
+				if pending, matched := clusterhelm.ParseHelmPendingOperations(err.Error()); matched {
+					if len(pending) == 0 {
+						pending = clusterhelm.PendingOperationManagedReleases(executor)
+					}
+					recovered := make([]string, 0, len(pending))
+					for _, rel := range pending {
+						if clusterhelm.ResetPendingOperationRelease(executor, rel.Name, rel.Namespace) {
+							recovered = append(recovered, rel.Namespace+"/"+rel.Name)
+						}
+					}
+					if len(recovered) > 0 {
+						if req.Logger != nil {
+							req.Logger.Warnf("helm release(s) %v stuck in a pending operation (interrupted install/upgrade/rollback); cleared pending revision(s) and retrying", recovered)
+						}
+						retryUp("up (helm pending-operation retry)")
+					}
 				}
 			}
 			// Some legacy clusters have Helm release resources whose objects exist
@@ -696,6 +724,24 @@ func Destroy(ctx context.Context, cfg config.Config, runtimePaths paths.Paths, r
 }
 
 func ensureHostProviderPlugin(ctx context.Context, runtimePaths paths.Paths, logger *logging.Logger) (string, error) {
+	// Respect an explicit MAGNUM_USE_HOST_PROVIDER=false: release builds
+	// always carry a default provider URL, and without this gate every run
+	// (preview included) downloads the plugin — and a download failure
+	// (air-gap, GitHub outage) hard-fails the reconcile even for clusters
+	// that have the provider disabled and no provider resource in state.
+	// A locally cached or ambient plugin is still exposed: the stack state
+	// may hold provider resources from earlier runs, and the engine needs
+	// the plugin binary to process (no-op delete) them during the flip-off.
+	if !hostsdk.Enabled() {
+		pluginDir := filepath.Join(runtimePaths.PulumiStateDir, "providers")
+		if _, err := os.Stat(filepath.Join(pluginDir, buildinfo.HostProviderAsset)); err == nil {
+			return pluginDir, nil
+		}
+		if providerDir := hostsdk.ProviderDir(); providerDir != "" {
+			return providerDir, nil
+		}
+		return "", nil
+	}
 	if providerDir := hostsdk.ProviderDir(); providerDir != "" {
 		return providerDir, nil
 	}

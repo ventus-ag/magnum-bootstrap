@@ -7,6 +7,7 @@ type ExtractTarArgs struct {
 	Destination      pulumi.StringInput      `pulumi:"destination"`
 	CheckPaths       pulumi.StringArrayInput `pulumi:"checkPaths"`
 	ChmodExecutables pulumi.BoolPtrInput     `pulumi:"chmodExecutables,optional"`
+	StampPath        pulumi.StringPtrInput   `pulumi:"stampPath,optional"`
 }
 
 type ExtractTar struct {
@@ -30,6 +31,9 @@ func NewExtractTar(ctx *pulumi.Context, name string, args *ExtractTarArgs, opts 
 	inputs := pulumi.Map{"archivePath": args.ArchivePath, "destination": args.Destination, "checkPaths": args.CheckPaths}
 	if args.ChmodExecutables != nil {
 		inputs["chmodExecutables"] = args.ChmodExecutables
+	}
+	if args.StampPath != nil {
+		inputs["stampPath"] = args.StampPath
 	}
 	if err := ctx.RegisterResource("magnumhost:index:ExtractTar", name, inputs, res, withDefaults(opts)...); err != nil {
 		return nil, err

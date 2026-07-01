@@ -47,13 +47,24 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, serviceFileResult.Changes...)
 
-	if configResult.Changed || serviceFileResult.Changed {
-		serviceResult, err := (hostresource.SystemdServiceSpec{Unit: "registry.service", DaemonReload: true}).Apply(executor)
-		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		changes = append(changes, serviceResult.Changes...)
+	// The registry must be enabled + running whenever the feature is on —
+	// not only daemon-reloaded when a file changed (which left the unit
+	// written but never started, i.e. the feature permanently inert), and
+	// restarted when its config or unit content changed.
+	enabled := true
+	active := true
+	serviceResult, err := (hostresource.SystemdServiceSpec{
+		Unit:          "registry.service",
+		Enabled:       &enabled,
+		Active:        &active,
+		DaemonReload:  configResult.Changed || serviceFileResult.Changed,
+		Restart:       configResult.Changed || serviceFileResult.Changed,
+		RestartReason: "registry config or unit changed",
+	}).Apply(executor)
+	if err != nil {
+		return moduleapi.Result{}, err
 	}
+	changes = append(changes, serviceResult.Changes...)
 
 	return moduleapi.Result{
 		Changes: changes,
@@ -98,20 +109,28 @@ http:
 }
 
 func buildRegistryService(cfg config.Config) string {
+	// Only the docker runtime ships the docker CLI; containerd-based images
+	// (FCoS default, Ubuntu driver) only have podman — a docker-hardcoded
+	// unit could never start there.
+	engine := "/usr/bin/podman"
+	deps := ""
+	if cfg.Shared.ContainerRuntime == "docker" {
+		engine = "/usr/bin/docker"
+		deps = "Requires=docker.service\nAfter=docker.service\n"
+	}
 	return fmt.Sprintf(`[Unit]
 Description=Docker registry v2
-Requires=docker.service
-After=docker.service
-
+%s
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/docker run -d -p %d:5000 --restart=always --name registry -v /etc/sysconfig/registry-config.yml:/etc/docker/registry/config.yml registry:2
-ExecStop=/usr/bin/docker rm -f registry
+ExecStartPre=-%[2]s rm -f registry
+ExecStart=%[2]s run -d -p %[3]d:5000 --restart=always --name registry -v /etc/sysconfig/registry-config.yml:/etc/docker/registry/config.yml registry:2
+ExecStop=%[2]s rm -f registry
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.Worker.RegistryPort)
+`, deps, engine, cfg.Worker.RegistryPort)
 }
 
 // Destroy stops the registry service and removes its configuration.

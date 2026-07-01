@@ -56,7 +56,7 @@ KUBE_TAG="${KUBE_TAG:-v1.30.5}"
 KUBE_TAG_UPGRADE="${KUBE_TAG_UPGRADE:-v1.31.4}"
 FCOS_STREAM="${FCOS_STREAM:-stable}"
 VICTORIA_DIR="${VICTORIA_DIR:-}"
-SCENARIOS="${SCENARIOS:-create ca-rotate upgrade}"
+SCENARIOS="${SCENARIOS:-create ca-rotate upgrade periodic}"
 WORKERS="${WORKERS:-0}"
 MASTERS="${MASTERS:-1}"   # >=2 enables the multi-master + 2-LB path (opt-in; TCG-slow)
 
@@ -835,6 +835,16 @@ scenario_upgrade() {
 }
 _upgrade_worker() { apply_worker "$1" upgrade "$KUBE_TAG_UPGRADE"; assert_worker_joined "$1"; }
 
+# scenario_periodic — drift-correction path: inject real host drift on the
+# master (crashed kube-scheduler + mangled kubelet-config.yaml), heal it via
+# the magnum-reconcile-periodic unit (`run-periodic`: refresh on, etcd day-2
+# gating), and assert a second periodic run is zero-change. This is the only
+# tier that exercises run-periodic at all.
+scenario_periodic() {
+  log "=== SCENARIO: periodic (drift heal via run-periodic) ==="
+  gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh assert-periodic-heal"
+}
+
 # scenario_scale_masters — grow the control plane from 1 to MASTERS one node at a
 # time, asserting the etcd membership climbs by exactly one per added master.
 #
@@ -980,6 +990,7 @@ main() {
       scale-masters) scenario_scale_masters;  record_scenario "$s" PASS "control plane 1 -> ${MASTERS}, etcd ${MASTERS} members" ;;
       ca-rotate)     scenario_ca_rotate;      record_scenario "$s" PASS "API server leaf cert re-keyed" ;;
       upgrade)       scenario_upgrade;        record_scenario "$s" PASS "kubelet ${KUBE_TAG} -> ${KUBE_TAG_UPGRADE}" ;;
+      periodic)      scenario_periodic;       record_scenario "$s" PASS "drift healed by run-periodic, steady state zero-change" ;;
       *) die "unknown scenario: $s" ;;
     esac
   done

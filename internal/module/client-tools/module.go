@@ -102,6 +102,14 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	needsHelm := binaryNeedsReconcile("/usr/local/bin/helm", desired.HelmURL, installed.HelmURL, installed.HelmSHA256)
 	needsHelmCopy := binaryNeedsReconcile("/srv/magnum/bin/helm", desired.HelmURL, installed.HelmURL, installed.HelmCopySHA256) || needsHelm
 
+	// A replaced kubelet binary must restart the running kubelet, or an
+	// upgrade whose version delta changes no config file (e.g. an Ubuntu
+	// patch-level bump) leaves the old kubelet running while Heat reports the
+	// upgrade complete. The services module applies the actual restart.
+	if needsKubelet && req.Restarts != nil {
+		req.Restarts.Add("kubelet", "kubelet binary changed to "+cfg.Shared.KubeTag)
+	}
+
 	if req.Apply {
 		kubeletDownload, kubectlDownload, err := downloadClientBinaries(ctx, executor, desired, needsKubelet, needsKubectl)
 		if err != nil {

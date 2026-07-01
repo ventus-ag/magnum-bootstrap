@@ -2,7 +2,6 @@ package hostplugin
 
 import (
 	"context"
-	"os"
 
 	providerpkg "github.com/pulumi/pulumi-go-provider"
 	"github.com/pulumi/pulumi-go-provider/infer"
@@ -73,12 +72,16 @@ func (*Directory) Read(_ context.Context, req infer.ReadRequest[DirectoryArgs, D
 	return infer.ReadResponse[DirectoryArgs, DirectoryState]{ID: spec.Path, Inputs: inputs, State: state}, nil
 }
 
-func (*Directory) Delete(_ context.Context, req infer.DeleteRequest[DirectoryState]) (infer.DeleteResponse, error) {
-	err := os.RemoveAll(req.State.Path)
-	if os.IsNotExist(err) {
-		return infer.DeleteResponse{}, nil
-	}
-	return infer.DeleteResponse{}, err
+// Delete is deliberately a state-only no-op. A Directory resource leaving the
+// program does not mean the operator wants the path destroyed: registrations
+// are conditional on observed host state (certs registered only when
+// readable, /var/lib/etcd only while EtcdVolumeSize > 0), and disabling the
+// provider (MAGNUM_USE_HOST_PROVIDER=false) re-registers everything as legacy
+// components — a recursive os.RemoveAll here would then wipe live directories
+// such as a mounted etcd data volume. Real teardown is owned by the module
+// Destroy() cleanup paths, matching legacy component behavior.
+func (*Directory) Delete(_ context.Context, _ infer.DeleteRequest[DirectoryState]) (infer.DeleteResponse, error) {
+	return infer.DeleteResponse{}, nil
 }
 
 func (*Directory) Diff(_ context.Context, req infer.DiffRequest[DirectoryArgs, DirectoryState]) (infer.DiffResponse, error) {

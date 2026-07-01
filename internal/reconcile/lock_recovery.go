@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -116,7 +117,22 @@ func localProcessExists(pid int) bool {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
+	if err != nil && err != syscall.EPERM {
+		return false
+	}
+	// The PID is alive, but the Pulumi lock file survives reboots in the
+	// local file backend, so after a reboot (or plain PID reuse) this PID is
+	// often some unrelated long-lived process — treating it as an active lock
+	// holder wedges every future run until a manual `bootstrap cancel`. A
+	// genuine holder is this binary or a pulumi child process; anything else
+	// means the recorded owner is gone and the lock is stale.
+	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		// No /proc entry to judge by — stay conservative and honor the lock.
+		return true
+	}
+	name := strings.TrimSpace(string(comm))
+	return name == "bootstrap" || strings.HasPrefix(name, "pulumi")
 }
 
 func formatPIDList(pids []int) string {

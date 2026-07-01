@@ -53,6 +53,19 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	// Only set podCidr and backend — let the chart handle image defaults.
 	// Matches the bash script values.yaml which only sets these two fields.
+	// Exception: CONTAINER_INFRA_PREFIX redirects the image repositories to
+	// the mirror (tags stay chart defaults), consistent with coredns/cinder.
+	flannelValues := map[string]interface{}{
+		"backend": backend,
+	}
+	if prefix := cfg.Shared.ContainerInfraPrefix; prefix != "" {
+		flannelValues["image"] = map[string]interface{}{
+			"repository": prefix + "flannel",
+		}
+		flannelValues["image_cni_plugin"] = map[string]interface{}{
+			"repository": prefix + "flannel-cni-plugin",
+		}
+	}
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "flannel",
 		Namespace:   "kube-flannel",
@@ -61,9 +74,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		RepoURL:     "https://flannel-io.github.io/flannel/",
 		Values: map[string]interface{}{
 			"podCidr": podCIDR,
-			"flannel": map[string]interface{}{
-				"backend": backend,
-			},
+			"flannel": flannelValues,
 		},
 	}, childOpts...)
 	if err != nil {

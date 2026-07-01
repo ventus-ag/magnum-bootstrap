@@ -56,6 +56,14 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 
 	chartVersion := config.LookupByKubeVersion(gpuOperatorChartVersions, cfg.Shared.KubeTag)
 
+	// The GPU operator pulls its whole component fleet (driver, toolkit,
+	// dcgm, nfd, validators) from nvcr.io with per-component repository
+	// values — a single CONTAINER_INFRA_PREFIX remap cannot cover it. Warn
+	// instead of silently deploying images an air-gapped cluster can't pull.
+	if cfg.Shared.ContainerInfraPrefix != "" {
+		_ = ctx.Log.Warn("cluster-gpu-operator: CONTAINER_INFRA_PREFIX is not applied to GPU operator images (nvcr.io per-component repositories); air-gapped clusters need chart-side mirror configuration", nil)
+	}
+
 	_, err := clusterhelm.DeployHelmRelease(ctx, name+"-chart", clusterhelm.HelmReleaseArgs{
 		ReleaseName: "gpu-operator",
 		Namespace:   "gpu-operator",

@@ -3,7 +3,9 @@ package etcdconfig
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +29,67 @@ var etcdImageTags = map[string]string{
 
 func etcdTag(cfg config.Config) string {
 	return config.LookupByKubeVersion(etcdImageTags, cfg.Shared.KubeTag)
+}
+
+var etcdUnitTagRe = regexp.MustCompile(`etcd:(v?[0-9]+\.[0-9]+\.[0-9][^"\s]*)`)
+
+// currentEtcdUnitTag returns the etcd image tag from the installed unit file,
+// or "" when no unit exists (fresh node) or no tag is recognizable.
+func currentEtcdUnitTag() string {
+	data, err := os.ReadFile("/etc/systemd/system/etcd.service")
+	if err != nil {
+		return ""
+	}
+	m := etcdUnitTagRe.FindStringSubmatch(string(data))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+func etcdTagMajorMinor(tag string) (int, int, bool) {
+	parts := strings.SplitN(strings.TrimPrefix(strings.TrimSpace(tag), "v"), ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+// resolveEtcdRenderTag picks the etcd tag the unit file is rendered with.
+// etcd supports neither downgrades nor multi-minor upgrades (3.4 data cannot
+// start under 3.6; it must step through 3.5), so when the installed unit runs
+// a version the desired tag cannot safely replace, the rendered content keeps
+// the CURRENT tag — this must live in the render itself, not just Run(),
+// because the host-provider path writes the registered unit content even when
+// the Run phase fails. etcdUpgradeBlocked reports the unsafe-jump case so
+// Run() can surface it as a clear phase error instead of a silent stay-put.
+func resolveEtcdRenderTag(cfg config.Config) (tag string, blocked bool) {
+	desired := etcdTag(cfg)
+	current := currentEtcdUnitTag()
+	if current == "" || current == desired {
+		return desired, false
+	}
+	cMaj, cMin, okC := etcdTagMajorMinor(current)
+	dMaj, dMin, okD := etcdTagMajorMinor(desired)
+	if !okC || !okD {
+		return desired, false
+	}
+	if cMaj > dMaj || (cMaj == dMaj && cMin > dMin) {
+		// Never downgrade a running etcd (data format is not backward
+		// compatible); keep the newer installed version.
+		return current, false
+	}
+	if dMaj != cMaj || dMin-cMin >= 2 {
+		// Unsupported jump (e.g. legacy bash-era 3.4 data adopted by a
+		// reconciler that wants 3.6). Keep the working version running.
+		return current, true
+	}
+	return desired, false
 }
 
 type Module struct{}
@@ -55,6 +118,16 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{
 			Outputs: map[string]string{"etcdTag": etcdTag(cfg)},
 		}, nil
+	}
+
+	// Fail fast on an unsupported etcd version jump (e.g. adopted legacy 3.4
+	// data with a desired 3.6): the rendered unit keeps the working version
+	// (resolveEtcdRenderTag), and the operator gets an actionable error
+	// instead of a wedged etcd that refuses its own data files.
+	if renderTag, blocked := resolveEtcdRenderTag(cfg); blocked {
+		return moduleapi.Result{}, fmt.Errorf(
+			"etcd: installed version %s cannot be upgraded directly to %s (etcd supports only single-minor upgrades); keeping %s running — step the cluster through intermediate Kubernetes/etcd versions",
+			currentEtcdUnitTag(), etcdTag(cfg), renderTag)
 	}
 
 	executor := host.NewExecutor(req.Apply, req.Logger)
@@ -130,10 +203,14 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		changes = append(changes, cs...)
 		if err != nil {
 			// Data present but etcd will not start. If the cluster is reachable and
-			// we are no longer a member, the data is orphaned (node removed while
-			// down) and unusable — wipe and rejoin. Otherwise fail safe: refuse to
-			// destroy data on a transient or quorum-loss condition.
-			if lbOK && !checkMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP) {
+			// we are DEFINITIVELY no longer a member (the member list query
+			// succeeded and we are absent), the data is orphaned (node removed
+			// while down) and unusable — wipe and rejoin. A failed member-list
+			// query must NOT count as "not a member": a transient/mTLS error
+			// would wipe a healthy replica for a fixable local problem.
+			// Otherwise fail safe: refuse to destroy data.
+			isMember, membershipKnown := queryMembership(executor, lbEndpoint, certDir, cfg.Shared.TLSDisabled, cfg.Shared.InstanceName, nodeIP)
+			if lbOK && membershipKnown && !isMember {
 				if req.Logger != nil {
 					req.Logger.Warnf("etcd: have data but not a member and etcd will not start — orphaned data, wiping and rejoining: %v", err)
 				}
@@ -310,10 +387,23 @@ func prepareVolume(cfg config.Config, executor *host.Executor) ([]host.Change, e
 	}
 	if lineResult.Changed {
 		changes = append(changes, lineResult.Changes...)
-		_ = executor.Run("mount", "-a")
-		_ = executor.Run("chown", "-R", "etcd.etcd", "/var/lib/etcd")
-		_ = executor.Run("chmod", "755", "/var/lib/etcd")
 	}
+
+	// Mount whenever the volume is not mounted (we are past the IsMountpoint
+	// early-return), not only when the fstab line just changed: if an earlier
+	// run wrote the line but its mount failed or the run died in between, a
+	// changed-gated mount would never retry — etcd would bootstrap on the root
+	// disk and the next reboot would mount the (empty) volume over that data,
+	// which on a single master means bootstrapping a brand-new empty cluster.
+	// A mount failure is fatal for the same reason. Mount only the target
+	// (fstab-driven), not mount -a.
+	if err := executor.Run("mount", "/var/lib/etcd"); err != nil {
+		return nil, fmt.Errorf("mount etcd volume %s at /var/lib/etcd: %w", devicePath, err)
+	}
+	changes = append(changes, host.Change{Action: host.ActionUpdate, Path: "/var/lib/etcd",
+		Summary: fmt.Sprintf("mount %s at /var/lib/etcd", devicePath)})
+	_ = executor.Run("chown", "-R", "etcd.etcd", "/var/lib/etcd")
+	_ = executor.Run("chmod", "755", "/var/lib/etcd")
 
 	return changes, nil
 }
@@ -374,6 +464,7 @@ func buildEtcdService(cfg config.Config) string {
 		containerImage = "registry.k8s.io/"
 	}
 	containerImage += "etcd"
+	renderTag, _ := resolveEtcdRenderTag(cfg)
 
 	return fmt.Sprintf(`[Unit]
 Description=Etcd server
@@ -402,7 +493,7 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-`, kubecommon.PodmanResetExecStartPre("/bin/podman", "etcd"), containerImage, etcdTag(cfg))
+`, kubecommon.PodmanResetExecStartPre("/bin/podman", "etcd"), containerImage, renderTag)
 }
 
 func installEtcdctl(cfg config.Config, executor *host.Executor) ([]host.Change, error) {
@@ -498,13 +589,46 @@ func etcdHealthy(executor *host.Executor, endpoint, certDir string, tlsDisabled 
 }
 
 func checkMembership(executor *host.Executor, endpoint, certDir string, tlsDisabled bool, instanceName, nodeIP string) bool {
+	isMember, _ := queryMembership(executor, endpoint, certDir, tlsDisabled, instanceName, nodeIP)
+	return isMember
+}
+
+// queryMembership distinguishes "definitively not a member" from "could not
+// ask": ok is false when the member-list query itself failed. Destructive
+// callers (data wipe) must require ok.
+func queryMembership(executor *host.Executor, endpoint, certDir string, tlsDisabled bool, instanceName, nodeIP string) (isMember, ok bool) {
 	args := etcdctlArgs(endpoint, certDir, tlsDisabled)
 	args = append(args, "member", "list")
 	out, err := runEtcdctl(executor, args...)
 	if err != nil {
+		return false, false
+	}
+	for _, m := range parseMemberList(out) {
+		if memberMatchesSelf(m, instanceName, nodeIP) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// memberMatchesSelf reports whether a member-list row belongs to this node:
+// exact name match, or a peer URL whose host is exactly nodeIP. Substring
+// matching is unsafe here — "10.0.0.5" is a prefix of "10.0.0.57" and
+// "…master-1" of "…master-10" — and a false positive on the removal paths
+// (rejoinCluster, Destroy) evicts a healthy foreign voter and degrades quorum.
+func memberMatchesSelf(m etcdMember, instanceName, nodeIP string) bool {
+	if instanceName != "" && m.name == instanceName {
+		return true
+	}
+	return nodeIP != "" && peerURLHostEquals(m.peerURL, nodeIP)
+}
+
+func peerURLHostEquals(rawURL, host string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
 		return false
 	}
-	return strings.Contains(out, instanceName) || strings.Contains(out, nodeIP)
+	return u.Hostname() == host
 }
 
 func skipMembershipReconcile(cfg config.Config) bool {
@@ -590,16 +714,12 @@ func rejoinCluster(cfg config.Config, executor *host.Executor, nodeIP, protocol,
 		// member add will still work if the cluster accepts us.
 		executor.Logger.Warnf("etcd rejoin: member list failed (cluster may be forming quorum), skipping remove: %v", err)
 	} else {
-		lines := strings.Split(out, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, cfg.Shared.InstanceName) || strings.Contains(line, nodeIP) {
-				parts := strings.SplitN(line, ",", 2)
-				if len(parts) > 0 {
-					memberID := strings.TrimSpace(parts[0])
-					if _, rmErr := runEtcdctl(executor, append(args, "member", "remove", memberID)...); rmErr != nil {
-						executor.Logger.Warnf("etcd rejoin: member remove failed (member %s, may be transient): %v", memberID, rmErr)
-					}
-				}
+		for _, m := range parseMemberList(out) {
+			if !memberMatchesSelf(m, cfg.Shared.InstanceName, nodeIP) {
+				continue
+			}
+			if _, rmErr := runEtcdctl(executor, append(append([]string{}, args...), "member", "remove", m.id)...); rmErr != nil {
+				executor.Logger.Warnf("etcd rejoin: member remove failed (member %s, may be transient): %v", m.id, rmErr)
 			}
 		}
 	}
@@ -1144,7 +1264,9 @@ func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, 
 	}
 	var candidates []memberEntry
 	for _, m := range members {
-		if strings.Contains(m.name, cfg.Shared.InstanceName) {
+		// Exact match: with substring matching, "…master-1" would wrongly skip
+		// "…master-10" and leave a genuinely orphaned member in place.
+		if m.name == cfg.Shared.InstanceName {
 			continue
 		}
 		// Never evict a learner: it is a join-in-progress (client-unhealthy by
@@ -1440,7 +1562,7 @@ func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Reques
 
 	executor := host.NewExecutor(req.Apply, req.Logger)
 	nodeIP := cfg.ResolveNodeIP()
-	certDir := "/etc/kubernetes"
+	certDir := "/etc/etcd/certs"
 
 	protocol := "https"
 	if cfg.Shared.TLSDisabled {
@@ -1457,19 +1579,16 @@ func (Module) Destroy(_ context.Context, cfg config.Config, req moduleapi.Reques
 		}
 	} else {
 		// Find our member ID and remove ourselves.
-		for _, line := range strings.Split(out, "\n") {
-			if strings.Contains(line, cfg.Shared.InstanceName) || strings.Contains(line, nodeIP) {
-				parts := strings.SplitN(line, ",", 2)
-				if len(parts) > 0 {
-					memberID := strings.TrimSpace(parts[0])
-					if req.Logger != nil {
-						req.Logger.Infof("etcd destroy: removing member=%s from cluster", memberID)
-					}
-					removeArgs := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
-					_, _ = runEtcdctl(executor, append(removeArgs, "member", "remove", memberID)...)
-				}
-				break
+		for _, m := range parseMemberList(out) {
+			if !memberMatchesSelf(m, cfg.Shared.InstanceName, nodeIP) {
+				continue
 			}
+			if req.Logger != nil {
+				req.Logger.Infof("etcd destroy: removing member=%s from cluster", m.id)
+			}
+			removeArgs := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+			_, _ = runEtcdctl(executor, append(removeArgs, "member", "remove", m.id)...)
+			break
 		}
 	}
 
@@ -1501,10 +1620,16 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				return nil, err
 			}
 			if devicePath, err := findEtcdVolumeDevice(cfg, executor); err == nil && devicePath != "" {
-				fstabLine := fmt.Sprintf("%s /var/lib/etcd xfs defaults 0 0", devicePath)
-				fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dataDirRes)
-				if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
-					return nil, err
+				// Same fstype rule as Run(): register the line with the real
+				// on-disk fstype (legacy volumes may be ext4); a hardcoded xfs
+				// line would conflict with Run()'s and can break the boot-time
+				// mount. Blank device → skip, Run() formats and writes first.
+				if fstype := executor.BlockDeviceFstype(devicePath); fstype != "" {
+					fstabLine := fmt.Sprintf("%s /var/lib/etcd %s defaults 0 0", devicePath, fstype)
+					fstabOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dataDirRes)
+					if _, err := hostsdk.RegisterLineSpec(ctx, name+"-fstab", hostresource.LineSpec{Path: "/etc/fstab", Line: fstabLine, Mode: 0o644}, fstabOpts...); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}

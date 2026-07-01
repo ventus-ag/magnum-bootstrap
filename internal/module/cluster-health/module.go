@@ -9,6 +9,7 @@ import (
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -32,15 +33,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	kubectl := "/srv/magnum/bin/kubectl"
 	kubeconfig := "/etc/kubernetes/admin.conf"
 
-	pods, err := allCrashLoopPods(executor, kubectl, kubeconfig)
-	if err != nil {
-		return moduleapi.Result{
-			Warnings: []string{fmt.Sprintf("failed to scan for crashlooping pods: %v", err)},
-		}, nil
-	}
+	pods, warnScan := managedCrashLoopPods(executor, kubectl, kubeconfig, req.Logger)
 
 	var deleted []string
-	var warnings []string
+	warnings := warnScan
 
 	for _, pod := range pods {
 		if req.Apply {
@@ -73,35 +69,59 @@ type podRef struct {
 	name      string
 }
 
-// allCrashLoopPods scans all namespaces for pods with crashlooping containers.
-func allCrashLoopPods(executor *host.Executor, kubectl, kubeconfig string) ([]podRef, error) {
-	out, err := executor.RunCapture(
-		kubectl, "--kubeconfig="+kubeconfig,
-		"get", "pods", "--all-namespaces",
-		"--field-selector=status.phase!=Succeeded",
-		"-o", `jsonpath={range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{"|"}{.lastState.terminated.reason}{"|"}{.restartCount}{" "}{end}{"\n"}{end}`,
-	)
-	if err != nil {
-		return nil, err
-	}
+// managedNamespaces are the namespaces the cluster addon modules deploy into.
+// The healing scan is limited to them: this module manages addon health, and a
+// cluster-wide sweep would delete users' crashlooping pods — a bare debug pod
+// would be gone permanently, and controller pods would be delete-churned in a
+// way that resets CrashLoopBackOff and hides the failure from their owner.
+func managedNamespaces() []string {
+	return []string{"kube-system", "kube-flannel", "kubernetes-dashboard", "gpu-operator"}
+}
 
+// managedCrashLoopPods scans the managed addon namespaces for crashlooping
+// pods that are safe to heal by deletion. Scan errors are reported as
+// warnings, never as failures.
+func managedCrashLoopPods(executor *host.Executor, kubectl, kubeconfig string, logger *logging.Logger) ([]podRef, []string) {
 	var pods []podRef
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
+	var warnings []string
+	for _, ns := range managedNamespaces() {
+		out, err := executor.RunCapture(
+			kubectl, "--kubeconfig="+kubeconfig,
+			"get", "pods", "-n", ns,
+			"--field-selector=status.phase!=Succeeded",
+			"-o", `jsonpath={range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.metadata.ownerReferences[*].kind}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{"|"}{.lastState.terminated.reason}{"|"}{.restartCount}{" "}{end}{"\n"}{end}`,
+		)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("failed to scan namespace %s for crashlooping pods: %v", ns, err))
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		ns := parts[0]
-		name := parts[1]
-		containers := parts[2]
-		if isCrashLooping(containers) {
-			pods = append(pods, podRef{namespace: ns, name: name})
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "\t", 4)
+			if len(parts) != 4 {
+				continue
+			}
+			namespace := parts[0]
+			name := parts[1]
+			ownerKinds := strings.TrimSpace(parts[2])
+			containers := parts[3]
+			if !isCrashLooping(containers) {
+				continue
+			}
+			// Only controller-owned pods are recreated after deletion. A pod
+			// with no owner reference would just be gone — leave it alone.
+			if ownerKinds == "" {
+				if logger != nil {
+					logger.Infof("cluster-health: skipping crashlooping pod %s/%s (no controller owner, deletion would not recreate it)", namespace, name)
+				}
+				continue
+			}
+			pods = append(pods, podRef{namespace: namespace, name: name})
 		}
 	}
-	return pods, nil
+	return pods, warnings
 }
 
 // isCrashLooping checks per-container status fields to detect crashlooping.

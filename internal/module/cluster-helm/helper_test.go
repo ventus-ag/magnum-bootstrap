@@ -232,3 +232,38 @@ func removeIfExists(path string) error {
 	}
 	return os.Remove(path)
 }
+
+func TestParseHelmPendingOperations(t *testing.T) {
+	msg := `error: update failed: 1 error occurred: Helm Release kube-system/coredns: another operation (install/upgrade/rollback) is in progress`
+	pairs, matched := ParseHelmPendingOperations(msg)
+	if !matched {
+		t.Fatal("expected pending-operation match")
+	}
+	if len(pairs) != 1 || pairs[0].Namespace != "kube-system" || pairs[0].Name != "coredns" {
+		t.Fatalf("unexpected pairs: %+v", pairs)
+	}
+
+	// Phrase present but release not named → matched with empty pairs
+	// (caller falls back to scanning managed releases).
+	pairs, matched = ParseHelmPendingOperations("another operation (install/upgrade/rollback) is in progress")
+	if !matched || len(pairs) != 0 {
+		t.Fatalf("expected matched with no pairs, got matched=%v pairs=%+v", matched, pairs)
+	}
+
+	if _, matched := ParseHelmPendingOperations("cannot patch: something is invalid"); matched {
+		t.Fatal("unrelated error must not match")
+	}
+}
+
+func TestParseHelmPatchFailuresLineScoped(t *testing.T) {
+	msg := `error: update failed: 2 errors occurred:
+Helm Release kube-system/coredns: cannot patch "coredns" with kind Deployment: Deployment.apps "coredns" is invalid
+Helm Release kube-system/metrics-server: context deadline exceeded`
+	pairs := ParseHelmPatchFailures(msg)
+	if len(pairs) != 1 || pairs[0].Name != "coredns" {
+		t.Fatalf("must mark only the failing release, got %+v", pairs)
+	}
+	if ParseHelmPatchFailures("all healthy") != nil {
+		t.Fatal("no phrase → nil")
+	}
+}

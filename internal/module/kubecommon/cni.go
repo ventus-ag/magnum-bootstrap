@@ -23,9 +23,32 @@ var cniPluginMarkerPaths = []string{
 	"/opt/cni/bin/portmap",
 }
 
+// cniExtractStamp records which CNI tarball was last extracted into
+// /opt/cni/bin (see ExtractTarSpec.StampPath).
+const cniExtractStamp = "/opt/cni/bin/.magnum-cni-extracted"
+
+// cniArtifacts resolves the CNI plugins release URL and local tarball path
+// for the node architecture. Everything else in the reconciler honors
+// cfg.Shared.Arch; a hardcoded amd64 here would hand arm64 nodes unusable
+// binaries.
+func cniArtifacts(arch string) (url, tgz string) {
+	switch strings.ToLower(strings.TrimSpace(arch)) {
+	case "", "amd64", "x86_64":
+		arch = "amd64"
+	case "arm64", "aarch64":
+		arch = "arm64"
+	default:
+		arch = strings.ToLower(strings.TrimSpace(arch))
+	}
+	url = fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/%s/cni-plugins-linux-%s-%s.tgz",
+		CNITag, arch, CNITag)
+	tgz = fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-%s-%s.tgz", arch, CNITag)
+	return url, tgz
+}
+
 // SetupFlannelCNI creates CNI directories, downloads and extracts CNI plugins,
 // and loads the kernel modules required by flannel.
-func SetupFlannelCNI(executor *host.Executor) ([]host.Change, error) {
+func SetupFlannelCNI(executor *host.Executor, arch string) ([]host.Change, error) {
 	var changes []host.Change
 
 	for _, dir := range []string{"/opt/cni/bin", "/srv/magnum/kubernetes/cni"} {
@@ -36,9 +59,7 @@ func SetupFlannelCNI(executor *host.Executor) ([]host.Change, error) {
 		changes = append(changes, result.Changes...)
 	}
 
-	cniURL := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/%s/cni-plugins-linux-amd64-%s.tgz",
-		CNITag, CNITag)
-	cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", CNITag)
+	cniURL, cniTgz := cniArtifacts(arch)
 
 	cs, err := ReconcileCNIPlugins(executor, cniURL, cniTgz)
 	if err != nil {
@@ -84,6 +105,10 @@ func ReconcileCNIPlugins(executor *host.Executor, cniURL, cniTgz string) ([]host
 		Destination:      "/opt/cni/bin",
 		CheckPaths:       cniPluginMarkerPaths,
 		ChmodExecutables: true,
+		// Version stamp: the marker binaries exist from ANY prior version, so
+		// without it a CNITag bump downloads the new tarball but never
+		// re-extracts (stale plugins forever). cniTgz is version-specific.
+		StampPath: cniExtractStamp,
 	}
 	extractResult, err := extract.Apply(executor)
 	if err != nil {
@@ -93,7 +118,7 @@ func ReconcileCNIPlugins(executor *host.Executor, cniURL, cniTgz string) ([]host
 	return changes, nil
 }
 
-func RegisterFlannelCNI(ctx *pulumi.Context, name string, opts ...pulumi.ResourceOption) error {
+func RegisterFlannelCNI(ctx *pulumi.Context, name string, arch string, opts ...pulumi.ResourceOption) error {
 	dirResources := map[string]pulumi.Resource{}
 	for _, dir := range []string{"/opt/cni/bin", "/srv/magnum/kubernetes/cni"} {
 		resourceName := name + "-dir-" + strings.ReplaceAll(strings.Trim(dir, "/"), "/", "-")
@@ -103,9 +128,7 @@ func RegisterFlannelCNI(ctx *pulumi.Context, name string, opts ...pulumi.Resourc
 		}
 		dirResources[dir] = res
 	}
-	cniURL := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/%s/cni-plugins-linux-amd64-%s.tgz",
-		CNITag, CNITag)
-	cniTgz := fmt.Sprintf("/srv/magnum/kubernetes/cni/cni-plugins-linux-amd64-%s.tgz", CNITag)
+	cniURL, cniTgz := cniArtifacts(arch)
 	downloadOpts := append([]pulumi.ResourceOption{}, opts...)
 	downloadOpts = append(downloadOpts, pulumi.DependsOn([]pulumi.Resource{dirResources["/srv/magnum/kubernetes/cni"]}))
 	downloadRes, err := hostsdk.RegisterDownloadSpec(ctx, name+"-download", hostresource.DownloadSpec{URL: cniURL, Path: cniTgz, Mode: 0o644, Retries: 5}, downloadOpts...)
@@ -119,6 +142,7 @@ func RegisterFlannelCNI(ctx *pulumi.Context, name string, opts ...pulumi.Resourc
 		Destination:      "/opt/cni/bin",
 		CheckPaths:       cniPluginMarkerPaths,
 		ChmodExecutables: true,
+		StampPath:        cniExtractStamp,
 	}, extractOpts...); err != nil {
 		return err
 	}

@@ -3,7 +3,9 @@ package kubecommon
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
@@ -47,6 +49,15 @@ func RenderKubeletConfig(opts KubeletConfigOpts) string {
 	if resolvConf == "" {
 		resolvConf = systemdResolvConf
 	}
+	// providerID is IMMUTABLE once the node registers. Baking a broken
+	// "openstack:///" (empty instance ID after a metadata hiccup) can never
+	// be fixed without recreating the Node object and breaks OCCM/Cinder/
+	// autoscaler node mapping. Omit the field instead — the cloud controller
+	// resolves the instance by node name when providerID is unset.
+	providerIDLine := ""
+	if opts.InstanceID != "" {
+		providerIDLine = "providerID: openstack:///" + opts.InstanceID + "\n"
+	}
 	return fmt.Sprintf(`---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -75,8 +86,7 @@ containerLogMaxFiles: 5
 containerLogMaxSize: 10Mi
 %smaxPods: 110
 podPidsLimit: -1
-providerID: openstack:///%s
-resolvConf: %s
+%sresolvConf: %s
 volumePluginDir: /var/lib/kubelet/volumeplugins
 rotateCertificates: true
 tlsCertFile: %s/kubelet.crt
@@ -87,7 +97,7 @@ eventRecordQPS: 5
 containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
 %s
 `, opts.CertDir, opts.CgroupDriver, opts.DNSServiceIP, opts.DNSClusterDomain,
-		opts.NodeIP, opts.RegisterWithTaints, opts.InstanceID, resolvConf,
+		opts.NodeIP, opts.RegisterWithTaints, providerIDLine, resolvConf,
 		opts.CertDir, opts.CertDir, opts.FeatureGates)
 }
 
@@ -129,13 +139,28 @@ func BuildKubeletArgs(cfg config.Config) string {
 }
 
 // FetchInstanceID retrieves the OpenStack instance UUID from the metadata
-// service. Returns an empty string on any failure. Always fetches even in
-// dry-run so preview content matches what is on disk.
+// service (with retries), falling back to the providerID already recorded in
+// the on-disk kubelet config so a transient metadata outage neither bakes a
+// broken providerID nor flaps the rendered file (and with it a kubelet
+// restart) between runs. Always fetches even in dry-run so preview content
+// matches what is on disk.
 func FetchInstanceID(executor *host.Executor) string {
-	out, err := executor.RunCapture("curl", "-s", "--max-time", "5", "http://169.254.169.254/openstack/latest/meta_data.json")
-	if err != nil {
-		return ""
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		out, err := executor.RunCapture("curl", "-s", "--max-time", "5", "http://169.254.169.254/openstack/latest/meta_data.json")
+		if err != nil {
+			continue
+		}
+		if id := parseMetadataUUID(out); id != "" {
+			return id
+		}
 	}
+	return existingProviderInstanceID("/etc/kubernetes/kubelet-config.yaml")
+}
+
+func parseMetadataUUID(out string) string {
 	if idx := strings.Index(out, `"uuid"`); idx >= 0 {
 		rest := out[idx+7:]
 		if start := strings.Index(rest, `"`); start >= 0 {
@@ -146,4 +171,18 @@ func FetchInstanceID(executor *host.Executor) string {
 		}
 	}
 	return ""
+}
+
+var providerIDRe = regexp.MustCompile(`providerID:\s*openstack:///([0-9a-fA-F-]+)`)
+
+func existingProviderInstanceID(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	m := providerIDRe.FindSubmatch(data)
+	if m == nil {
+		return ""
+	}
+	return string(m[1])
 }
