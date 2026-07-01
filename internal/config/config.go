@@ -461,12 +461,14 @@ func isSystemdBooted() bool {
 	return err == nil && fi.IsDir()
 }
 
-// IsPureCARotation returns true when a CA rotation is active. Modules that defer
-// to the rotation module (which handles certs and service restarts itself) skip
-// their normal work while it is set. Completed rotations are filtered earlier by
-// the AppliedCARotationID check in Operation(), so a stale token does not keep
-// this true. (Formerly also required !IS_UPGRADE && !IS_RESIZE; those flags were
-// removed in favor of state-driven convergence.)
+// IsPureCARotation returns true whenever CA_ROTATION_ID is set. WARNING: it is
+// NOT applied-aware — CA_ROTATION_ID lingers in heat-params after a rotation
+// finalizes (the rotate fragment never clears it), so this stays true for the
+// life of the cluster once any rotation has run. Use it only for the always-true
+// guards inside the rotation module itself. Callers that need "a rotation is
+// ACTIVE (triggered but not yet applied)" must use Operation() == OperationCARotate,
+// which consults AppliedCARotationID and correctly returns to create/reconcile
+// once the rotation completes.
 func (c Config) IsPureCARotation() bool {
 	return c.Trigger.CARotationID != ""
 }

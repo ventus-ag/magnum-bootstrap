@@ -70,6 +70,19 @@ func (a *RunAccumulator) RecordFailure(phaseID string, err error) {
 	}
 }
 
+// RecordWarnings captures warnings from a phase whose Run() returned an error, so
+// diagnostic messages a module attaches before failing (e.g. "trigger ca-rotate")
+// still reach the result JSON. RecordPhase is skipped on the failure path, so
+// this is the only route for a failed phase's warnings.
+func (a *RunAccumulator) RecordWarnings(warnings []string) {
+	if len(warnings) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.warnings = append(a.warnings, warnings...)
+}
+
 func (a *RunAccumulator) HasFailure() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -204,6 +217,7 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 
 				if phaseRun.err != nil {
 					acc.RecordFailure(phase.ID, phaseRun.err)
+					acc.RecordWarnings(phaseRun.result.Warnings)
 
 					// Still register the component so phaseResources[phase.ID]
 					// is populated and downstream phases retain their dependency

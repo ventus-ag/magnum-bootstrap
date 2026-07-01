@@ -69,7 +69,13 @@ type State struct {
 	LeafMode     string `json:"leafMode"`
 	SAVerifyMode string `json:"saVerifyMode"`
 	SASignMode   string `json:"saSignMode"`
-	UpdatedAt    string `json:"updatedAt"`
+	// Hard marks an uncoordinated hard rotation in progress. It is written
+	// before the hard cutover so that a crash between the cert install and the
+	// completion marker resumes on the hard path (independent, no cross-node
+	// wait) instead of falling back to the coordinated protocol once the certs
+	// look healthy again.
+	Hard      bool   `json:"hard,omitempty"`
+	UpdatedAt string `json:"updatedAt"`
 }
 
 // StagingDir returns the per-rotation staging directory.

@@ -16,6 +16,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	coord "github.com/ventus-ag/magnum-bootstrap/internal/carotation"
+	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
@@ -36,6 +37,10 @@ const (
 	// phaseOverrideEnv forces a single phase without coordination, for manual
 	// recovery of a wedged rotation.
 	phaseOverrideEnv = "MAGNUM_CA_ROTATION_PHASE"
+
+	// hardRotateEnv forces the uncoordinated hard-rotate path even when the
+	// installed certs still look usable, for manual recovery.
+	hardRotateEnv = "MAGNUM_CA_ROTATION_HARD"
 )
 
 // Cert directory roots. Vars so tests can redirect them away from /etc.
@@ -106,7 +111,217 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		return moduleapi.Result{}, fmt.Errorf("ca-rotation: service account keys must be provided")
 	}
 
+	// A new rotation was triggered but the installed certs are already
+	// unusable (expired, or no longer chaining to the live CA). The graceful
+	// dual-CA protocol coordinates every step through the cluster's own K8s API
+	// and etcd quorum — both of which are down when the certs are broken — so it
+	// would only wedge. There is no zero-downtime left to protect on a broken
+	// cluster, so rotate hard: install the new material locally and restart,
+	// WITHOUT waiting on any other node. Each node that reaches this path
+	// converges independently; the control plane recovers as more of them do.
+	hard, why := hardRotateRequested(cfg)
+	// Once a hard rotation has begun for this id, keep resuming on the hard path
+	// even if the certs already look healthy (the cutover may have landed before
+	// a crash). Otherwise the node would fall back to the coordinated protocol
+	// and wait on peers again — the exact cross-node blocking the hard path
+	// exists to avoid — and a coordinated finalize would drop the old SA verify
+	// key and 401 still-running pods.
+	if !hard {
+		if inProgress, herr := hardRotateInProgress(rotationID); herr == nil && inProgress {
+			hard, why = true, "resuming in-progress hard rotation"
+		}
+	}
+	if hard {
+		logf(req, "ca-rotation: %s — performing uncoordinated HARD rotation rotationId=%s (no barrier, independent per-node recovery)", why, rotationID)
+		return runHardRotate(cfg, req, rotationID)
+	}
+
 	return runProtocol(ctx, cfg, req, rotationID)
+}
+
+// hardRotateInProgress reports whether a hard rotation was started for
+// rotationID but not yet finalized (marker not written). The breadcrumb is the
+// Hard flag persisted in local state before the hard cutover.
+func hardRotateInProgress(rotationID string) (bool, error) {
+	st, err := coord.LoadState(rotationID)
+	if err != nil {
+		return false, err
+	}
+	return st.RotationID == rotationID && st.Hard && st.Phase != coord.PhaseDone, nil
+}
+
+// hardRotateRequested reports whether the node should skip the coordinated
+// dual-CA protocol and rotate hard. It triggers on an explicit env force, or
+// when the live CA or any live leaf is expired or no longer chains to the live
+// CA — a local, deterministic "the installed cert has a problem" signal. It
+// deliberately does NOT probe API/etcd reachability: those are transient on a
+// healthy cluster (a peer mid-restart) and would wrongly turn an ordinary
+// proactive rotation into a disruptive one.
+func hardRotateRequested(cfg config.Config) (bool, string) {
+	if truthyEnv(os.Getenv(hardRotateEnv)) {
+		return true, "forced by " + hardRotateEnv
+	}
+	var reasons []string
+	caPath := certDir + "/ca.crt"
+	if broken, why := certutil.CertFileNeedsRefresh(caPath); broken {
+		reasons = append(reasons, "ca.crt "+why)
+	}
+	for _, name := range leafNames(cfg.Role()) {
+		leaf := certDir + "/" + name + ".crt"
+		if broken, why := certutil.CertFileNeedsRefresh(leaf); broken {
+			reasons = append(reasons, name+".crt "+why)
+			continue
+		}
+		if certutil.LeafChainBroken(leaf, caPath) {
+			reasons = append(reasons, name+".crt no longer chains to CA")
+		}
+	}
+	if len(reasons) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(reasons, "; ")
+}
+
+func truthyEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// runHardRotate installs the new CA and freshly-signed leaves in a single shot
+// with no coordinator, no barriers and no restart Lease, then restarts local
+// services. The new material is fetched from Keystone/Barbican (the OpenStack
+// API), which is reachable even when the cluster's own control plane is down.
+func runHardRotate(cfg config.Config, req moduleapi.Request, rotationID string) (moduleapi.Result, error) {
+	role := cfg.Role()
+	isMaster := role == config.RoleMaster
+	executor := host.NewExecutor(req.Apply, req.Logger)
+	r := &runner{cfg: cfg, req: req, rotationID: rotationID, role: role, isMaster: isMaster, nodeName: cfg.Shared.InstanceName, executor: executor}
+
+	// Breadcrumb: record that a hard rotation has begun BEFORE mutating any live
+	// material, so a crash before the completion marker resumes on the hard path
+	// (see hardRotateInProgress) rather than reverting to the coordinated
+	// protocol once the certs look healthy.
+	if err := coord.SaveState(coord.State{RotationID: rotationID, Role: role.String(), Instance: r.nodeName, Hard: true}); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("ca-rotation: record hard-rotation breadcrumb: %w", err)
+	}
+
+	// Snapshot old material, fetch the new CA and sign new leaves (OpenStack API).
+	if err := r.ensureStaged(); err != nil {
+		return moduleapi.Result{}, err
+	}
+	if err := r.writeHardFiles(); err != nil {
+		return moduleapi.Result{}, err
+	}
+	if isMaster {
+		cs, err := updateAdminKubeconfig(cfg, executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		r.changes = append(r.changes, cs...)
+		if err := r.chownCerts(); err != nil {
+			return moduleapi.Result{}, err
+		}
+	}
+
+	// Restart local services without the cluster-wide restart Lease and without
+	// waiting on cross-node quorum: each node converts independently.
+	r.restartAndWaitBestEffort()
+
+	// Best-effort workload rollout so pods re-read the new trust anchor. It only
+	// lands once the API recovers; while it is down the bounded retries fail and
+	// are downgraded to warnings (a later periodic reconcile does not re-run this
+	// module once the marker is written, so this is the disruptive-but-necessary
+	// emergency rollout).
+	if isMaster {
+		pc, pw := patchWorkloads(executor, rotationID)
+		r.changes = append(r.changes, pc...)
+		r.warnings = append(r.warnings, pw...)
+	}
+
+	if err := coord.WriteMarker(rotationID); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("ca-rotation: write completion marker: %w", err)
+	}
+	_ = coord.SaveState(coord.State{RotationID: rotationID, Role: role.String(), Instance: r.nodeName,
+		Phase: coord.PhaseDone, CAMode: coord.CAModeNew, LeafMode: coord.LeafModeNew,
+		SAVerifyMode: coord.CAModeBundle, SASignMode: coord.LeafModeNew, Hard: true})
+	_ = os.RemoveAll(coord.StagingDir(rotationID))
+
+	r.warnings = append(r.warnings, "performed uncoordinated HARD CA rotation (installed certs were unusable); running pods may need to restart to obtain new-CA credentials")
+	return moduleapi.Result{Changes: r.changes, Warnings: r.warnings, Outputs: r.outputs()}, nil
+}
+
+// writeHardFiles installs the final all-new material in one shot: new CA (kube +
+// etcd), new leaves + new SA signing key, and — for masters — a new+old SA
+// verify bundle (so tokens held by already-running pods keep validating until
+// they cycle) plus the new CA signing key.
+func (r *runner) writeHardFiles() error {
+	newCA, err := os.ReadFile(filepath.Join(coord.NewDir(r.rotationID), "ca.crt"))
+	if err != nil {
+		return fmt.Errorf("ca-rotation: read new CA: %w", err)
+	}
+	// Fail fast BEFORE mutating any live material if the new CA signing key
+	// (CA_KEY heat-param) does not pair with the new CA cert fetched from
+	// Barbican. Installing a split ca.crt/ca.key pair crashloops
+	// kube-controller-manager on "tls: private key does not match public key" —
+	// the very failure the pre-rotate cert-module guards exist to prevent. The
+	// hard path is the one place that trusts Heat-supplied material on an
+	// already-broken cluster, so it must verify the pair explicitly rather than
+	// assume Magnum kept CA_KEY and the Barbican CA in sync. The leaves are not
+	// at risk (both leaves and this CA come from Barbican, so they are mutually
+	// consistent by construction).
+	if r.isMaster && r.cfg.Shared.CAKey != "" &&
+		!certutil.KeyPEMMatchesCertPEM([]byte(r.cfg.Shared.CAKey+"\n"), newCA) {
+		return fmt.Errorf("ca-rotation: hard rotate: CA_KEY does not pair with the new CA cert from Barbican — refusing to install a split CA cert/key pair; rotation material is inconsistent, re-run the CA rotation")
+	}
+
+	if err := r.writeLiveCA(newCA); err != nil {
+		return err
+	}
+	if err := r.writeCutoverFiles(); err != nil { // new leaves (+ new SA signing key for masters)
+		return err
+	}
+	if r.isMaster {
+		verify, err := concatPEM(
+			filepath.Join(coord.NewDir(r.rotationID), "service_account.key"),
+			filepath.Join(coord.OldDir(r.rotationID), "service_account.key"),
+		)
+		if err != nil {
+			return err
+		}
+		if err := r.writeLive(certDir+"/service_account.key", verify, 0o440); err != nil {
+			return err
+		}
+		if r.cfg.Shared.CAKey != "" {
+			if err := r.writeLive(certDir+"/ca.key", []byte(r.cfg.Shared.CAKey+"\n"), 0o400); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// restartAndWaitBestEffort daemon-reloads and restarts the rotation services,
+// waiting only for each service's OWN process to come up — never for cross-node
+// etcd quorum or API health. All failures are recorded as warnings so a
+// still-broken peer never fails this node's reconcile.
+func (r *runner) restartAndWaitBestEffort() {
+	if err := r.executor.Run("systemctl", "daemon-reload"); err != nil {
+		r.warnings = append(r.warnings, fmt.Sprintf("hard-rotate: daemon-reload: %v", err))
+	}
+	for _, svc := range rotationServices(r.role) {
+		if err := r.executor.Run("systemctl", "restart", svc); err != nil {
+			r.warnings = append(r.warnings, fmt.Sprintf("hard-rotate: restart %s: %v", svc, err))
+			continue
+		}
+		r.changes = append(r.changes, host.Change{Action: host.ActionRestart, Summary: fmt.Sprintf("restart %s (hard CA rotation)", svc)})
+		if !r.executor.WaitForSystemctlActive(svc, serviceStartTimeout(svc), 2*time.Second) {
+			r.warnings = append(r.warnings, fmt.Sprintf("hard-rotate: service %s did not become active after restart", svc))
+		}
+	}
 }
 
 // runProtocol drives the dual-CA prepare/cutover/finalize protocol with

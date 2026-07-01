@@ -88,10 +88,95 @@ func NeedsReconcile(certPath, keyPath string, spec Spec) (bool, string) {
 	return false, ""
 }
 
+// LeafChainBroken reports true ONLY when the leaf at leafPath and the CA file
+// at caFile both parse, but NO certificate in caFile signed the leaf. caFile may
+// hold a new+old bundle (multiple PEM blocks); the leaf need only chain to one
+// of them, so this does not misfire mid dual-CA rotation. Missing or unparseable
+// inputs return false — those cases are already handled by the missing/expired
+// checks (a fresh node has no leaf yet, and reporting "chain broken" there would
+// wrongly force a CA refetch). A true result means the on-disk leaf no longer
+// chains to the on-disk CA: the CA or the leaf was replaced out from under us
+// (e.g. changed by the cluster owner), and the leaf must be re-signed against the
+// current CA.
+func LeafChainBroken(leafPath, caFile string) bool {
+	leaf, err := loadCertificate(leafPath)
+	if err != nil {
+		return false
+	}
+	cas, err := loadCACerts(caFile)
+	if err != nil || len(cas) == 0 {
+		return false
+	}
+	for _, ca := range cas {
+		if leafSignedBy(leaf, ca) {
+			return false
+		}
+	}
+	return true
+}
+
+// leafSignedBy reports whether ca issued leaf. It prefers the standard
+// CheckSignatureFrom (which also validates CA basic constraints) but falls back
+// to a bare signature check against the CA public key when the CA certificate
+// does not advertise IsCA/BasicConstraints — some legacy Magnum CA material does
+// not, and we only care here whether the key pair matches, not whether the CA is
+// policy-valid.
+func leafSignedBy(leaf, ca *x509.Certificate) bool {
+	if err := leaf.CheckSignatureFrom(ca); err == nil {
+		return true
+	}
+	// Fallback: verify the leaf's signature directly with the CA public key,
+	// ignoring CA basic-constraints/key-usage policy that CheckSignatureFrom
+	// enforces (some legacy Magnum CA certs omit IsCA/KeyUsageCertSign).
+	return ca.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil
+}
+
+// loadCACerts decodes every CERTIFICATE block in a PEM file. It tolerates
+// interleaved non-certificate blocks and returns an error only when the file
+// cannot be read or contains no parseable certificate.
+func loadCACerts(path string) ([]*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read CA file %s: %w", path, err)
+	}
+	var certs []*x509.Certificate
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		certs = append(certs, cert)
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("no certificate found in %s", path)
+	}
+	return certs, nil
+}
+
 // CertFileNeedsRefresh returns true when the certificate file is missing,
 // malformed, or expired.
 func CertFileNeedsRefresh(path string) (bool, string) {
-	cert, err := loadCertificate(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return true, fmt.Errorf("read certificate %s: %w", path, err).Error()
+	}
+	return CertPEMNeedsRefresh(data)
+}
+
+// CertPEMNeedsRefresh is the in-memory counterpart of CertFileNeedsRefresh: it
+// reports whether a PEM-encoded certificate is unparseable or outside its
+// validity window. Used to vet material freshly fetched from Barbican before
+// installing it (e.g. detect that Barbican still serves an already-expired CA).
+func CertPEMNeedsRefresh(pemData []byte) (bool, string) {
+	cert, err := parseCertPEM(pemData)
 	if err != nil {
 		return true, err.Error()
 	}
@@ -105,18 +190,59 @@ func CertFileNeedsRefresh(path string) (bool, string) {
 	return false, ""
 }
 
+// CertPEMMatchesKeyFile reports whether the PEM-encoded certificate's public
+// half matches the private key at keyPath. It is the inverse of
+// KeyPEMMatchesCertFile and returns false if either input cannot be read or
+// parsed — callers treat false as "this fetched cert is not provably the partner
+// of the on-disk key, so do not install it over a working pair".
+func CertPEMMatchesKeyFile(certPEM []byte, keyPath string) bool {
+	cert, err := parseCertPEM(certPEM)
+	if err != nil {
+		return false
+	}
+	key, err := loadPrivateKey(keyPath)
+	if err != nil {
+		return false
+	}
+	return publicKeysMatch(cert.PublicKey, publicKey(key))
+}
+
+// KeyPEMMatchesCertPEM reports whether the PEM-encoded private key and
+// PEM-encoded certificate are a matching pair. Both inputs are in-memory (no
+// file I/O), for vetting freshly-fetched/parameter-supplied material before it
+// is written to disk. Returns false if either input cannot be parsed.
+func KeyPEMMatchesCertPEM(keyPEM, certPEM []byte) bool {
+	cert, err := parseCertPEM(certPEM)
+	if err != nil {
+		return false
+	}
+	key, err := loadPrivateKeyPEM(keyPEM)
+	if err != nil {
+		return false
+	}
+	return publicKeysMatch(cert.PublicKey, publicKey(key))
+}
+
 func loadCertificate(path string) (*x509.Certificate, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read certificate %s: %w", path, err)
 	}
+	cert, err := parseCertPEM(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w (%s)", err, path)
+	}
+	return cert, nil
+}
+
+func parseCertPEM(data []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(data)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("invalid certificate PEM %s", path)
+		return nil, fmt.Errorf("invalid certificate PEM")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse certificate %s: %w", path, err)
+		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return cert, nil
 }

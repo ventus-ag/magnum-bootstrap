@@ -420,6 +420,62 @@ error and retries with a targeted recovery (helpers in `cluster-helm/helper.go`)
 - Rotation ID tracking prevents duplicate rotation on periodic runs
 - Completed rotation detected at operation-detection time → falls back to
   normal create/reconcile plan instead of re-running full ca-rotate phases
+- **Hard rotate on a broken cluster** (`ca-rotation/module.go`
+  `hardRotateRequested`/`runHardRotate`): the graceful dual-CA protocol
+  coordinates every step through the cluster's own K8s API + etcd quorum, so on a
+  cluster whose certs already expired (API down) it can only wedge. When a
+  rotation is triggered AND the installed CA/leaf material is unusable (expired,
+  or a leaf no longer chains to the live CA — `certutil.LeafChainBroken`), each
+  node instead rotates **hard**: fetch the new CA + sign new leaves from
+  Keystone/Barbican (the OpenStack API, reachable when the cluster's own API is
+  not), install the final all-new material in one shot (SA verify kept as a
+  new+old bundle so running pods' tokens survive), and restart local services
+  **without the restart Lease and without waiting on cross-node quorum**. Nodes
+  converge independently; the control plane recovers as more of them convert.
+  Trigger is cert-brokenness only (NOT a transient API/etcd probe, which would
+  wrongly hard-rotate a healthy proactive rotation). `MAGNUM_CA_ROTATION_HARD=1`
+  forces it. It is disruptive (pods may need to restart for new-CA creds) — that
+  is acceptable on an already-broken cluster. Safety details: (a) `writeHardFiles`
+  vets `CA_KEY` against the new Barbican CA (`certutil.KeyPEMMatchesCertPEM`)
+  BEFORE mutating anything and fails fast on mismatch, so it never re-creates the
+  split `ca.crt`/`ca.key` pair the pre-rotate guards prevent; (b) a `Hard` state
+  breadcrumb is written before the cutover so a crash before the completion
+  marker RESUMES on the hard path (`hardRotateInProgress`) instead of falling
+  back to the coordinated protocol and waiting on peers again; (c) SA-verify is
+  left as a new+old bundle and never narrowed to new-only — hard rotate is
+  EXPIRY recovery, not compromise recovery (the old SA key stays a valid token
+  issuer so running pods survive; for a compromised key use a normal coordinated
+  rotation on a healthy cluster); (d) simultaneous uncoordinated etcd restarts
+  are safe — the cert swap leaves the WAL untouched with no `--force-new-cluster`
+  and unchanged membership, and `etcd-config cleanupExcessMembers` only evicts
+  when `len(members) > NUMBER_OF_MASTERS` (a rotation never creates excess), so a
+  peer that is transiently unreachable during the cross-cert window is not culled.
+- **Client-changed cert auto-heal** (normal reconcile, no rotation): `master-`/
+  `worker-certificates` add a leaf-chains-to-CA check (`certutil.LeafChainBroken`,
+  bundle-aware) to `certNeedsReconcile`, gated `!IsPureCARotation()`. A leaf that
+  no longer chains to the on-disk CA (client swapped the CA or a leaf) forces a
+  CA re-fetch from Barbican + re-sign, so a client-mangled cluster self-heals to
+  the canonical CA. Cross-node coordination for a mass-expiry on a **normal**
+  reconcile is impossible (the coordinating API is what is down); per-node
+  self-heal + emergent etcd-quorum re-form is accepted.
+- **CA-pair guard + fail-fast on an unrecoverable expired cluster**
+  (`master-certs`/`worker-certs`): when the live CA is expired, the cert modules
+  re-fetch it from Barbican — but on a mass-expiry the cluster's CA can itself be
+  unusable, or Barbican's CA can no longer pair with the node's `ca.key`
+  (`CA_KEY` drift). Installing such a CA splits the `ca.crt`/`ca.key` pair
+  (kube-controller-manager then crashloops `tls: private key does not match
+  public key`) and the doomed apiserver restart burns the whole ~7.5 min Heat
+  health-wait. So before installing a re-fetched CA the modules vet it:
+  `certutil.CertPEMNeedsRefresh` (Barbican still serves an unusable CA) and, for
+  masters with an existing key, `certutil.CertPEMMatchesKeyFile` (fetched CA vs
+  on-disk `ca.key`). On failure they **preserve the working material and fail
+  fast at the cert phase** with an actionable "trigger a CA rotation (ca-rotate)"
+  message (logged + carried into `reconciler-last-run.json` — failed-phase
+  warnings are now captured via `RunAccumulator.RecordWarnings`). This is the
+  pre-rotate half: it turns a mysterious multi-minute timeout wedge into a fast,
+  clear signal; the operator's `ca-rotate` then drives the hard-rotate recovery
+  above. A ca-rotate supplies fresh, mutually-consistent material via the earlier
+  `ca-rotation` phase, so it never reaches these guards with a broken CA.
 
 ### Error Handling Philosophy
 - **Must succeed** (cert copy, config write, chmod): return error, halt phase

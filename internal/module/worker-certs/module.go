@@ -75,12 +75,28 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	caCertPath := certDir + "/ca.crt"
 	caNeedsRefresh, _ := certutil.CertFileNeedsRefresh(caCertPath)
 
+	// Auto-heal "changed by client": when any live leaf no longer chains to the
+	// on-disk CA (the CA or a leaf was replaced out from under us), re-fetch the
+	// canonical CA from Barbican and re-sign every affected leaf against it.
+	// Gated off only during an ACTIVE dual-CA rotation. Uses Operation()
+	// (applied-aware), NOT IsPureCARotation() — the latter stays true forever
+	// once CA_ROTATION_ID lingers in heat-params after a completed rotation.
+	checkChain := cfg.Operation() != config.OperationCARotate
+	if checkChain && !caNeedsRefresh {
+		for _, spec := range specs {
+			if certutil.LeafChainBroken(fmt.Sprintf("%s/%s.crt", certDir, spec.Name), caCertPath) {
+				caNeedsRefresh = true
+				break
+			}
+		}
+	}
+
 	if !req.Apply {
 		if caNeedsRefresh {
 			changes = append(changes, plannedFileChange(caCertPath, "reconcile cluster CA certificate"))
 		}
 		for _, spec := range specs {
-			if needsReconcile, _ := certNeedsReconcile(certDir, spec); needsReconcile {
+			if needsReconcile, _ := certNeedsReconcile(certDir, spec, checkChain); needsReconcile {
 				changes = append(changes, plannedFileChange(
 					fmt.Sprintf("%s/%s.crt", certDir, spec.Name),
 					fmt.Sprintf("reconcile %s certificate", spec.Name),
@@ -92,7 +108,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 
 	needsSigning := caNeedsRefresh
 	for _, spec := range specs {
-		if needsReconcile, _ := certNeedsReconcile(certDir, spec); needsReconcile {
+		if needsReconcile, _ := certNeedsReconcile(certDir, spec, checkChain); needsReconcile {
 			needsSigning = true
 			break
 		}
@@ -120,6 +136,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		if err != nil {
 			return moduleapi.Result{}, fmt.Errorf("worker-certificates: %w", err)
 		}
+		// Recovery guard (normal reconcile only): if Barbican still serves an
+		// unusable CA, re-signing leaves against it is futile and the doomed
+		// kubelet restart burns the Heat window. Fail fast with an actionable
+		// message so the operator triggers a CA rotation.
+		if expired, why := certutil.CertPEMNeedsRefresh([]byte(caPEM)); expired {
+			msg := fmt.Sprintf("Barbican serves an unusable CA cert (%s); this node cannot self-recover on a normal reconcile — trigger a CA rotation (ca-rotate) to mint a new CA", why)
+			req.Logger.Warnf("worker-certificates: %s", msg)
+			return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("worker-certificates: %s", msg)
+		}
 		fileResult, err := (hostresource.FileSpec{Path: caCertPath, Content: []byte(caPEM), Mode: 0o444}).Apply(executor)
 		if err != nil {
 			return moduleapi.Result{}, err
@@ -131,7 +156,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	// deterministic spec order.
 	signSpecs := make([]magnumapi.CertSpec, 0, len(specs))
 	for _, spec := range specs {
-		needsReconcile, _ := certNeedsReconcile(certDir, spec)
+		needsReconcile, _ := certNeedsReconcile(certDir, spec, checkChain)
 		if !needsReconcile {
 			continue
 		}
@@ -186,7 +211,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
-func certNeedsReconcile(certDir string, spec magnumapi.CertSpec) (bool, string) {
+func certNeedsReconcile(certDir string, spec magnumapi.CertSpec, checkChain bool) (bool, string) {
 	desired := certutil.Spec{
 		CommonName:  spec.CN,
 		DNSNames:    spec.SANDNSs,
@@ -197,11 +222,17 @@ func certNeedsReconcile(certDir string, spec magnumapi.CertSpec) (bool, string) 
 	if spec.O != "" {
 		desired.Organizations = []string{spec.O}
 	}
-	return certutil.NeedsReconcile(
-		fmt.Sprintf("%s/%s.crt", certDir, spec.Name),
-		fmt.Sprintf("%s/%s.key", certDir, spec.Name),
-		desired,
-	)
+	certPath := fmt.Sprintf("%s/%s.crt", certDir, spec.Name)
+	if needs, reason := certutil.NeedsReconcile(certPath, fmt.Sprintf("%s/%s.key", certDir, spec.Name), desired); needs {
+		return true, reason
+	}
+	// The cert matches its spec and is valid, but may no longer chain to the
+	// current on-disk CA (CA or leaf replaced by the client). Re-sign it so it
+	// chains to the CA the rest of the control plane trusts.
+	if checkChain && certutil.LeafChainBroken(certPath, certDir+"/ca.crt") {
+		return true, "leaf no longer chains to CA"
+	}
+	return false, ""
 }
 
 func plannedFileChange(path, summary string) host.Change {

@@ -143,6 +143,227 @@ func TestNeedsReconcileDetectsMissingKeyUsageBit(t *testing.T) {
 	}
 }
 
+func TestLeafChainBrokenFreshNodeReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	// No leaf, no CA on disk (fresh node): must not report a broken chain.
+	if LeafChainBroken(filepath.Join(dir, "server.crt"), filepath.Join(dir, "ca.crt")) {
+		t.Fatalf("missing leaf/CA must not report chain broken")
+	}
+}
+
+func TestLeafChainBrokenMatchedPairReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	ca := newCA(t)
+	leafPath := filepath.Join(dir, "server.crt")
+	caPath := filepath.Join(dir, "ca.crt")
+	writeLeafSignedBy(t, ca, leafPath)
+	writePEMCerts(t, caPath, ca.certDER)
+
+	if LeafChainBroken(leafPath, caPath) {
+		t.Fatalf("leaf signed by the on-disk CA must not report chain broken")
+	}
+}
+
+func TestLeafChainBrokenForeignCAReturnsTrue(t *testing.T) {
+	dir := t.TempDir()
+	signer := newCA(t)
+	other := newCA(t)
+	leafPath := filepath.Join(dir, "server.crt")
+	caPath := filepath.Join(dir, "ca.crt")
+	writeLeafSignedBy(t, signer, leafPath)
+	writePEMCerts(t, caPath, other.certDER) // CA swapped out from under the leaf
+
+	if !LeafChainBroken(leafPath, caPath) {
+		t.Fatalf("leaf not signed by the on-disk CA must report chain broken")
+	}
+}
+
+func TestLeafChainBrokenBundleReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	newer := newCA(t)
+	older := newCA(t)
+	leafPath := filepath.Join(dir, "server.crt")
+	caPath := filepath.Join(dir, "ca.crt")
+	writeLeafSignedBy(t, newer, leafPath)
+	// ca.crt is a new+old bundle (mid dual-CA rotation): leaf chains to one member.
+	writePEMCerts(t, caPath, newer.certDER, older.certDER)
+
+	if LeafChainBroken(leafPath, caPath) {
+		t.Fatalf("leaf chaining to one CA in a bundle must not report chain broken")
+	}
+}
+
+func TestLeafChainBrokenUnparseableCAReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	ca := newCA(t)
+	leafPath := filepath.Join(dir, "server.crt")
+	caPath := filepath.Join(dir, "ca.crt")
+	writeLeafSignedBy(t, ca, leafPath)
+	if err := os.WriteFile(caPath, []byte("not a pem file"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// An unreadable CA is not "chain broken" here — the CA-expiry/missing checks
+	// own that case, and forcing a refetch on garbage could clobber real material.
+	if LeafChainBroken(leafPath, caPath) {
+		t.Fatalf("unparseable CA must not report chain broken")
+	}
+}
+
+func TestLeafChainBrokenLegacyNonCASignerReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	// A signer cert that does NOT advertise IsCA/BasicConstraints (legacy Magnum
+	// material). CheckSignatureFrom rejects it as a parent, so LeafChainBroken
+	// must fall back to a bare signature check and still see the leaf as chained.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "legacy-ca"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		// deliberately no IsCA / BasicConstraintsValid
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate signer: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("ParseCertificate signer: %v", err)
+	}
+
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey leaf: %v", err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "leaf"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate leaf: %v", err)
+	}
+
+	caPath := filepath.Join(dir, "ca.crt")
+	leafPath := filepath.Join(dir, "server.crt")
+	writePEMCerts(t, caPath, caDER)
+	writePEMCerts(t, leafPath, leafDER)
+
+	if LeafChainBroken(leafPath, caPath) {
+		t.Fatalf("leaf signed by a non-CA-flagged signer must not report chain broken (fallback path)")
+	}
+}
+
+func TestCertPEMNeedsRefresh(t *testing.T) {
+	ca := newCA(t)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.certDER})
+	if needs, why := CertPEMNeedsRefresh(caPEM); needs {
+		t.Fatalf("valid CA PEM must not need refresh; got %q", why)
+	}
+	if needs, _ := CertPEMNeedsRefresh([]byte("garbage")); !needs {
+		t.Fatalf("unparseable PEM must need refresh")
+	}
+}
+
+func TestCertPEMMatchesKeyFile(t *testing.T) {
+	dir := t.TempDir()
+	ca := newCA(t)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.certDER})
+
+	keyPath := filepath.Join(dir, "ca.key")
+	writeKeyPEM(t, keyPath, ca.key)
+	if !CertPEMMatchesKeyFile(caPEM, keyPath) {
+		t.Fatalf("CA PEM must match its own key file")
+	}
+
+	otherKeyPath := filepath.Join(dir, "other.key")
+	writeKeyPEM(t, otherKeyPath, newCA(t).key)
+	if CertPEMMatchesKeyFile(caPEM, otherKeyPath) {
+		t.Fatalf("CA PEM must not match a foreign key file")
+	}
+	if CertPEMMatchesKeyFile(caPEM, filepath.Join(dir, "missing.key")) {
+		t.Fatalf("missing key file must not match")
+	}
+}
+
+func writeKeyPEM(t *testing.T, path string, key *rsa.PrivateKey) {
+	t.Helper()
+	der := x509.MarshalPKCS1PrivateKey(key)
+	buf := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, buf, 0o400); err != nil {
+		t.Fatalf("WriteFile %s: %v", path, err)
+	}
+}
+
+type testCA struct {
+	cert    *x509.Certificate
+	certDER []byte
+	key     *rsa.PrivateKey
+}
+
+func newCA(t *testing.T) *testCA {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: "kubernetes"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate CA: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("ParseCertificate CA: %v", err)
+	}
+	return &testCA{cert: cert, certDER: der, key: key}
+}
+
+func writeLeafSignedBy(t *testing.T, ca *testCA, leafPath string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey leaf: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano() + 1),
+		Subject:      pkix.Name{CommonName: "kubernetes"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatalf("CreateCertificate leaf: %v", err)
+	}
+	writePEMCerts(t, leafPath, der)
+}
+
+func writePEMCerts(t *testing.T, path string, ders ...[]byte) {
+	t.Helper()
+	var buf []byte
+	for _, der := range ders {
+		buf = append(buf, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", path, err)
+	}
+}
+
 func writeCertPair(certPath, keyPath string, spec Spec, notBefore, notAfter time.Time) error {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
