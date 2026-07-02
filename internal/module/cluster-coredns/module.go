@@ -82,36 +82,15 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			"priorityClassName": "system-cluster-critical",
 			// The coredns chart's HPA lives under the `hpa` key (a top-level
 			// `autoscaling` block is silently ignored by Helm — DNS then never
-			// scales past replicaCount). Metrics use autoscaling/v2 syntax; the
-			// old targetAverageUtilization form is v2beta1, rejected on modern
-			// clusters. HPA needs metrics-server to act, so it is enabled only
-			// when that addon is on.
+			// scales past replicaCount). HPA needs metrics-server to act, so it
+			// is enabled only when that addon is on. Metric spec schema must
+			// match the HPA apiVersion the pinned chart renders — see
+			// corednsHPAMetrics.
 			"hpa": map[string]interface{}{
 				"enabled":     cfg.Shared.MetricsServerEnabled,
 				"minReplicas": 2,
 				"maxReplicas": 10,
-				"metrics": []interface{}{
-					map[string]interface{}{
-						"type": "Resource",
-						"resource": map[string]interface{}{
-							"name": "cpu",
-							"target": map[string]interface{}{
-								"type":               "Utilization",
-								"averageUtilization": 60,
-							},
-						},
-					},
-					map[string]interface{}{
-						"type": "Resource",
-						"resource": map[string]interface{}{
-							"name": "memory",
-							"target": map[string]interface{}{
-								"type":               "Utilization",
-								"averageUtilization": 60,
-							},
-						},
-					},
-				},
+				"metrics":     corednsHPAMetrics(cfg.Shared.KubeTag),
 			},
 			"rollingUpdate": map[string]interface{}{
 				"maxUnavailable": 1,
@@ -272,8 +251,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 //	chart 1.15.1 → CoreDNS 1.8.0   (K8s 1.20-1.21)
 //	chart 1.16.4 → CoreDNS 1.8.4   (K8s 1.22)
 //	chart 1.16.6 → CoreDNS 1.8.6   (K8s 1.23-1.24)
-//	chart 1.19.6 → CoreDNS 1.9.3   (K8s 1.25-1.26)
-//	chart 1.24.5 → CoreDNS 1.10.1  (K8s 1.27-1.28)
+//	chart 1.19.6 → CoreDNS 1.9.3   (K8s 1.25)
+//	chart 1.24.5 → CoreDNS 1.10.1  (K8s 1.26-1.28; 1.26 uses this chart because
+//	                                1.19.6 hardcodes autoscaling/v2beta2 in its
+//	                                HPA template and that API is removed in 1.26 —
+//	                                1.24.5 adds the autoscaling/v2 capability
+//	                                check; the CoreDNS image stays pinned to the
+//	                                kubeadm version via corednsImageTags)
 //	chart 1.31.0 → CoreDNS 1.11.1  (K8s 1.29-1.30)
 //	chart 1.36.1 → CoreDNS 1.11.3  (K8s 1.31-1.32)
 //	chart 1.42.2 → CoreDNS 1.12.0  (K8s 1.33)
@@ -289,7 +273,7 @@ var corednsChartVersions = map[string]string{
 	"1.29": "1.31.0",
 	"1.28": "1.24.5",
 	"1.27": "1.24.5",
-	"1.26": "1.19.6",
+	"1.26": "1.24.5",
 	"1.25": "1.19.6",
 	"1.24": "1.16.6",
 	"1.23": "1.16.6",
@@ -326,6 +310,55 @@ func corednsChartDefault(kubeTag string) string {
 
 func corednsImageDefault(kubeTag string) string {
 	return config.LookupByKubeVersion(corednsImageTags, kubeTag)
+}
+
+// corednsHPAMetrics returns HPA metric specs in the schema matching the HPA
+// apiVersion the pinned chart renders. Chart 1.15.1 (K8s 1.20-1.21) hardcodes
+// autoscaling/v2beta1, whose ResourceMetricSource uses targetAverageUtilization
+// — feeding it the v2-style target{} block fails helm validation and wedges the
+// whole create (seen on the version-ladder v1.20.12 create). Charts 1.16.4+
+// render v2beta2 or v2, both of which use the target{} form.
+func corednsHPAMetrics(kubeTag string) []interface{} {
+	if !kubeletconfig.KubeMinorAtLeast(kubeTag, 22) {
+		return []interface{}{
+			map[string]interface{}{
+				"type": "Resource",
+				"resource": map[string]interface{}{
+					"name":                     "cpu",
+					"targetAverageUtilization": 60,
+				},
+			},
+			map[string]interface{}{
+				"type": "Resource",
+				"resource": map[string]interface{}{
+					"name":                     "memory",
+					"targetAverageUtilization": 60,
+				},
+			},
+		}
+	}
+	return []interface{}{
+		map[string]interface{}{
+			"type": "Resource",
+			"resource": map[string]interface{}{
+				"name": "cpu",
+				"target": map[string]interface{}{
+					"type":               "Utilization",
+					"averageUtilization": 60,
+				},
+			},
+		},
+		map[string]interface{}{
+			"type": "Resource",
+			"resource": map[string]interface{}{
+				"name": "memory",
+				"target": map[string]interface{}{
+					"type":               "Utilization",
+					"averageUtilization": 60,
+				},
+			},
+		},
+	}
 }
 
 // corednsCachePlugin returns the cache plugin entry for the CoreDNS Corefile.
