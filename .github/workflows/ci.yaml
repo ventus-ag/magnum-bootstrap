@@ -200,16 +200,24 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # e2e-fcos — single-master FCoS VM tier (matrix: pinned + latest k8s). Every PR
-  # (open/sync/reopen), dispatch and nightly. Skipped on plain `push` and on bare
-  # `labeled` events (those are for the opt-in tiers below). Reuses the build
-  # artifact. Dispatch use_host_provider=true swaps the legacy hostresource
-  # bridge for the real magnumhost Pulumi provider plugin.
+  # (open/sync/reopen), dispatch and nightly. Skipped on plain `push`. On a
+  # `labeled` event it runs only when the added label opts into a heavy tier
+  # (e2e-openstack / e2e-multimaster) — matching the `resolve` gate above — so
+  # labeling a PR to add the OpenStack/multimaster tier keeps the base FCoS
+  # coverage in the SAME run instead of dropping it (and having concurrency
+  # cancel the in-flight FCoS run). A bare, unrelated label still skips FCoS.
+  # Reuses the build artifact. Dispatch use_host_provider=true swaps the legacy
+  # hostresource bridge for the real magnumhost Pulumi provider plugin.
   # ---------------------------------------------------------------------------
   e2e-fcos:
     name: e2e-fcos (${{ matrix.name }})
     needs: [build, resolve]
     runs-on: self-hosted
-    if: ${{ github.event_name != 'push' && github.event.action != 'labeled' }}
+    if: >-
+      github.event_name != 'push' &&
+      (github.event.action != 'labeled' ||
+       contains(github.event.pull_request.labels.*.name, 'e2e-multimaster') ||
+       contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
     strategy:
       fail-fast: false
       matrix:
