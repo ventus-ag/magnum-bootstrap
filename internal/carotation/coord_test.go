@@ -207,6 +207,28 @@ func TestBarrierGivesUpAtContextDeadline(t *testing.T) {
 	}
 }
 
+func TestBarrierFailsFastOnStall(t *testing.T) {
+	// m0 reached cutover but w0 is stuck at prepare and never advances. With a far
+	// absolute Timeout, the master must still fail fast via StallTimeout (no
+	// forward progress) rather than waiting out the whole budget — and name the
+	// stuck node.
+	c := fakeCoord(node("m0", "cutover@rot-1"), node("w0", "prepare@rot-1"))
+	_ = c.EnsureRotation(context.Background(), "rot-1")
+	_ = c.AdvanceDesiredPhase(context.Background(), "rot-1", PhaseCutover)
+	start := time.Now()
+	err := c.Barrier(context.Background(), "rot-1", PhaseCutover, true,
+		BarrierOptions{Poll: time.Millisecond, Timeout: time.Hour, StallTimeout: 30 * time.Millisecond})
+	if err == nil {
+		t.Fatal("expected the barrier to fail fast on stall")
+	}
+	if !strings.Contains(err.Error(), "no progress") || !strings.Contains(err.Error(), "w0") {
+		t.Fatalf("stall error should name the stuck node: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("barrier ignored stall timeout (waited %v)", elapsed)
+	}
+}
+
 func TestAllNodesReachedIgnoresTerminatingNode(t *testing.T) {
 	terminating := node("dead", "")
 	now := metav1.NewTime(time.Now())

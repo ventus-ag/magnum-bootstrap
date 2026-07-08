@@ -207,8 +207,11 @@ func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 			},
 		},
 	}
-	if _, err := kc.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create PVC: %w", err)
+	if err := r.retryTransientAPI(ctx, "create PVC", func() error {
+		_, e := kc.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 
 	// --- OCCM: nginx behind a LoadBalancer Service (Octavia). The Deployment
@@ -292,8 +295,11 @@ func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset)
 			},
 		},
 	}
-	if _, err := kc.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create nginx deployment: %w", err)
+	if err := r.retryTransientAPI(ctx, "create nginx deployment", func() error {
+		_, e := kc.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: smokeSvc, Namespace: "default"},
@@ -303,10 +309,68 @@ func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset)
 			Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(80)}},
 		},
 	}
-	if _, err := kc.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create LB service: %w", err)
+	if err := r.retryTransientAPI(ctx, "create LB service", func() error {
+		_, e := kc.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 	return nil
+}
+
+// transientAPIErr reports whether err is a brief control-plane blip that a
+// just-completed disruptive op (upgrade, CA rotation) can legitimately produce —
+// the apiserver restarting behind the VIP, or addon pods briefly re-establishing
+// trust after a CA cutover. These are safe to retry: the cluster is converging,
+// not broken.
+func transientAPIErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsServerTimeout(err) || apierrors.IsTimeout(err) {
+		return true
+	}
+	s := err.Error()
+	for _, sub := range []string{
+		"EOF",
+		"connection refused",
+		"connection reset by peer",
+		"TLS handshake timeout",
+		"i/o timeout",
+		"server is currently unable",
+		"the server was unable to return a response",
+		"apiserver not ready",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTransientAPI runs fn, retrying on a transient control-plane blip for up to
+// ~90s. Post-CA-rotate / post-upgrade the apiserver can briefly return
+// EOF/connection-refused while it settles behind the VIP; a single such error is
+// an expected, valid cluster state, not a product defect. A create that actually
+// landed before the connection dropped is detected via AlreadyExists and treated
+// as success.
+func (r *runner) retryTransientAPI(ctx context.Context, what string, fn func() error) error {
+	deadline := time.Now().Add(90 * time.Second)
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if err == nil || apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		if !transientAPIErr(err) || time.Now().After(deadline) {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		r.log("smoke: %s hit transient API blip (%v) — retry %d", what, err, attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
 
 func (r *runner) waitLBIngress(ctx context.Context, kc *kubernetes.Clientset) (string, error) {

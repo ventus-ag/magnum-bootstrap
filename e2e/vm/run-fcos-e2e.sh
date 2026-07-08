@@ -784,20 +784,26 @@ scenario_ca_rotate() {
   mp="$(ssh_port master)"
   log "=== SCENARIO: ca-rotate (id=$rot) ==="
   before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
-  if multimaster; then
-    # Apply the rotation to every master ~concurrently — Heat rotates the whole
-    # master batch at once, and the dual-CA barrier's per-master restart Lease is
-    # only exercised under concurrent applies (sequential would block at barrier 1).
-    local pids=() i=0 rc=0 p
-    while [ "$i" -lt "${MASTERS:-1}" ]; do
-      apply_master_idx "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
-      i=$((i + 1))
-    done
-    for p in "${pids[@]}"; do wait "$p" || rc=1; done
-    [ "$rc" = 0 ] || die "ca-rotate: a master reconcile failed (see per-master output above)"
-  else
-    apply_master ca-rotate "$KUBE_TAG" "$rot"
-  fi
+  # Rotate every master AND every worker ~concurrently. On real OpenStack, Heat
+  # fires the ca-rotate SoftwareDeployment on every node at once; the reconciler's
+  # dual-CA prepare barrier on the master blocks until EVERY node (workers
+  # included) reports reaching prepare. So the workers must rotate in the same
+  # window — triggering masters alone makes them wait out the whole run budget for
+  # a worker that never rotates (the wedge this harness previously reproduced as a
+  # false failure). Backgrounding also exercises the per-master restart Lease,
+  # which only serializes under concurrent applies.
+  local pids=() i=0 rc=0 p
+  while [ "$i" -lt "${MASTERS:-1}" ]; do
+    apply_master_idx "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "${WORKERS:-0}" ]; do
+    apply_worker "$i" ca-rotate "$KUBE_TAG" & pids+=($!)
+    i=$((i + 1))
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [ "$rc" = 0 ] || die "ca-rotate: a node reconcile failed (see per-node output above)"
   gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
   after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
   sb="${before##*server=}"; sa="${after##*server=}"

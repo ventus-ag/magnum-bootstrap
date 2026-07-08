@@ -369,7 +369,16 @@ func runDeadline(ctx context.Context, fallback time.Duration) time.Time {
 type BarrierOptions struct {
 	Poll    time.Duration
 	Timeout time.Duration
-	Logf    func(format string, args ...any)
+	// StallTimeout fails the barrier fast when the cluster makes no forward
+	// progress for this long — i.e. the set of nodes still not at the barrier
+	// phase has not shrunk. It is enforced only on the master that drives
+	// advancement (which is the only party that can observe the pending set):
+	// a worker merely waits for the desired phase and keeps the absolute
+	// deadline, so it never trips on a long-but-progressing serial master
+	// restart. This turns a genuinely stuck peer (never reaches the phase) into
+	// a fast, actionable failure instead of consuming the whole Heat run budget.
+	StallTimeout time.Duration
+	Logf         func(format string, args ...any)
 }
 
 func (o BarrierOptions) withDefaults() BarrierOptions {
@@ -378,6 +387,9 @@ func (o BarrierOptions) withDefaults() BarrierOptions {
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 20 * time.Minute
+	}
+	if o.StallTimeout <= 0 {
+		o.StallTimeout = 20 * time.Minute
 	}
 	if o.Logf == nil {
 		o.Logf = func(string, ...any) {}
@@ -397,6 +409,14 @@ func (c *Coordinator) Barrier(ctx context.Context, rotationID string, completed 
 	}
 	opts = opts.withDefaults()
 	deadline := runDeadline(ctx, opts.Timeout)
+	// Master-only stall tracking: the last observed pending set and when it last
+	// changed. Any shrink of the pending set (a node reaching `completed`) counts
+	// as progress and resets the clock; no change for StallTimeout fails fast.
+	var (
+		lastPendingKey  = "\x00" // sentinel: differs from any real set on first observation
+		lastProgress    = time.Now()
+		lastPendingList []string
+	)
 	for {
 		desired, err := c.ReadDesiredPhase(ctx, rotationID)
 		if err == nil && desired.AtLeast(next) {
@@ -413,6 +433,15 @@ func (c *Coordinator) Barrier(ctx context.Context, rotationID string, completed 
 				}
 			} else if listErr == nil {
 				opts.Logf("ca-rotation: waiting for nodes to reach %s: %v", completed, pending)
+				if key := pendingKey(pending); key != lastPendingKey {
+					lastPendingKey = key
+					lastProgress = time.Now()
+					lastPendingList = pending
+				}
+				if opts.StallTimeout > 0 && time.Since(lastProgress) >= opts.StallTimeout {
+					return fmt.Errorf("ca-rotation: no progress for %s — nodes still not at %s: %v (rotationId=%s)",
+						time.Since(lastProgress).Round(time.Second), completed, lastPendingList, rotationID)
+				}
 			}
 		}
 		if err != nil {
@@ -427,6 +456,14 @@ func (c *Coordinator) Barrier(ctx context.Context, rotationID string, completed 
 		case <-time.After(opts.Poll):
 		}
 	}
+}
+
+// pendingKey renders a pending-node set into an order-independent key so that a
+// reordered-but-identical set is not mistaken for progress.
+func pendingKey(pending []string) string {
+	s := append([]string(nil), pending...)
+	sort.Strings(s)
+	return strings.Join(s, ",")
 }
 
 // LockOptions tunes the restart lock acquisition.

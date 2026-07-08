@@ -408,9 +408,24 @@ func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, 
 				return moduleapi.Result{}, err
 			}
 		}
+		// Once every node has cut over to the new serving cert, roll the
+		// CA-consuming workloads immediately so running pods (OCCM, Cinder-CSI, …)
+		// remount the new+old trust bundle and re-establish apiserver TLS right
+		// away, instead of spending the whole prepare→finalize window failing
+		// x509 verification (`certificate signed by unknown authority`) against a
+		// cert their stale mounted CA cannot verify. patchWorkloads is keyed on
+		// the new CA fingerprint, so the finalize rollout below is then a no-op —
+		// pods roll exactly once, but as early as it is safe to.
+		if step == coord.PhaseCutover && isMaster {
+			pc, pw := patchWorkloads(executor, rotationID)
+			r.changes = append(r.changes, pc...)
+			r.warnings = append(r.warnings, pw...)
+		}
 	}
 
-	// Finalize bookkeeping (idempotent): workload rollout, completion marker.
+	// Finalize bookkeeping (idempotent): workload rollout backstop (a no-op when
+	// the cutover rollout above already stamped the same fingerprint), completion
+	// marker.
 	if isMaster {
 		pc, pw := patchWorkloads(executor, rotationID)
 		r.changes = append(r.changes, pc...)
@@ -766,13 +781,27 @@ func waitForHealthy(cfg config.Config, executor *host.Executor) error {
 			}
 		}
 	}
-	for i := 0; i < 90; i++ { // up to 7.5 minutes for API readiness
+	// Require /healthz to answer on several CONSECUTIVE probes before declaring
+	// the node healthy. A single transient "ok" is not enough: during finalize
+	// the apiserver can answer briefly and then restart again as the remaining
+	// cert/kubeconfig swaps land. Returning on the first ok lets run-once (and
+	// therefore Heat) report success while the API is still bouncing — an
+	// external client (e.g. the driver's post-rotate smoke) then hits the next
+	// restart window and gets EOF/connection-refused. Insisting on a stable
+	// streak gates completion on a durably-serving API.
+	const wantStreak = 3
+	streak := 0
+	for i := 0; i < 90; i++ { // up to ~7.5 minutes for durable API readiness
 		if err := executor.Run("kubectl", "--kubeconfig="+adminConf, "get", "--raw=/healthz"); err == nil {
-			return nil
+			if streak++; streak >= wantStreak {
+				return nil
+			}
+		} else {
+			streak = 0
 		}
 		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("ca-rotation: API server health check failed")
+	return fmt.Errorf("ca-rotation: API server did not stay healthy for %d consecutive probes after restart", wantStreak)
 }
 
 // waitForEtcdQuorum blocks until the local etcd endpoint reports healthy, which
