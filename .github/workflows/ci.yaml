@@ -386,6 +386,13 @@ jobs:
     name: e2e-fcos-multimaster
     needs: [build, resolve]
     runs-on: self-hosted
+    # Non-blocking: multi-master etcd formation across 3 emulated VMs is flaky on
+    # the TCG-only runner (nested AMD-V, no KVM — etcd raft heartbeat/election
+    # timing collapses under emulation, ~30% fail), so a flake here must not
+    # red-block a PR. It still runs and reports on every PR; the reliable
+    # merge-blocking gates are e2e-fcos (single-master) + e2e-openstack (smoke).
+    # Flip this off once a KVM-capable / bare-metal runner is available.
+    continue-on-error: true
     steps:
       - name: Checkout magnum-bootstrap
         uses: actions/checkout@v4
@@ -466,9 +473,10 @@ jobs:
   # e2e-openstack — real Magnum cluster on the ventus cloud. Runs on EVERY push,
   # pull_request, dispatch and nightly (no opt-in label): the cloud is
   # self-hosted infra with no metered cost, so every change is validated end to
-  # end. To keep per-push feedback tractable on the single runner, each push/PR
-  # runs only the fast `smoke` scenario (one cluster); the full `all` sweep runs
-  # on the nightly schedule (and whenever os_scenario is set via dispatch).
+  # end. Each push/PR runs a matrix of `smoke` + both multi-master scenarios
+  # (`multimaster` = create-3, `multimaster-scale` = 1→3) — the real cloud is the
+  # reliable multi-master gate the TCG FCoS tier cannot be. The full `all` sweep
+  # runs on the nightly schedule (and a single scenario via dispatch os_scenario).
   #
   # Driven by the prebuilt `magnum-e2e` Go binary (gophercloud + client-go) from
   # the build artifact — no openstack/kubectl CLIs or clouds.yaml on the runner.
@@ -482,15 +490,23 @@ jobs:
   # which is ALSO independently runnable via its own workflow_dispatch
   # (Actions → e2e-openstack → Run workflow), decoupled from a full CI run.
   e2e-openstack:
-    name: e2e-openstack
+    name: e2e-openstack (${{ matrix.scenario }})
     needs: [build]
+    # Per-PR multi-master coverage: every push/PR runs smoke + BOTH multimaster
+    # scenarios on the real cloud (reliable, unlike the TCG FCoS tier). The full
+    # `all` sweep runs only nightly; a single scenario via workflow_dispatch. The
+    # matrix legs serialize behind the reusable workflow's `e2e-openstack`
+    # concurrency group + the single runner (one cluster at a time), and
+    # CLUSTER_NAME/artifacts are scenario-tagged so they never collide.
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(github.event_name == 'schedule' && '["all"]' || (github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.os_scenario) || '["smoke","multimaster","multimaster-scale"]')) }}
     uses: ./.github/workflows/e2e-openstack.yaml
     secrets: inherit
     with:
       use_prebuilt: true
-      # Fast `smoke` on every push/PR; the full `all` sweep only on the nightly
-      # schedule or an explicit workflow_dispatch os_scenario.
-      scenario: ${{ github.event.inputs.os_scenario || (github.event_name == 'schedule' && 'all' || 'smoke') }}
+      scenario: ${{ matrix.scenario }}
       keep_cluster: ${{ github.event.inputs.keep_cluster == 'true' }}
       os_master_count_resize: ${{ github.event.inputs.os_master_count_resize || '2' }}
       os_skip_upgrade: ${{ github.event.inputs.os_skip_upgrade == 'true' }}
