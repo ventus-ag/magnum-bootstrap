@@ -705,13 +705,19 @@ apply_master_idx() {
 # apply_master <op> <tag> [rot] — master-0 (back-compat for single-master scenarios).
 apply_master() { apply_master_idx 0 "$@"; }
 
-apply_worker() {  # apply_worker <i> <op> <tag>
-  local i="$1" op="$2" tag="$3" wp; wp="$(ssh_port "worker$i")"
+apply_worker() {  # apply_worker <i> <op> <tag> [rot]
+  # rot (the CA rotation id) MUST be passed for op=ca-rotate and MUST match the
+  # id the masters use: the reconciler detects a ca-rotate only when heat-params
+  # carries CA_ROTATION_ID, and the coordination ConfigMap + per-node annotations
+  # are keyed by that id. An empty/mismatched id makes the worker run an ordinary
+  # `create`, so it never reaches the rotation's prepare barrier and the masters
+  # wait it out. Empty for create/upgrade (no rotation).
+  local i="$1" op="$2" tag="$3" rot="${4:-}" wp; wp="$(ssh_port "worker$i")"
   if [ "$TRIGGER" = agent ]; then
-    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
+    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "$rot" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
   else
-    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
+    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "$rot" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
   fi
 }
@@ -799,7 +805,7 @@ scenario_ca_rotate() {
   done
   i=0
   while [ "$i" -lt "${WORKERS:-0}" ]; do
-    apply_worker "$i" ca-rotate "$KUBE_TAG" & pids+=($!)
+    apply_worker "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
     i=$((i + 1))
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
