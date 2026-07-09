@@ -660,6 +660,9 @@ func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive 
 	if err := r.verifyNodeCount(ctx); err != nil {
 		return fmt.Errorf("verify %s: %w", name, err)
 	}
+	if err := r.verifyControlPlaneVIP(ctx); err != nil {
+		return fmt.Errorf("verify %s: %w", name, err)
+	}
 	if disruptive {
 		if err := r.verifySAConsistency(ctx); err != nil {
 			return fmt.Errorf("verify %s: %w", name, err)
@@ -670,6 +673,33 @@ func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive 
 			return fmt.Errorf("verify %s: %w", name, err)
 		}
 	}
+	return nil
+}
+
+// verifyControlPlaneVIP asserts that a multi-master cluster's API is fronted by
+// the control-plane LoadBalancer VIP rather than pinned to a single master.
+// Magnum points api_address at the master-LB VIP when master_lb_enabled=true; if
+// it instead resolved to one master's own address, losing that master would take
+// the whole API down — the opposite of what multi-master is for. This is the
+// explicit control-plane VIP check the driver otherwise only exercises implicitly
+// (every client dials c.APIAddress). No-op for single-master clusters.
+func (r *runner) verifyControlPlaneVIP(ctx context.Context) error {
+	c, err := r.getCluster(ctx)
+	if err != nil {
+		return fmt.Errorf("get cluster for VIP check: %w", err)
+	}
+	if c.MasterCount <= 1 {
+		return nil // single master: no control-plane LB VIP expected
+	}
+	if !c.MasterLBEnabled {
+		return fmt.Errorf("multi-master cluster (%d masters) has master_lb_enabled=false — API is not fronted by a control-plane LB VIP", c.MasterCount)
+	}
+	for _, m := range c.MasterAddresses {
+		if m != "" && strings.Contains(c.APIAddress, m) {
+			return fmt.Errorf("api_address %q resolves to master %q's own address, not the LB VIP — the API is pinned to a single master", c.APIAddress, m)
+		}
+	}
+	r.log("control-plane VIP OK: api_address %s is the master LB VIP across %d masters %v ✅", c.APIAddress, c.MasterCount, c.MasterAddresses)
 	return nil
 }
 
