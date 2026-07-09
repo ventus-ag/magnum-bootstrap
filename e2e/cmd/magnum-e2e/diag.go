@@ -150,8 +150,46 @@ func (r *runner) collectHeatDiagnostics(ctx context.Context, reason string) {
 		}
 	}
 
+	// Also surface resources still IN_PROGRESS. When a step times out on
+	// UPDATE_IN_PROGRESS with ZERO failed resources, this is the only way to see
+	// what Heat is still waiting on. In particular, a SoftwareDeployment that is
+	// still in progress but whose node already signalled success
+	// (deploy_status_code 0) is the smoking gun for a Heat-side orchestration /
+	// signal-transport wedge — the node reconcile finished and returned 0, yet
+	// the parent stack never finalized — as opposed to a node fault (which shows
+	// up as FAILED above).
+	var inProgress []stackresources.Resource
+	for _, rs := range res {
+		if strings.Contains(rs.Status, "IN_PROGRESS") {
+			inProgress = append(inProgress, rs)
+		}
+	}
+	fmt.Fprintf(&b, "\n-- IN_PROGRESS Heat resources (%d of %d) --\n", len(inProgress), len(res))
+	for _, rs := range inProgress {
+		fmt.Fprintf(&b, "  %-34s %-40s %s\n      reason: %s\n",
+			rs.Name, rs.Type, rs.Status, strings.TrimSpace(rs.StatusReason))
+	}
+	for _, rs := range inProgress {
+		if rs.Type != "OS::Heat::SoftwareDeployment" || rs.PhysicalID == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "\n### (in-progress) SoftwareDeployment %s (%s)\n", rs.Name, rs.PhysicalID)
+		stdout, stderr, code, derr := fetchDeployOutput(ctx, orch, rs.PhysicalID)
+		if derr != nil {
+			fmt.Fprintf(&b, "(fetch deploy output failed: %v)\n", derr)
+			continue
+		}
+		fmt.Fprintf(&b, "deploy_status_code: %s  (0 here == node already succeeded; Heat has not finalized)\n", code)
+		if s := strings.TrimSpace(stderr); s != "" {
+			fmt.Fprintf(&b, "--- deploy_stderr (tail) ---\n%s\n", tail(s, 4000))
+		}
+		if s := strings.TrimSpace(stdout); s != "" {
+			fmt.Fprintf(&b, "--- deploy_stdout (tail) ---\n%s\n", tail(s, 4000))
+		}
+	}
+
 	r.writeDiagFile("heat-"+reason, b.String())
-	r.log("heat-diag: %d failed Heat resource(s) captured for %q", len(failed), reason)
+	r.log("heat-diag: %d failed, %d in-progress Heat resource(s) captured for %q", len(failed), len(inProgress), reason)
 }
 
 // fetchDeployOutput reads a Heat SoftwareDeployment's output_values directly
