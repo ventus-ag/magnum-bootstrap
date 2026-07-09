@@ -5,10 +5,19 @@ name: CI
 # on it and reuses that one binary instead of rebuilding. Downstream jobs run in
 # parallel:
 #
-#   build  ──┬─▶ e2e-fcos              (single-master FCoS VM, every PR)
-#            ├─▶ e2e-fcos-multimaster  (multi-master + LBs; dispatch/label/nightly)
-#            └─▶ e2e-openstack         (real OpenStack; dispatch/label/nightly)
+#   build  ──┬─▶ e2e-fcos              (single-master FCoS VM)
+#            ├─▶ e2e-fcos-multimaster  (multi-master + LBs)
+#            └─▶ e2e-openstack         (real OpenStack: smoke per-run, all nightly)
 #
+# The ventus cloud is self-hosted infra with no metered cost, so the FULL e2e
+# suite (both FCoS VM tiers + the real-OpenStack tier) runs on EVERY push and
+# pull_request — no opt-in labels. The only per-run/nightly split is the
+# OpenStack SCENARIO: a fast `smoke` cluster on each push/PR, the full `all`
+# sweep on the nightly schedule (and via workflow_dispatch os_scenario).
+#
+# NOTE: all these tiers run on a SINGLE self-hosted runner (magnum-actions01),
+# so they SERIALIZE — a full run is the sum of the tiers, not the max. Add more
+# self-hosted runners (or move e2e-openstack to a hosted runner) to parallelize.
 # The FCoS VM tiers run on the self-hosted `ventus` runner; e2e-openstack needs
 # OpenStack credentials. See e2e/README.md.
 
@@ -17,9 +26,7 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-    # `labeled` lets the opt-in heavy tiers (multimaster / openstack) start when
-    # their label is added without a new push.
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       kube_tag:
@@ -34,14 +41,6 @@ on:
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
         default: stable/victoria
-      run_multimaster:
-        description: Also run the multi-master FCoS tier
-        type: boolean
-        default: false
-      run_openstack:
-        description: Also run the real-OpenStack tier (provisions billed cloud resources)
-        type: boolean
-        default: false
       use_host_provider:
         description: Run e2e-fcos against the real magnumhost Pulumi provider (instead of the legacy bridge)
         type: boolean
@@ -191,7 +190,6 @@ jobs:
     name: Resolve latest k8s
     needs: build
     runs-on: self-hosted
-    if: ${{ github.event.action != 'labeled' || contains(github.event.pull_request.labels.*.name, 'e2e-multimaster') || contains(github.event.pull_request.labels.*.name, 'e2e-openstack') }}
     outputs:
       latest: ${{ steps.k.outputs.latest }}
     steps:
@@ -199,17 +197,15 @@ jobs:
         run: echo "latest=$(curl -fsSL https://dl.k8s.io/release/stable.txt)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # e2e-fcos — single-master FCoS VM tier (matrix: pinned + latest k8s). Every PR
-  # (open/sync/reopen), dispatch and nightly. Skipped on plain `push` and on bare
-  # `labeled` events (those are for the opt-in tiers below). Reuses the build
-  # artifact. Dispatch use_host_provider=true swaps the legacy hostresource
+  # e2e-fcos — single-master FCoS VM tier (matrix: pinned + latest k8s). Runs on
+  # every push, pull_request, dispatch and nightly (no opt-in label). Reuses the
+  # build artifact. Dispatch use_host_provider=true swaps the legacy hostresource
   # bridge for the real magnumhost Pulumi provider plugin.
   # ---------------------------------------------------------------------------
   e2e-fcos:
     name: e2e-fcos (${{ matrix.name }})
     needs: [build, resolve]
     runs-on: self-hosted
-    if: ${{ github.event_name != 'push' && github.event.action != 'labeled' }}
     strategy:
       fail-fast: false
       matrix:
@@ -383,17 +379,13 @@ jobs:
           rm -rf "$WD" || true
 
   # ---------------------------------------------------------------------------
-  # e2e-fcos-multimaster — N masters + the two L4 LBs. Opt-in: dispatch with
-  # run_multimaster, the `e2e-multimaster` PR label, or nightly. Reuses build.
+  # e2e-fcos-multimaster — N masters + the two L4 LBs. Runs on every push,
+  # pull_request, dispatch and nightly (no opt-in label). Reuses build.
   # ---------------------------------------------------------------------------
   e2e-fcos-multimaster:
     name: e2e-fcos-multimaster
     needs: [build, resolve]
     runs-on: self-hosted
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_multimaster == 'true') ||
-      github.event_name == 'schedule' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-multimaster'))
     steps:
       - name: Checkout magnum-bootstrap
         uses: actions/checkout@v4
@@ -471,8 +463,12 @@ jobs:
           rm -rf "$WD" || true
 
   # ---------------------------------------------------------------------------
-  # e2e-openstack — real Magnum cluster. Opt-in: dispatch with run_openstack,
-  # the `e2e-openstack` PR label, or nightly. Provisions billed cloud resources.
+  # e2e-openstack — real Magnum cluster on the ventus cloud. Runs on EVERY push,
+  # pull_request, dispatch and nightly (no opt-in label): the cloud is
+  # self-hosted infra with no metered cost, so every change is validated end to
+  # end. To keep per-push feedback tractable on the single runner, each push/PR
+  # runs only the fast `smoke` scenario (one cluster); the full `all` sweep runs
+  # on the nightly schedule (and whenever os_scenario is set via dispatch).
   #
   # Driven by the prebuilt `magnum-e2e` Go binary (gophercloud + client-go) from
   # the build artifact — no openstack/kubectl CLIs or clouds.yaml on the runner.
@@ -480,28 +476,21 @@ jobs:
   # also supported). The reconciler node binary itself is delivered to the nodes
   # via the reconciler_version/reconciler_binary_url labels (or the template
   # defaults), NOT this artifact.
-  # ---------------------------------------------------------------------------
-  # Same gate as before (dispatch run_openstack / `e2e-openstack` label / nightly)
-  # and still `needs: build` so it reuses this run's bootstrap-dist artifact
+  #
+  # `needs: build` so it reuses this run's bootstrap-dist artifact
   # (use_prebuilt: true). The tier lives in the reusable e2e-openstack workflow,
   # which is ALSO independently runnable via its own workflow_dispatch
   # (Actions → e2e-openstack → Run workflow), decoupled from a full CI run.
-  #
-  # A SINGLE job, ONE invocation: scenario=all makes the magnum-e2e binary run the
-  # curated default sweep one-by-one in this one run (each its own cluster, torn
-  # down before the next). Dispatch can pick a single scenario via os_scenario.
   e2e-openstack:
     name: e2e-openstack
     needs: [build]
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_openstack == 'true') ||
-      github.event_name == 'schedule' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-openstack'))
     uses: ./.github/workflows/e2e-openstack.yaml
     secrets: inherit
     with:
       use_prebuilt: true
-      scenario: ${{ github.event.inputs.os_scenario || 'all' }}
+      # Fast `smoke` on every push/PR; the full `all` sweep only on the nightly
+      # schedule or an explicit workflow_dispatch os_scenario.
+      scenario: ${{ github.event.inputs.os_scenario || (github.event_name == 'schedule' && 'all' || 'smoke') }}
       keep_cluster: ${{ github.event.inputs.keep_cluster == 'true' }}
       os_master_count_resize: ${{ github.event.inputs.os_master_count_resize || '2' }}
       os_skip_upgrade: ${{ github.event.inputs.os_skip_upgrade == 'true' }}
