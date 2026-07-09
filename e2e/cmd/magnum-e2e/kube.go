@@ -207,8 +207,11 @@ func (r *runner) smokeCloudIntegration(ctx context.Context) error {
 			},
 		},
 	}
-	if _, err := kc.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create PVC: %w", err)
+	if err := r.retryTransientAPI(ctx, "create PVC", func() error {
+		_, e := kc.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 
 	// --- OCCM: nginx behind a LoadBalancer Service (Octavia). The Deployment
@@ -292,8 +295,11 @@ func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset)
 			},
 		},
 	}
-	if _, err := kc.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create nginx deployment: %w", err)
+	if err := r.retryTransientAPI(ctx, "create nginx deployment", func() error {
+		_, e := kc.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: smokeSvc, Namespace: "default"},
@@ -303,10 +309,68 @@ func (r *runner) createLBWorkload(ctx context.Context, kc *kubernetes.Clientset)
 			Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(80)}},
 		},
 	}
-	if _, err := kc.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create LB service: %w", err)
+	if err := r.retryTransientAPI(ctx, "create LB service", func() error {
+		_, e := kc.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{})
+		return e
+	}); err != nil {
+		return err
 	}
 	return nil
+}
+
+// transientAPIErr reports whether err is a brief control-plane blip that a
+// just-completed disruptive op (upgrade, CA rotation) can legitimately produce —
+// the apiserver restarting behind the VIP, or addon pods briefly re-establishing
+// trust after a CA cutover. These are safe to retry: the cluster is converging,
+// not broken.
+func transientAPIErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsServerTimeout(err) || apierrors.IsTimeout(err) {
+		return true
+	}
+	s := err.Error()
+	for _, sub := range []string{
+		"EOF",
+		"connection refused",
+		"connection reset by peer",
+		"TLS handshake timeout",
+		"i/o timeout",
+		"server is currently unable",
+		"the server was unable to return a response",
+		"apiserver not ready",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTransientAPI runs fn, retrying on a transient control-plane blip for up to
+// ~90s. Post-CA-rotate / post-upgrade the apiserver can briefly return
+// EOF/connection-refused while it settles behind the VIP; a single such error is
+// an expected, valid cluster state, not a product defect. A create that actually
+// landed before the connection dropped is detected via AlreadyExists and treated
+// as success.
+func (r *runner) retryTransientAPI(ctx context.Context, what string, fn func() error) error {
+	deadline := time.Now().Add(90 * time.Second)
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if err == nil || apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		if !transientAPIErr(err) || time.Now().After(deadline) {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		r.log("smoke: %s hit transient API blip (%v) — retry %d", what, err, attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
 
 func (r *runner) waitLBIngress(ctx context.Context, kc *kubernetes.Clientset) (string, error) {
@@ -596,6 +660,9 @@ func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive 
 	if err := r.verifyNodeCount(ctx); err != nil {
 		return fmt.Errorf("verify %s: %w", name, err)
 	}
+	if err := r.verifyControlPlaneVIP(ctx); err != nil {
+		return fmt.Errorf("verify %s: %w", name, err)
+	}
 	if disruptive {
 		if err := r.verifySAConsistency(ctx); err != nil {
 			return fmt.Errorf("verify %s: %w", name, err)
@@ -606,6 +673,33 @@ func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive 
 			return fmt.Errorf("verify %s: %w", name, err)
 		}
 	}
+	return nil
+}
+
+// verifyControlPlaneVIP asserts that a multi-master cluster's API is fronted by
+// the control-plane LoadBalancer VIP rather than pinned to a single master.
+// Magnum points api_address at the master-LB VIP when master_lb_enabled=true; if
+// it instead resolved to one master's own address, losing that master would take
+// the whole API down — the opposite of what multi-master is for. This is the
+// explicit control-plane VIP check the driver otherwise only exercises implicitly
+// (every client dials c.APIAddress). No-op for single-master clusters.
+func (r *runner) verifyControlPlaneVIP(ctx context.Context) error {
+	c, err := r.getCluster(ctx)
+	if err != nil {
+		return fmt.Errorf("get cluster for VIP check: %w", err)
+	}
+	if c.MasterCount <= 1 {
+		return nil // single master: no control-plane LB VIP expected
+	}
+	if !c.MasterLBEnabled {
+		return fmt.Errorf("multi-master cluster (%d masters) has master_lb_enabled=false — API is not fronted by a control-plane LB VIP", c.MasterCount)
+	}
+	for _, m := range c.MasterAddresses {
+		if m != "" && strings.Contains(c.APIAddress, m) {
+			return fmt.Errorf("api_address %q resolves to master %q's own address, not the LB VIP — the API is pinned to a single master", c.APIAddress, m)
+		}
+	}
+	r.log("control-plane VIP OK: api_address %s is the master LB VIP across %d masters %v ✅", c.APIAddress, c.MasterCount, c.MasterAddresses)
 	return nil
 }
 

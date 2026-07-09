@@ -162,6 +162,25 @@ var scenarios = map[string]scenarioDef{
 		// climbLadder) so multimaster upgrades exercise real minor bumps.
 		upgradeLadder: climbLadder,
 	},
+	// multimaster — fast per-PR INITIAL 3-master coverage: proves batch etcd
+	// formation (3 members from scratch behind the control-plane LB VIP), then a
+	// CA rotation through the concurrent dual-CA barrier and an SA-consistency
+	// check across all three apiservers. This is the reliable multi-master gate
+	// the TCG FCoS tier cannot be.
+	"multimaster": {
+		masters: 3, workers: 1,
+		ops: "cloud-smoke,ca-rotate,verify-sa",
+	},
+	// multimaster-scale — fast per-PR SCALE 1->3 coverage: create a single-master
+	// cluster then resize the master nodegroup to 3, exercising the sequential
+	// etcd learner-join + promotion path on a live cluster (exactly what breaks
+	// under TCG on the FCoS tier), then rotate + verify SA trust across the grown
+	// control plane. verifyBundle asserts control-plane node count == master
+	// nodegroup count after the resize.
+	"multimaster-scale": {
+		masters: 1, workers: 1,
+		ops: "resize-masters=3,cloud-smoke,ca-rotate,verify-sa",
+	},
 	"chained-single": {
 		masters: 1, workers: 1,
 		ops: "upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate",

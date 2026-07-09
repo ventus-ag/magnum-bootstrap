@@ -828,6 +828,19 @@ func (r *runner) waitStatus(ctx context.Context, want string) error {
 	// (waitStatus fails fast on *_FAILED) rather than a blind client timeout.
 	if want == "CREATE_COMPLETE" && r.cfg.createTimeoutMin > 0 {
 		mins = r.cfg.createTimeoutMin + 3
+	} else if want == "UPDATE_COMPLETE" {
+		// Coordinated ops (CA rotation, upgrade) restart the control plane one
+		// master at a time behind cross-node barriers, so wall-clock grows with
+		// cluster size. Extend the base budget by a per-extra-node margin so a
+		// legitimately slow — but progressing — multi-master rotation is not cut
+		// off mid-flight. A truly stuck rotation still fails fast node-side via
+		// the ca-rotation barrier stall timeout; this only widens patience, never
+		// shrinks it below the configured base.
+		extra := 2 * r.cfg.nodeCount
+		if r.cfg.masterCount > 1 {
+			extra += 8 * (r.cfg.masterCount - 1)
+		}
+		mins += extra
 	}
 	deadline := time.Now().Add(time.Duration(mins) * time.Minute)
 	r.log("waiting for status %s (timeout %dm)", want, mins)

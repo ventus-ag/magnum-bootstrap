@@ -1296,18 +1296,41 @@ func cleanupExcessMembers(cfg config.Config, executor *host.Executor, protocol, 
 	// remove only the highest-indexed one that is NOT healthy.
 	for _, c := range candidates {
 		clientEndpoint := memberClientEndpoint(c.member.peerURL)
-		if clientEndpoint != "" && etcdHealthy(executor, clientEndpoint, certDir, cfg.Shared.TLSDisabled) {
+		if clientEndpoint == "" || !evictionUnreachable(executor, clientEndpoint, certDir, cfg.Shared.TLSDisabled) {
 			if executor.Logger != nil {
-				executor.Logger.Infof("etcd: refusing to evict excess member %s (%s) — endpoint healthy; node count likely stale", c.member.name, c.member.id)
+				executor.Logger.Infof("etcd: refusing to evict excess member %s (%s) — endpoint reachable within grace window; node count likely stale (scale-up with stale NUMBER_OF_MASTERS)", c.member.name, c.member.id)
 			}
 			continue
 		}
 		if executor.Logger != nil {
-			executor.Logger.Infof("etcd: removing excess member %s (%s, peer %s) — endpoint unreachable, treating as scaled-down orphan", c.member.name, c.member.id, c.member.peerURL)
+			executor.Logger.Infof("etcd: removing excess member %s (%s, peer %s) — endpoint unreachable for the full grace window, treating as scaled-down orphan", c.member.name, c.member.id, c.member.peerURL)
 		}
 		runEtcdctl(executor, append(args, "member", "remove", c.member.id)...)
 		return
 	}
+}
+
+// evictionUnreachable reports whether a candidate excess member is unreachable
+// for a SUSTAINED window, not just a single instant. This is the guard that
+// separates a genuinely scaled-down orphan (VM deleted — unreachable forever)
+// from a healthy, freshly-joined master that is momentarily unreachable while it
+// restarts etcd during its own `services`/`start-services` phase. A single probe
+// (the previous behaviour) misreads that restart blip as an orphan and evicts a
+// live member mid-join; the removed member can then never rejoin with its data
+// ("ignore already removed member" / "rejected stream ... because it was
+// removed"), permanently wedging the scale-up. Requires EVERY probe across the
+// window to fail — an orphan stays down, a restarting member recovers.
+func evictionUnreachable(executor *host.Executor, endpoint, certDir string, tlsDisabled bool) bool {
+	const probes = 6
+	for i := 0; i < probes; i++ {
+		if i > 0 {
+			time.Sleep(10 * time.Second)
+		}
+		if etcdHealthy(executor, endpoint, certDir, tlsDisabled) {
+			return false // recovered within the window → not an orphan
+		}
+	}
+	return true
 }
 
 // memberClientEndpoint derives a member's client URL (port 2379) from its peer

@@ -64,14 +64,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}, nil
 	}
 
-	// Converge the agent image tag toward the desired heat-params value so an
-	// agent version bump (e.g. ussuri -> victoria) lands without replacing the
-	// node. No-op when the tag is empty (older heat-params lack the key).
-	tagChanges, err := reconcileAgentImage(executor, cfg, req)
+	// Converge the agent unit toward desired state without replacing the node:
+	// the image tag follows the heat-params value (e.g. ussuri -> victoria) and
+	// the REQUESTS_CA_BUNDLE path is normalized to a version-stable CA bundle
+	// (FCoS 44 dropped the legacy symlink the ignition unit points at).
+	unitChanges, err := reconcileAgentUnit(executor, cfg, req)
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
-	changes = append(changes, tagChanges...)
+	changes = append(changes, unitChanges...)
 
 	result, err := (hostresource.SystemdServiceSpec{
 		Unit:    unitName,
@@ -92,18 +93,28 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
-// reconcileAgentImage rewrites the agent unit's image reference to the desired
-// "<ContainerInfraPrefix>heat-container-agent:<HeatContainerAgentTag>" and pulls
-// it. The restart is deferred to a periodic run: run-once executes UNDER the
-// heat-container-agent (a Heat SoftwareDeployment), so restarting it mid-run
-// would kill the in-flight heat-config-notify signal and wedge the Heat update.
-func reconcileAgentImage(executor *host.Executor, cfg config.Config, req moduleapi.Request) ([]host.Change, error) {
-	tag := cfg.Shared.HeatContainerAgentTag
-	if tag == "" {
-		return nil, nil
-	}
-	desiredRef := cfg.Shared.ContainerInfraPrefix + "heat-container-agent:" + tag
+// canonicalCABundle is the version-stable system trust bundle. update-ca-trust
+// regenerates it on every FCoS/RHEL release; the legacy compat symlink
+// /etc/pki/tls/certs/ca-bundle.crt that the ignition unit points at was dropped
+// in FCoS 44, wedging os-collect-config (no CA to verify the Heat API over TLS).
+const canonicalCABundle = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 
+// agentCABundleEnv matches the REQUESTS_CA_BUNDLE=<path> token on the podman run
+// line so it can be normalized to canonicalCABundle. Ubuntu units already point
+// at /etc/ssl/certs/ca-certificates.crt (also valid), so only rewrite the FCoS
+// legacy /etc/pki path.
+var agentCABundleEnv = regexp.MustCompile(`REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle\.crt`)
+
+// reconcileAgentUnit converges the agent unit toward desired state without
+// replacing the node: it rewrites the image reference to the desired
+// "<ContainerInfraPrefix>heat-container-agent:<HeatContainerAgentTag>" (pulled
+// first) and normalizes the REQUESTS_CA_BUNDLE path to canonicalCABundle. Both
+// are applied in a single read/write so an existing node self-heals the FCoS 44
+// CA-path breakage on its next periodic run. The restart is deferred to a
+// periodic run: run-once executes UNDER the heat-container-agent (a Heat
+// SoftwareDeployment), so restarting it mid-run would kill the in-flight
+// heat-config-notify signal and wedge the Heat update.
+func reconcileAgentUnit(executor *host.Executor, cfg config.Config, req moduleapi.Request) ([]host.Change, error) {
 	var content []byte
 	var readPath string
 	for _, p := range agentUnitReadPaths {
@@ -117,30 +128,42 @@ func reconcileAgentImage(executor *host.Executor, cfg config.Config, req modulea
 		}
 	}
 	if readPath == "" {
-		logf(req, "warn", "agent unit not found at any of %v; skipping image convergence", agentUnitReadPaths)
+		logf(req, "warn", "agent unit not found at any of %v; skipping convergence", agentUnitReadPaths)
 		return nil, nil
 	}
 
-	// An unexpected unit format (no recognizable image token) should be visible
-	// but must not wedge the whole node reconcile — the agent may be running fine.
-	if !agentImageRef.Match(content) {
-		logf(req, "warn", "agent unit %s has no recognizable heat-container-agent image reference; skipping tag convergence", readPath)
-		return nil, nil
+	desired := content
+
+	// CA bundle path normalization — always applied, independent of the image
+	// tag, so it heals even when heat-params carries no tag or the pull fails.
+	desired = agentCABundleEnv.ReplaceAll(desired, []byte("REQUESTS_CA_BUNDLE="+canonicalCABundle))
+
+	// Image tag convergence — only when heat-params carries a tag.
+	var desiredRef string
+	if tag := cfg.Shared.HeatContainerAgentTag; tag != "" {
+		if !agentImageRef.Match(desired) {
+			// An unexpected unit format (no recognizable image token) should be
+			// visible but must not wedge the reconcile — the agent may be fine.
+			logf(req, "warn", "agent unit %s has no recognizable heat-container-agent image reference; skipping tag convergence", readPath)
+		} else if replaced := agentImageRef.ReplaceAll(desired, []byte(cfg.Shared.ContainerInfraPrefix+"heat-container-agent:"+tag)); string(replaced) != string(desired) {
+			desiredRef = cfg.Shared.ContainerInfraPrefix + "heat-container-agent:" + tag
+			// Pull first; on failure leave the image reference untouched so a
+			// missing image can never wedge the agent on a later restart. The
+			// CA-bundle fix above is still applied.
+			if err := executor.Run("podman", "pull", desiredRef); err != nil {
+				logf(req, "warn", "podman pull %s failed; leaving agent image unchanged: %v", desiredRef, err)
+				desiredRef = ""
+			} else {
+				desired = replaced
+			}
+		}
 	}
 
-	newContent := agentImageRef.ReplaceAll(content, []byte(desiredRef))
-	if string(newContent) == string(content) {
-		return nil, nil // already at the desired image reference
+	if string(desired) == string(content) {
+		return nil, nil // already converged
 	}
 
-	// Pull first; on failure leave the unit untouched so a missing image can
-	// never wedge the agent on a later restart.
-	if err := executor.Run("podman", "pull", desiredRef); err != nil {
-		logf(req, "warn", "podman pull %s failed; leaving agent image unchanged: %v", desiredRef, err)
-		return nil, nil
-	}
-
-	ch, err := executor.EnsureFile(agentUnitPath, newContent, 0o644)
+	ch, err := executor.EnsureFile(agentUnitPath, desired, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("write %s: %w", agentUnitPath, err)
 	}
@@ -158,11 +181,11 @@ func reconcileAgentImage(executor *host.Executor, cfg config.Config, req modulea
 			return nil, fmt.Errorf("restart %s: %w", unitName, err)
 		}
 		if req.Apply && !executor.WaitForSystemctlActive(unitName, 30*time.Second, 2*time.Second) {
-			return nil, fmt.Errorf("service %s did not become active after image update", unitName)
+			return nil, fmt.Errorf("service %s did not become active after unit rewrite", unitName)
 		}
-		logf(req, "info", "heat-container-agent image updated to %s and restarted", desiredRef)
+		logf(req, "info", "heat-container-agent unit converged (image=%q, ca-bundle normalized) and restarted", desiredRef)
 	} else {
-		logf(req, "info", "heat-container-agent image staged to %s; restart deferred to periodic run", desiredRef)
+		logf(req, "info", "heat-container-agent unit converged (image=%q, ca-bundle normalized); restart deferred to periodic run", desiredRef)
 	}
 
 	return changes, nil

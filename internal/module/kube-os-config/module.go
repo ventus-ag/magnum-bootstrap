@@ -104,11 +104,18 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 
 // caBundleSource returns the system CA bundle path for the node OS. EnsureCopy
 // errors on a missing source, so the path must match the OS: Debian/Ubuntu use
-// /etc/ssl/certs/ca-certificates.crt; RHEL/Fedora CoreOS use
-// /etc/pki/tls/certs/ca-bundle.crt.
+// /etc/ssl/certs/ca-certificates.crt; RHEL/Fedora use the canonical extracted
+// bundle /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem. The legacy
+// /etc/pki/tls/certs/ca-bundle.crt compat symlink was dropped in FCoS 44, so
+// target the canonical path directly (present on every FCoS version); fall back
+// to the legacy symlink only if the canonical path is absent.
 func caBundleSource(cfg config.Config) string {
 	if cfg.IsUbuntu() {
 		return "/etc/ssl/certs/ca-certificates.crt"
+	}
+	const canonical = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+	if _, err := os.Stat(canonical); err == nil {
+		return canonical
 	}
 	return "/etc/pki/tls/certs/ca-bundle.crt"
 }

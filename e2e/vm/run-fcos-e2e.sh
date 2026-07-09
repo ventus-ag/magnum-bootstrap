@@ -705,13 +705,19 @@ apply_master_idx() {
 # apply_master <op> <tag> [rot] — master-0 (back-compat for single-master scenarios).
 apply_master() { apply_master_idx 0 "$@"; }
 
-apply_worker() {  # apply_worker <i> <op> <tag>
-  local i="$1" op="$2" tag="$3" wp; wp="$(ssh_port "worker$i")"
+apply_worker() {  # apply_worker <i> <op> <tag> [rot]
+  # rot (the CA rotation id) MUST be passed for op=ca-rotate and MUST match the
+  # id the masters use: the reconciler detects a ca-rotate only when heat-params
+  # carries CA_ROTATION_ID, and the coordination ConfigMap + per-node annotations
+  # are keyed by that id. An empty/mismatched id makes the worker run an ordinary
+  # `create`, so it never reaches the rotation's prepare barrier and the masters
+  # wait it out. Empty for create/upgrade (no rotation).
+  local i="$1" op="$2" tag="$3" rot="${4:-}" wp; wp="$(ssh_port "worker$i")"
   if [ "$TRIGGER" = agent ]; then
-    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
+    local res; res="$(render_and_push_deploy "worker$i" worker "$op" "$tag" "$rot" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "AGENT_STATE_DIR='$GUEST_E2E_DIR/heat-state' $GUEST_E2E_DIR/guest-run.sh heat-deploy ${res% *} ${res##* } $op"
   else
-    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "" "$(worker_ip "$i")" "$(api_endpoint)")"
+    local hp; hp="$(render_and_push "worker$i" worker "$op" "$tag" "$rot" "$(worker_ip "$i")" "$(api_endpoint)")"
     gssh "$wp" "$GUEST_E2E_DIR/guest-run.sh apply $hp $op"
   fi
 }
@@ -784,20 +790,26 @@ scenario_ca_rotate() {
   mp="$(ssh_port master)"
   log "=== SCENARIO: ca-rotate (id=$rot) ==="
   before="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
-  if multimaster; then
-    # Apply the rotation to every master ~concurrently — Heat rotates the whole
-    # master batch at once, and the dual-CA barrier's per-master restart Lease is
-    # only exercised under concurrent applies (sequential would block at barrier 1).
-    local pids=() i=0 rc=0 p
-    while [ "$i" -lt "${MASTERS:-1}" ]; do
-      apply_master_idx "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
-      i=$((i + 1))
-    done
-    for p in "${pids[@]}"; do wait "$p" || rc=1; done
-    [ "$rc" = 0 ] || die "ca-rotate: a master reconcile failed (see per-master output above)"
-  else
-    apply_master ca-rotate "$KUBE_TAG" "$rot"
-  fi
+  # Rotate every master AND every worker ~concurrently. On real OpenStack, Heat
+  # fires the ca-rotate SoftwareDeployment on every node at once; the reconciler's
+  # dual-CA prepare barrier on the master blocks until EVERY node (workers
+  # included) reports reaching prepare. So the workers must rotate in the same
+  # window — triggering masters alone makes them wait out the whole run budget for
+  # a worker that never rotates (the wedge this harness previously reproduced as a
+  # false failure). Backgrounding also exercises the per-master restart Lease,
+  # which only serializes under concurrent applies.
+  local pids=() i=0 rc=0 p
+  while [ "$i" -lt "${MASTERS:-1}" ]; do
+    apply_master_idx "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "${WORKERS:-0}" ]; do
+    apply_worker "$i" ca-rotate "$KUBE_TAG" "$rot" & pids+=($!)
+    i=$((i + 1))
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [ "$rc" = 0 ] || die "ca-rotate: a node reconcile failed (see per-node output above)"
   gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-ready"
   after="$(gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh cert-hashes")"
   sb="${before##*server=}"; sa="${after##*server=}"
