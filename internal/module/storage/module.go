@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,7 +75,12 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		runtimeService = "docker"
 	}
 	if executor.SystemctlIsActive(runtimeService) && executor.IsMountpoint(storageDir) {
+		// A node wedged by a PRE-FIX relocation (volume mounted over the live
+		// store, old pods orphaned) lands here on every later run — self-heal
+		// it instead of leaving it for a manual reboot.
+		healChanges := healOrphanShimWedge(executor, req, runtimeService)
 		return moduleapi.Result{
+			Changes: healChanges,
 			Outputs: map[string]string{"storageDir": storageDir, "status": "already-mounted"},
 		}, nil
 	}
@@ -94,10 +100,34 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		return moduleapi.Result{}, fmt.Errorf("storage: no device found for volume %s", cfg.Shared.DockerVolume)
 	}
 
+	// Adopting an OLD node whose runtime store lives on the ROOT disk: mounting
+	// the dedicated volume here would silently shadow the live store under the
+	// running workloads. The runtime then restarts onto an empty store while
+	// every old pod keeps running as an orphan shim — invisible to CRI, holding
+	// RWO volume mounts, CNI IPs and host ports — and no new pod can start
+	// until the node is rebooted. Relocation is intrinsically disruptive (all
+	// node-local pods are recreated), so do it as an orderly reboot-equivalent
+	// instead of a wedge: stop kubelet+runtime, kill leftover shims, unmount
+	// everything below the store, clear the old content (reclaims the root
+	// disk), then mount and let the services phase bring everything back up.
+	relocationNeeded := liveStoreRelocationNeeded(executor, storageDir, runtime)
+
 	if !req.Apply {
+		if relocationNeeded {
+			changes = append(changes, host.Change{Action: host.ActionUpdate, Path: storageDir,
+				Summary: fmt.Sprintf("relocate live %s store from root disk to dedicated volume (node-local pods will be recreated)", runtime)})
+		}
 		changes = append(changes, host.Change{Action: host.ActionCreate, Path: storageDir,
 			Summary: fmt.Sprintf("format %s and mount at %s", devicePath, storageDir)})
 		return moduleapi.Result{Changes: changes, Outputs: map[string]string{"storageDir": storageDir}}, nil
+	}
+
+	if relocationNeeded {
+		rc, err := relocateLiveRuntimeStore(executor, req, storageDir, runtimeService)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, rc...)
 	}
 
 	// Ensure storage directory exists.
@@ -153,9 +183,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			Summary: fmt.Sprintf("mount %s at %s", devicePath, storageDir)})
 	}
 
-	// Restore SELinux context only if we just formatted — Fedora CoreOS only
-	// (Ubuntu uses AppArmor; restorecon is absent / a no-op there).
-	if cfg.IsFCoS() && formatted {
+	// Restore SELinux context if we just formatted, or after a relocation (an
+	// old volume may carry docker-era labels that break containerd) — Fedora
+	// CoreOS only (Ubuntu uses AppArmor; restorecon is absent / a no-op there).
+	if cfg.IsFCoS() && (formatted || relocationNeeded) {
 		_ = executor.Run("restorecon", "-R", storageDir)
 	}
 
@@ -204,6 +235,186 @@ func migrateLegacyDockerMount(executor *host.Executor) ([]host.Change, error) {
 		}
 	}
 	return changes, nil
+}
+
+// liveStoreRelocationNeeded reports whether mounting the dedicated volume at
+// storageDir would shadow a live (or leftover) runtime store on the root disk.
+// A fresh node is not affected: the runtime may have pre-created the directory
+// skeleton before the storage phase runs, but it holds no snapshots/containers
+// and no shims, so nothing here triggers.
+func liveStoreRelocationNeeded(executor *host.Executor, storageDir, runtime string) bool {
+	if executor.IsMountpoint(storageDir) {
+		return false
+	}
+	if runtimeStoreHasData(storageDir, runtime) {
+		return true
+	}
+	// Leftover shims keep old pods alive (and their mounts/IPs/ports held)
+	// even when the store content was already shadowed by a prior wedged run.
+	return leftoverShimsRunning(executor)
+}
+
+// runtimeStoreHasData reports whether storageDir holds meaningful store
+// content: actual snapshot/container entries, not the empty directory skeleton
+// a just-started runtime creates.
+func runtimeStoreHasData(storageDir, runtime string) bool {
+	patterns := []string{
+		filepath.Join(storageDir, "io.containerd.snapshotter.*", "snapshots", "*"),
+	}
+	if runtime != "containerd" {
+		patterns = []string{
+			filepath.Join(storageDir, "containers", "*"),
+			filepath.Join(storageDir, "overlay2", "??*"),
+		}
+	}
+	for _, p := range patterns {
+		if m, _ := filepath.Glob(p); len(m) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func leftoverShimsRunning(executor *host.Executor) bool {
+	out, err := executor.RunCapture("pgrep", "-f", "containerd-shim")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+// relocateLiveRuntimeStore performs the orderly reboot-equivalent takedown
+// before the dedicated volume is mounted over a live root-disk store:
+// stop kubelet and the runtime, kill leftover shims (their containers die with
+// them), unmount everything below the store and the runtime state dir, clear
+// the old content and stale CNI allocations, and mark kubelet+runtime for
+// restart so the services phase brings the node back like after a reboot.
+func relocateLiveRuntimeStore(executor *host.Executor, req moduleapi.Request, storageDir, runtimeService string) ([]host.Change, error) {
+	req.Logger.Warnf("storage: live %s store detected on root disk at %s — relocating to dedicated volume; node-local pods will be recreated", runtimeService, storageDir)
+	var changes []host.Change
+
+	// Stop consumers first. kubelet may not exist yet on a half-migrated node,
+	// so its stop is best-effort — but the runtime MUST be down before the
+	// store is cleared, else a live daemon keeps recreating content and holds
+	// the bolt DB open mid-wipe.
+	_ = executor.Run("systemctl", "stop", "kubelet")
+	_ = executor.Run("systemctl", "stop", runtimeService)
+	if runtimeService == "docker" {
+		_ = executor.Run("systemctl", "stop", "docker.socket")
+	}
+	if executor.SystemctlIsActive(runtimeService) {
+		return nil, fmt.Errorf("storage: %s still active after stop; refusing to relocate a live store", runtimeService)
+	}
+
+	// Kill leftover shims: every orphan pod dies with its shim, releasing RWO
+	// volume mounts, host ports and CNI IPs. pkill exits 1 when nothing
+	// matches — not an error.
+	_ = executor.Run("pkill", "-9", "-f", "containerd-shim")
+	for i := 0; i < 30 && leftoverShimsRunning(executor); i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if leftoverShimsRunning(executor) {
+		return nil, fmt.Errorf("storage: leftover containerd-shim processes survived SIGKILL; refusing to mount over a busy store")
+	}
+	changes = append(changes, host.Change{Action: host.ActionDelete, Path: storageDir,
+		Summary: "stop runtime and kill leftover pod shims before store relocation"})
+
+	// Container rootfs overlays (and sandbox shm mounts) linger after their
+	// processes die; unmount deepest-first so the store content is removable.
+	uc, leftover := unmountAllUnder(executor, storageDir)
+	changes = append(changes, uc...)
+	if len(leftover) > 0 {
+		// A mount we cannot detach even lazily would make the clear below
+		// fail with an opaque EBUSY — name the offender instead.
+		return nil, fmt.Errorf("storage: mounts still busy under %s after unmount attempts: %s", storageDir, strings.Join(leftover, ", "))
+	}
+	runtimeStateDir := "/run/containerd"
+	if runtimeService == "docker" {
+		runtimeStateDir = "/run/docker"
+	}
+	uc, leftover = unmountAllUnder(executor, runtimeStateDir)
+	changes = append(changes, uc...)
+	if len(leftover) > 0 {
+		// State-dir leftovers (a stuck shm) don't block the store swap.
+		req.Logger.Warnf("storage: mounts still busy under %s (non-fatal): %s", runtimeStateDir, strings.Join(leftover, ", "))
+	}
+
+	// Clear the old store so it doesn't sit shadowed under the new mount as a
+	// silent root-disk space leak, plus the runtime state dir (bundles there
+	// reference the old snapshots) and stale CNI allocations (every sandbox
+	// they belong to is gone; the plugins recreate the dirs on next use).
+	if err := clearDirContents(storageDir); err != nil {
+		return nil, fmt.Errorf("storage: clear old runtime store %s: %w", storageDir, err)
+	}
+	changes = append(changes, host.Change{Action: host.ActionDelete, Path: storageDir,
+		Summary: "clear old root-disk runtime store before mounting dedicated volume"})
+	if err := clearDirContents(runtimeStateDir); err != nil {
+		req.Logger.Warnf("storage: clear runtime state dir %s (non-fatal): %v", runtimeStateDir, err)
+	}
+	_ = os.RemoveAll("/var/lib/cni")
+
+	if req.Restarts != nil {
+		req.Restarts.Add(runtimeService, "runtime store relocated to dedicated volume")
+		req.Restarts.Add("kubelet", "runtime store relocated to dedicated volume")
+	}
+	return changes, nil
+}
+
+// unmountAllUnder unmounts every mountpoint at or below prefix, deepest first,
+// falling back to a lazy detach when a plain unmount is refused. It returns
+// the recorded changes plus any mountpoints that survived both attempts.
+func unmountAllUnder(executor *host.Executor, prefix string) ([]host.Change, []string) {
+	mps := mountpointsUnder("/proc/self/mounts", prefix)
+	var changes []host.Change
+	var leftover []string
+	for _, mp := range mps {
+		if err := executor.Run("umount", mp); err != nil {
+			if lerr := executor.Run("umount", "-l", mp); lerr != nil {
+				leftover = append(leftover, mp)
+				continue
+			}
+		}
+		changes = append(changes, host.Change{Action: host.ActionDelete, Path: mp,
+			Summary: "unmount leftover container mount under relocated store"})
+	}
+	return changes, leftover
+}
+
+// mountpointsUnder parses a mounts file (/proc/self/mounts format) and returns
+// the mountpoints at or below prefix, deepest first.
+func mountpointsUnder(mountsFile, prefix string) []string {
+	data, err := os.ReadFile(mountsFile)
+	if err != nil {
+		return nil
+	}
+	var mps []string
+	for _, ln := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(ln)
+		if len(fields) < 2 {
+			continue
+		}
+		mp := strings.ReplaceAll(fields[1], "\\040", " ")
+		if mp == prefix || strings.HasPrefix(mp, prefix+"/") {
+			mps = append(mps, mp)
+		}
+	}
+	sort.Slice(mps, func(i, j int) bool { return len(mps[i]) > len(mps[j]) })
+	return mps
+}
+
+// clearDirContents removes everything inside dir but keeps dir itself (it may
+// be referenced by systemd units or become the mountpoint right after).
+func clearDirContents(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removeFstabMount strips any /etc/fstab line whose mountpoint field equals
