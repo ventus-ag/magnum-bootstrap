@@ -3,6 +3,7 @@ package clusterautohealer
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/apps/v1"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
@@ -66,10 +67,28 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			// Clean up failed NPD release so Pulumi can recreate it cleanly
 			// (e.g. after PSA rejection with old privileged values).
 			clusterhelm.CleanupFailedRelease(executor, "npd", "kube-system")
+			// A legacy (bash-era) DaemonSet mounts the "config" volume from a
+			// ConfigMap, while the Pulumi-managed spec sources it from a
+			// Secret. Server-side apply merges the volumes list by name, so
+			// adopting that object leaves BOTH configMap and secret set on
+			// one volume and the API server rejects it ("may not specify
+			// more than 1 volume type"). Delete the legacy object so
+			// Register() recreates it cleanly in the same up.
+			if legacyCM, err := executor.RunCapture("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+				"get", "daemonset", "magnum-auto-healer", "-n", "kube-system",
+				"-o", "jsonpath={.spec.template.spec.volumes[?(@.name=='config')].configMap.name}"); err == nil && strings.TrimSpace(legacyCM) != "" {
+				if req.Logger != nil {
+					req.Logger.Warnf("cluster-auto-healer: legacy DaemonSet mounts config from ConfigMap %s; deleting it for a clean Secret-based recreate", strings.TrimSpace(legacyCM))
+				}
+				_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+					"delete", "daemonset", "magnum-auto-healer", "-n", "kube-system", "--ignore-not-found=true")
+			}
 			// The auto-healer config (with the trustee password) now lives in
 			// a Secret; remove the legacy bash-era ConfigMap of the same name
 			// so the password stops being configmap-readable. Best-effort —
 			// the new Secret-mounted DaemonSet spec lands in the same up.
+			// Ordered after the legacy DaemonSet delete above so its pods are
+			// never left running against a vanished ConfigMap.
 			_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
 				"delete", "configmap", "magnum-auto-healer-config", "-n", "kube-system", "--ignore-not-found=true")
 		}
