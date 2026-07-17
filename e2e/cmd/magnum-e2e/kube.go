@@ -404,7 +404,9 @@ func (r *runner) waitLBIngress(ctx context.Context, kc *kubernetes.Clientset) (s
 // is assigned, and the pod must first become Ready, so it retries.
 func (r *runner) waitLBServes(ctx context.Context, ip string) error {
 	url := "http://" + ip + "/"
-	deadline := time.Now().Add(5 * time.Minute)
+	// 8 min (was 5): the CI runs up to 3 billed clusters concurrently, so
+	// Octavia amphora provisioning + datapath warm-up can lag under that load.
+	deadline := time.Now().Add(8 * time.Minute)
 	var lastErr error
 	for {
 		if err := httpProbeOK(ctx, url, 15*time.Second); err == nil {
@@ -585,11 +587,82 @@ func (r *runner) ensureExpandableDefaultSC(ctx context.Context, kc *kubernetes.C
 	return fmt.Errorf("no default StorageClass found — cannot test dynamic PVC resize")
 }
 
+// cleanupSmoke tears down the cloud-smoke workloads and WAITS for each object to
+// actually disappear. This is deferred and the next op reuses the same names
+// (e2e-lb / e2e-web / e2e-pvc), so a fire-and-forget delete lets the next
+// cloud-smoke race the still-in-progress teardown: the multimaster scenario runs
+// cloud-smoke immediately after the create-time create-cloud, and without the
+// wait the new nginx pod could not schedule ("persistentvolumeclaim e2e-pvc is
+// being deleted" / "not found", PV "still attached to node-0"), so the LB had no
+// backend and never served — surfaced as a bogus "LoadBalancer ... no route to
+// host" OCCM datapath failure. Order matters: delete the Deployment and let its
+// pod terminate first so the Cinder volume detaches before the PVC/PV delete;
+// the Service must fully disappear (OCCM clears its load-balancer-cleanup
+// finalizer only after the Octavia LB is torn down), so waiting for the Service
+// object to be gone is waiting for LB teardown. Best-effort throughout: a
+// timeout logs and continues rather than failing the run.
 func (r *runner) cleanupSmoke(ctx context.Context, kc *kubernetes.Clientset) {
-	r.log("cleaning up smoke workloads")
-	_ = kc.CoreV1().Services("default").Delete(ctx, smokeSvc, metav1.DeleteOptions{})
-	_ = kc.AppsV1().Deployments("default").Delete(ctx, smokeDeploy, metav1.DeleteOptions{})
-	_ = kc.CoreV1().PersistentVolumeClaims("default").Delete(ctx, smokePVC, metav1.DeleteOptions{})
+	r.log("cleaning up smoke workloads (waiting for teardown)")
+	// Fresh bounded context: this runs deferred, possibly after the op context
+	// was cancelled, and the teardown (Octavia LB + Cinder detach) is slow.
+	cctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	// 1. Deployment first, then wait for its pods to be gone (volume detached).
+	_ = kc.AppsV1().Deployments("default").Delete(cctx, smokeDeploy, metav1.DeleteOptions{})
+	r.waitGone(cctx, "deployment "+smokeDeploy, func() bool {
+		_, e := kc.AppsV1().Deployments("default").Get(cctx, smokeDeploy, metav1.GetOptions{})
+		return apierrors.IsNotFound(e)
+	})
+	r.waitGone(cctx, "smoke pods", func() bool {
+		pl, e := kc.CoreV1().Pods("default").List(cctx, metav1.ListOptions{LabelSelector: "app=" + smokeDeploy})
+		return e == nil && len(pl.Items) == 0
+	})
+
+	// 2. Service, then wait for the object (and thus the Octavia LB) to clear.
+	_ = kc.CoreV1().Services("default").Delete(cctx, smokeSvc, metav1.DeleteOptions{})
+	r.waitGone(cctx, "service "+smokeSvc+" (Octavia LB)", func() bool {
+		_, e := kc.CoreV1().Services("default").Get(cctx, smokeSvc, metav1.GetOptions{})
+		return apierrors.IsNotFound(e)
+	})
+
+	// 3. PVC, then wait for the PVC and its bound PV to be released.
+	var pvName string
+	if pvc, e := kc.CoreV1().PersistentVolumeClaims("default").Get(cctx, smokePVC, metav1.GetOptions{}); e == nil {
+		pvName = pvc.Spec.VolumeName
+	}
+	_ = kc.CoreV1().PersistentVolumeClaims("default").Delete(cctx, smokePVC, metav1.DeleteOptions{})
+	r.waitGone(cctx, "pvc "+smokePVC, func() bool {
+		_, e := kc.CoreV1().PersistentVolumeClaims("default").Get(cctx, smokePVC, metav1.GetOptions{})
+		return apierrors.IsNotFound(e)
+	})
+	if pvName != "" {
+		r.waitGone(cctx, "pv "+pvName, func() bool {
+			_, e := kc.CoreV1().PersistentVolumes().Get(cctx, pvName, metav1.GetOptions{})
+			return apierrors.IsNotFound(e)
+		})
+	}
+}
+
+// waitGone polls done() until it returns true or a bounded deadline passes,
+// logging (never failing) on timeout — teardown is best-effort.
+func (r *runner) waitGone(ctx context.Context, what string, done func() bool) {
+	deadline := time.Now().Add(4 * time.Minute)
+	for {
+		if done() {
+			return
+		}
+		if time.Now().After(deadline) {
+			r.log("cleanup: %s still present after wait (continuing)", what)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			r.log("cleanup: context done waiting for %s to clear", what)
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 // httpProbeOK does a single GET with a short timeout, returning nil only on a
