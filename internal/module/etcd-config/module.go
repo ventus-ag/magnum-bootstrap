@@ -807,13 +807,15 @@ func joinExistingCluster(cfg config.Config, executor *host.Executor, nodeIP, pro
 // IS the catch-up wait — etcd rejects promotion until the learner is in sync.
 func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, certDir, nodeIP, protocol string) ([]host.Change, error) {
 	myPeer := protocol + "://" + nodeIP + ":2380"
+	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
 	args := etcdctlArgs(lbEndpoint, certDir, cfg.Shared.TLSDisabled)
+	localArgs := etcdctlArgs(localEndpoint, certDir, cfg.Shared.TLSDisabled)
 
 	const attempts = 40
 	const delay = 3 * time.Second
 	var lastErr error
 	for i := 0; i < attempts; i++ {
-		out, err := runEtcdctl(executor, append(append([]string{}, args...), "member", "list")...)
+		members, err := listMembersPreferLB(executor, args, localArgs)
 		if err != nil {
 			// Cluster transiently unreachable (forming quorum, leader change).
 			lastErr = err
@@ -823,7 +825,7 @@ func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, cert
 			time.Sleep(delay)
 			continue
 		}
-		self, ok := selectSelf(parseMemberList(out), cfg.Shared.InstanceName, myPeer)
+		self, ok := selectSelf(members, cfg.Shared.InstanceName, myPeer)
 		switch promoteAction(self, ok) {
 		case promoteNoop:
 			// Not a member yet, or already a voter — nothing to do.
@@ -832,7 +834,16 @@ func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, cert
 			}
 			return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
 		case promoteDo:
-			_, perr := runEtcdctl(executor, append(append([]string{}, args...), "member", "promote", self.id)...)
+			// MemberPromote is one of the RPCs a learner does NOT serve, and
+			// the LB may route the call to the learner itself ("rpc not
+			// supported for learner"). Target a voter's client endpoint from
+			// the member list directly; the LB stays the fallback when no
+			// voter URL is parseable.
+			promoteArgs := args
+			if ve := voterClientEndpoint(members, self.id); ve != "" {
+				promoteArgs = etcdctlArgs(ve, certDir, cfg.Shared.TLSDisabled)
+			}
+			_, perr := runEtcdctl(executor, append(append([]string{}, promoteArgs...), "member", "promote", self.id)...)
 			if perr == nil {
 				if executor.Logger != nil {
 					executor.Logger.Infof("etcd: promoted learner %s (%s) to voter", cfg.Shared.InstanceName, self.id)
@@ -864,6 +875,32 @@ func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, cert
 		return nil, nil
 	}
 	return nil, fmt.Errorf("etcd: learner %s did not become a promotable voter after %d attempts: %w", cfg.Shared.InstanceName, attempts, lastErr)
+}
+
+// listMembersPreferLB lists cluster members via the LB, falling back to the
+// local endpoint when the LB call fails — the LB can route onto a learner (or
+// be down) while a learner still serves MemberList locally.
+func listMembersPreferLB(executor *host.Executor, lbArgs, localArgs []string) ([]etcdMember, error) {
+	out, err := runEtcdctl(executor, append(append([]string{}, lbArgs...), "member", "list")...)
+	if err != nil {
+		out, err = runEtcdctl(executor, append(append([]string{}, localArgs...), "member", "list")...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return parseMemberList(out), nil
+}
+
+// voterClientEndpoint returns the client URL of a started voting member other
+// than selfID, or "" when none is known.
+func voterClientEndpoint(members []etcdMember, selfID string) string {
+	for _, m := range members {
+		if m.id == selfID || m.isLearner || !m.started || m.clientURL == "" {
+			continue
+		}
+		return m.clientURL
+	}
+	return ""
 }
 
 // promoteHealthGate waits briefly for the (now promoted) local etcd to serve
@@ -932,6 +969,10 @@ func classifyPromoteErr(err error) promoteErrClass {
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "in sync with leader"):
+		return promoteRetry
+	case strings.Contains(msg, "rpc not supported for learner"):
+		// The promote call itself was routed onto a learner endpoint (LB
+		// round-robin) — the request never reached a voter; retry.
 		return promoteRetry
 	case strings.Contains(msg, "can only promote a learner member"):
 		// Bare form, without the in-sync suffix → already a voter.
@@ -1043,11 +1084,37 @@ func startWithExistingData(cfg config.Config, executor *host.Executor, nodeIP, p
 // the normal reboot/periodic path — and skipped entirely when the cluster (LB) is
 // unreachable.
 func promoteStrandedLearner(cfg config.Config, executor *host.Executor, lbEndpoint, certDir, nodeIP, protocol string, lbOK bool, changes []host.Change) ([]host.Change, error) {
-	if !lbOK {
+	if !lbOK && !selfIsLearnerLocally(cfg, executor, certDir, nodeIP, protocol) {
+		// LB unreachable and (as far as the local endpoint can tell) we are
+		// not a learner — nothing to promote; skip the 2-minute wait loop.
+		//
+		// The !lbOK skip must NOT be unconditional: the LB health probe is a
+		// single request that the LB may route to THE LEARNER ITSELF, which
+		// fails it with "rpc not supported for learner" — so an un-promoted
+		// learner makes the LB look down, an "unhealthy" LB skips promotion,
+		// and the node deadlocks as a learner forever (its apiserver serving
+		// learner errors the whole time). A learner CAN answer MemberList on
+		// its own client endpoint, so ask locally before giving up.
 		return changes, nil
 	}
 	pc, err := ensurePromoted(cfg, executor, lbEndpoint, certDir, nodeIP, protocol)
 	return append(changes, pc...), err
+}
+
+// selfIsLearnerLocally asks this node's own etcd endpoint whether it is a
+// learner. MemberList is one of the RPCs a learner serves, so this works even
+// when the node cannot pass quorum health checks. Any error means "cannot
+// tell" → false.
+func selfIsLearnerLocally(cfg config.Config, executor *host.Executor, certDir, nodeIP, protocol string) bool {
+	localEndpoint := fmt.Sprintf("%s://%s:2379", protocol, nodeIP)
+	args := etcdctlArgs(localEndpoint, certDir, cfg.Shared.TLSDisabled)
+	out, err := runEtcdctl(executor, append(args, "member", "list")...)
+	if err != nil {
+		return false
+	}
+	myPeer := protocol + "://" + nodeIP + ":2380"
+	self, ok := selectSelf(parseMemberList(out), cfg.Shared.InstanceName, myPeer)
+	return ok && self.isLearner
 }
 
 // memberAddWithRetry runs `etcdctl member add` for this node, retrying on the
@@ -1207,6 +1274,7 @@ type etcdMember struct {
 	id        string
 	name      string
 	peerURL   string
+	clientURL string
 	started   bool
 	isLearner bool
 }
@@ -1225,13 +1293,17 @@ func parseMemberList(out string) []etcdMember {
 		if len(fields) < 4 {
 			continue
 		}
-		ms = append(ms, etcdMember{
+		m := etcdMember{
 			id:        strings.TrimSpace(fields[0]),
 			name:      strings.TrimSpace(fields[2]),
 			peerURL:   strings.TrimSpace(fields[3]),
 			started:   len(fields) >= 2 && strings.TrimSpace(fields[1]) == "started",
 			isLearner: len(fields) >= 6 && strings.TrimSpace(fields[5]) == "true",
-		})
+		}
+		if len(fields) >= 5 {
+			m.clientURL = strings.TrimSpace(fields[4])
+		}
+		ms = append(ms, m)
 	}
 	return ms
 }

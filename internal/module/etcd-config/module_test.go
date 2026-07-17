@@ -276,6 +276,7 @@ func TestClassifyPromoteErr(t *testing.T) {
 		{"member not found is success", errString("etcdserver: member not found"), promoteAlreadyVoter},
 		{"transient no leader retries", errString("rpc error: code = Unavailable: no leader"), promoteRetry},
 		{"context deadline retries", errString("context deadline exceeded"), promoteRetry},
+		{"routed onto learner retries", errString("etcdserver: rpc not supported for learner"), promoteRetry},
 		{"cert error is fatal", errString("etcdserver: invalid certificate"), promoteFatal},
 	}
 	for _, c := range cases {
@@ -284,6 +285,35 @@ func TestClassifyPromoteErr(t *testing.T) {
 				t.Fatalf("classifyPromoteErr(%v) = %d, want %d", c.err, got, c.want)
 			}
 		})
+	}
+}
+
+func TestParseMemberListClientURL(t *testing.T) {
+	ms := parseMemberList("aaaa, started, kube-x-master-0, https://10.0.0.1:2380, https://10.0.0.1:2379, false")
+	if len(ms) != 1 || ms[0].clientURL != "https://10.0.0.1:2379" {
+		t.Fatalf("clientURL mis-parsed: %+v", ms)
+	}
+	// 4-field row: no clientURL, must not panic.
+	ms = parseMemberList("bbbb, unstarted, , https://10.0.0.2:2380")
+	if len(ms) != 1 || ms[0].clientURL != "" {
+		t.Fatalf("missing clientURL must default to empty: %+v", ms)
+	}
+}
+
+func TestVoterClientEndpoint(t *testing.T) {
+	members := []etcdMember{
+		{id: "self", name: "m2", clientURL: "https://10.0.0.3:2379", started: true, isLearner: true},
+		{id: "unstarted", name: "", clientURL: "https://10.0.0.4:2379", started: false},
+		{id: "learner2", name: "m3", clientURL: "https://10.0.0.5:2379", started: true, isLearner: true},
+		{id: "voter", name: "m0", clientURL: "https://10.0.0.1:2379", started: true},
+	}
+	// Must skip self, unstarted and learners — only the started voter qualifies.
+	if got := voterClientEndpoint(members, "self"); got != "https://10.0.0.1:2379" {
+		t.Fatalf("voterClientEndpoint = %q, want the started voter", got)
+	}
+	// No voter at all → empty (caller falls back to the LB).
+	if got := voterClientEndpoint(members[:3], "self"); got != "" {
+		t.Fatalf("expected empty endpoint with no voters, got %q", got)
 	}
 }
 
