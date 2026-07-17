@@ -107,11 +107,15 @@ on:
 permissions:
   contents: read
 
-# Never run two billed cloud clusters concurrently. Queue rather than cancel:
-# teardown is an `always()` step, and cancelling mid-run could orphan billed
-# resources before it gets a chance to clean up.
+# Serialize per SCENARIO, not globally: each scenario uses its own
+# CLUSTER_NAME (scenario-tagged) so distinct scenarios never touch the same
+# billed cluster and are safe to run in parallel — this lets ci.yaml's
+# smoke/multimaster/multimaster-scale matrix legs run concurrently instead of
+# queuing behind one global group. Two runs of the SAME scenario still serialize
+# (same CLUSTER_NAME prefix). Queue rather than cancel: teardown is an `always()`
+# step, and cancelling mid-run could orphan billed resources before cleanup.
 concurrency:
-  group: e2e-openstack
+  group: e2e-openstack-${{ inputs.scenario || 'all' }}
   cancel-in-progress: false
 
 jobs:

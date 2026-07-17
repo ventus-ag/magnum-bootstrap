@@ -73,10 +73,16 @@ WORKER_CPUS="${WORKER_CPUS:-1}"
 # from the CI run id; else 0. (A single self-hosted runner runs one job at a
 # time, so concurrency only happens with multiple runner instances per host —
 # the slot makes that safe.)
+# E2E_SLOT_OFFSET spreads concurrent matrix legs of the SAME CI run onto distinct
+# slots: they share one GITHUB_RUN_ID, so without an offset every leg derives the
+# identical slot and collides on subnet/mcast/host-ports when run in parallel on
+# one host (multiple runner agents). Offsets 0/1/2 map to +0/+50/+100 → three
+# residues that are always distinct mod 150, while the run-id base still varies
+# the slot across separate pipelines.
 SLOT="${E2E_SLOT:-}"
 if [ -z "$SLOT" ]; then
-  if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0}) % 150 ))
-  else SLOT=0; fi
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0} + ${E2E_SLOT_OFFSET:-0} * 50) % 150 ))
+  else SLOT=$(( (${E2E_SLOT_OFFSET:-0} * 50) % 150 )); fi
 fi
 # Unique /24, unique mcast group+port, unique SSH port window per slot.
 CNET="${CNET:-192.168.$((100 + SLOT % 150))}"
