@@ -57,7 +57,13 @@ install_pkgs() {
   local pm="$1"; shift
   log "installing via $pm: $*"
   case "$pm" in
-    apt-get) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    # DPkg::Lock::Timeout makes apt WAIT for the dpkg/lists lock instead of
+    # failing immediately. The CI runs several e2e jobs concurrently on one
+    # shared runner box, so two jobs can hit `apt-get` at the same instant
+    # ("E: Could not get lock /var/lib/apt/lists/lock"); without the timeout
+    # the loser aborts the whole provisioning step. 600s comfortably covers a
+    # sibling job's install.
+    apt-get) apt-get -o DPkg::Lock::Timeout=600 update -y && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y "$@" ;;
     dnf|yum) "$pm" install -y "$@" ;;
     pacman)  pacman -Sy --needed --noconfirm "$@" ;;
     zypper)  zypper --non-interactive install -y "$@" ;;
