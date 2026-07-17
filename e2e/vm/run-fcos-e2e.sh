@@ -277,10 +277,24 @@ gscp() { local p="$1"; shift; scp "${SSHBASE[@]}" -P "$p" "$@"; }
 cleanup() {
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    err "failure (rc=$rc) — collecting master diagnostics"
-    gssh "$(ssh_port master)" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null' 2>/dev/null || true
-    # Also dump the cluster's nodes/pods so a failure shows what did/didn't come up.
+    err "failure (rc=$rc) — collecting diagnostics from every node"
+    # Per-node reconciler state: a multi-master join failure lives on master-1/2
+    # and a worker addon crash on the minion — master-0's log alone hides both.
+    local _dn _di
+    _dn="master"
+    for _di in $(seq 1 $((${MASTERS:-1} - 1))); do _dn="$_dn master$_di"; done
+    for _di in $(seq 0 $((${WORKERS:-0} - 1))); do _dn="$_dn worker$_di"; done
+    for _di in $_dn; do
+      err "--- node $_di: reconciler-last-run.json + magnum-reconcile.log tail ---"
+      gssh "$(ssh_port "$_di")" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null; echo "--- etcd/kubelet unit state ---"; systemctl is-active etcd kubelet containerd 2>/dev/null' 2>/dev/null || true
+    done
+    # Cluster view incl. problem-pod events + current/previous logs.
     gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" 2>/dev/null || true
+    # Multi-master: the etcd member table (voter vs learner) is the first thing
+    # a join wedge needs answered.
+    if multimaster; then
+      gssh "$(ssh_port master)" '/usr/local/bin/etcdctl --endpoints=https://127.0.0.1:2379 --command-timeout=5s --cacert=/etc/etcd/certs/ca.crt --cert=/etc/etcd/certs/server.crt --key=/etc/etcd/certs/server.key member list -w table' 2>/dev/null || true
+    fi
   fi
   if [ "$KEEP_VM" = "1" ]; then
     log "KEEP_VM=1 — leaving VMs up (master: ssh -p $(ssh_port master) -i $WORKDIR/id_ed25519 root@127.0.0.1)"
