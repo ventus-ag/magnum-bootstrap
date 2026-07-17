@@ -286,7 +286,7 @@ cleanup() {
     for _di in $(seq 0 $((${WORKERS:-0} - 1))); do _dn="$_dn worker$_di"; done
     for _di in $_dn; do
       err "--- node $_di: reconciler-last-run.json + magnum-reconcile.log tail ---"
-      gssh "$(ssh_port "$_di")" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null; echo "--- etcd/kubelet unit state ---"; systemctl is-active etcd kubelet containerd 2>/dev/null' 2>/dev/null || true
+      gssh "$(ssh_port "$_di")" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null; echo "--- unit states (etcd kubelet containerd kube-proxy) ---"; systemctl is-active etcd kubelet containerd kube-proxy 2>/dev/null; echo "--- kube-proxy journal tail ---"; journalctl -u kube-proxy --no-pager -o short-iso 2>/dev/null | tail -60; echo "--- kubelet journal errors ---"; journalctl -u kubelet --no-pager -o short-iso 2>/dev/null | grep -E " E[0-9]{4} " | tail -40; echo "--- podman containers ---"; podman ps -a 2>/dev/null' 2>/dev/null || true
     done
     # Cluster view incl. problem-pod events + current/previous logs.
     gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" 2>/dev/null || true
