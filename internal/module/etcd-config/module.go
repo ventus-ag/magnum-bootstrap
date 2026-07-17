@@ -825,43 +825,63 @@ func ensurePromoted(cfg config.Config, executor *host.Executor, lbEndpoint, cert
 			time.Sleep(delay)
 			continue
 		}
-		self, ok := selectSelf(members, cfg.Shared.InstanceName, myPeer)
-		switch promoteAction(self, ok) {
-		case promoteNoop:
-			// Not a member yet, or already a voter — nothing to do.
-			if ok && !self.isLearner && executor.Logger != nil {
+		self, ok := selectSelfByPeer(members, myPeer)
+		if !ok {
+			// Our own member row is not visible via this MemberList yet. Two
+			// transient causes right after our join: (a) the LB routed this
+			// call to a follower that has not applied the member-add conf
+			// change, or (b) our just-added learner is still "unstarted" and so
+			// has an EMPTY NAME in the member list. We must NOT declare success
+			// here: skipping promotion strands us as a learner forever, and a
+			// learner's apiserver answers every request with "etcdserver: rpc
+			// not supported for learner" so the health phase never passes. Keep
+			// waiting — this is the multi-master batch-create wedge fix (a
+			// name+peer match missed the empty-name learner row and returned a
+			// false "not a member, nothing to do").
+			lastErr = fmt.Errorf("etcd: member %s (%s) not yet visible in member list", cfg.Shared.InstanceName, myPeer)
+			if executor.Logger != nil {
+				executor.Logger.Warnf("etcd: member %s not yet visible in member list (attempt %d/%d), retrying in %s", cfg.Shared.InstanceName, i+1, attempts, delay)
+			}
+			if !executor.Apply {
+				break
+			}
+			time.Sleep(delay)
+			continue
+		}
+		if !self.isLearner {
+			// Already a voter — nothing to do (normal reboot / periodic path).
+			if executor.Logger != nil {
 				executor.Logger.Infof("etcd: member %s already a voter; no promotion needed", cfg.Shared.InstanceName)
 			}
 			return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
-		case promoteDo:
-			// MemberPromote is one of the RPCs a learner does NOT serve, and
-			// the LB may route the call to the learner itself ("rpc not
-			// supported for learner"). Target a voter's client endpoint from
-			// the member list directly; the LB stays the fallback when no
-			// voter URL is parseable.
-			promoteArgs := args
-			if ve := voterClientEndpoint(members, self.id); ve != "" {
-				promoteArgs = etcdctlArgs(ve, certDir, cfg.Shared.TLSDisabled)
+		}
+		// self is a learner — promote it once it is in sync with the leader.
+		// MemberPromote is one of the RPCs a learner does NOT serve, and the LB
+		// may route the call to the learner itself ("rpc not supported for
+		// learner"). Target a voter's client endpoint from the member list
+		// directly; the LB stays the fallback when no voter URL is parseable.
+		promoteArgs := args
+		if ve := voterClientEndpoint(members, self.id); ve != "" {
+			promoteArgs = etcdctlArgs(ve, certDir, cfg.Shared.TLSDisabled)
+		}
+		_, perr := runEtcdctl(executor, append(append([]string{}, promoteArgs...), "member", "promote", self.id)...)
+		if perr == nil {
+			if executor.Logger != nil {
+				executor.Logger.Infof("etcd: promoted learner %s (%s) to voter", cfg.Shared.InstanceName, self.id)
 			}
-			_, perr := runEtcdctl(executor, append(append([]string{}, promoteArgs...), "member", "promote", self.id)...)
-			if perr == nil {
-				if executor.Logger != nil {
-					executor.Logger.Infof("etcd: promoted learner %s (%s) to voter", cfg.Shared.InstanceName, self.id)
-				}
-				return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
-			}
-			lastErr = perr
-			switch classifyPromoteErr(perr) {
-			case promoteAlreadyVoter:
-				// Raced to voter between list and promote — success.
-				return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
-			case promoteFatal:
-				return nil, fmt.Errorf("etcd promote learner %s: %w", cfg.Shared.InstanceName, perr)
-			default:
-				// promoteRetry — learner not yet in sync with leader; wait.
-				if executor.Logger != nil {
-					executor.Logger.Warnf("etcd: learner %s not yet in sync (attempt %d/%d), retrying in %s", cfg.Shared.InstanceName, i+1, attempts, delay)
-				}
+			return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
+		}
+		lastErr = perr
+		switch classifyPromoteErr(perr) {
+		case promoteAlreadyVoter:
+			// Raced to voter between list and promote — success.
+			return promoteHealthGate(executor, nodeIP, protocol, certDir, cfg.Shared.TLSDisabled), nil
+		case promoteFatal:
+			return nil, fmt.Errorf("etcd promote learner %s: %w", cfg.Shared.InstanceName, perr)
+		default:
+			// promoteRetry — learner not yet in sync with leader; wait.
+			if executor.Logger != nil {
+				executor.Logger.Warnf("etcd: learner %s not yet in sync (attempt %d/%d), retrying in %s", cfg.Shared.InstanceName, i+1, attempts, delay)
 			}
 		}
 		if !executor.Apply {
@@ -926,6 +946,9 @@ func promoteHealthGate(executor *host.Executor, nodeIP, protocol, certDir string
 
 // selectSelf finds this node's own member row by exact name AND peer URL. The
 // peer-URL match guards against a stale same-name entry with a different IP.
+// Use this only where the member is known to be started (day-2 maintenance):
+// a just-added/unstarted member has an empty name and would be missed — see
+// selectSelfByPeer.
 func selectSelf(members []etcdMember, instanceName, myPeer string) (etcdMember, bool) {
 	for _, m := range members {
 		if m.name == instanceName && m.peerURL == myPeer {
@@ -935,18 +958,21 @@ func selectSelf(members []etcdMember, instanceName, myPeer string) (etcdMember, 
 	return etcdMember{}, false
 }
 
-type promoteDecision int
-
-const (
-	promoteNoop promoteDecision = iota // not a member, or already a voter
-	promoteDo                          // a learner that should be promoted
-)
-
-func promoteAction(self etcdMember, found bool) promoteDecision {
-	if !found || !self.isLearner {
-		return promoteNoop
+// selectSelfByPeer finds this node's own member row by peer URL alone. peerURL
+// is the stable, unique-per-node identity fixed at member-add time (IP:2380),
+// whereas the NAME is empty for a member that is still "unstarted" — exactly the
+// state of a learner in the window between `member add --learner` and the
+// learner finishing its join. Promotion logic must find itself in that window,
+// so it matches on peerURL and never requires the name. removeStaleSelfMembers
+// has already dropped any stale same-name/different-IP row, and no two members
+// can share a peer URL, so this is both sufficient and safe.
+func selectSelfByPeer(members []etcdMember, myPeer string) (etcdMember, bool) {
+	for _, m := range members {
+		if m.peerURL == myPeer {
+			return m, true
+		}
 	}
-	return promoteDo
+	return etcdMember{}, false
 }
 
 type promoteErrClass int
@@ -1113,7 +1139,9 @@ func selfIsLearnerLocally(cfg config.Config, executor *host.Executor, certDir, n
 		return false
 	}
 	myPeer := protocol + "://" + nodeIP + ":2380"
-	self, ok := selectSelf(parseMemberList(out), cfg.Shared.InstanceName, myPeer)
+	// Match by peer URL (not name): a learner that has not finished starting is
+	// "unstarted" with an empty name but still carries its peer URL.
+	self, ok := selectSelfByPeer(parseMemberList(out), myPeer)
 	return ok && self.isLearner
 }
 
