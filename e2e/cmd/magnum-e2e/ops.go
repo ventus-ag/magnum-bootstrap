@@ -219,12 +219,19 @@ var scenarios = map[string]scenarioDef{
 	// sonobuoy — create a cluster and run a Sonobuoy conformance test against it.
 	// Mode is SONOBUOY_MODE (default "quick" for the daily/PR sweep; the weekly
 	// cron sets "certified-conformance"). The conformance workflow runs one leg
-	// per Kubernetes version (matrix), each its own cluster + Actions job, so the
-	// scenario itself is a single-cluster 1m/1w shape. The create version comes
-	// from CLUSTER_TEMPLATE (+ optional KUBE_TAG override for versions newer than
-	// any pinned template — see resolveConformanceLegs).
+	// per Kubernetes version (matrix), each its own cluster + Actions job. The
+	// create version comes from CLUSTER_TEMPLATE (+ optional KUBE_TAG override for
+	// versions newer than any pinned template — see resolveConformanceLegs).
+	//
+	// TWO workers: Kubernetes conformance REQUIRES at least two untainted
+	// (schedulable) nodes — the master is tainted, so 1 worker fails
+	// "[sig-architecture] ... should have at least two untainted nodes"
+	// ("Conformance requires at least two nodes") plus a cluster of DNS/DaemonSet
+	// tests that need to schedule across two nodes (and relieves the single-node
+	// contention that timed the DNS log-fetches out). Confirmed by the first full
+	// certified-conformance sweep (6-7 identical failures per version on 1m/1w).
 	"sonobuoy": {
-		masters: 1, workers: 1,
+		masters: 1, workers: 2,
 		ops: "sonobuoy",
 	},
 	// component-toggle — flip cluster addon labels on a live cluster and assert the
