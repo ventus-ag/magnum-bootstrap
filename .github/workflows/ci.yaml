@@ -88,6 +88,7 @@ on:
           - ubuntu-nodepool
           - component-toggle
           - version-ladder
+          - sonobuoy
   schedule:
     - cron: "0 2 * * *" # nightly 02:00 UTC
 
@@ -512,7 +513,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: ${{ fromJSON(github.event_name == 'schedule' && '["all"]' || (github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.os_scenario) || '["smoke","multimaster","multimaster-scale"]')) }}
+        scenario: ${{ fromJSON(github.event_name == 'schedule' && '["all"]' || (github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.os_scenario) || '["smoke","multimaster","multimaster-scale","sonobuoy"]')) }}
     uses: ./.github/workflows/e2e-openstack.yaml
     secrets: inherit
     with:

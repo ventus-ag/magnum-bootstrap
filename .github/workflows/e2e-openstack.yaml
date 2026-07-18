@@ -55,6 +55,23 @@ on:
         description: Skip the post-rotation add-node + SA-consistency check (legacy)
         type: boolean
         default: false
+      # ── Conformance matrix knobs (conformance.yaml passes these per version) ──
+      cluster_template:
+        description: "Override the create template (else vars.MAGNUM_CLUSTER_TEMPLATE). Used by the conformance matrix to pin a version."
+        type: string
+        default: ""
+      kube_tag:
+        description: "kube_tag label override merged onto the template (test a version newer than any pinned template)."
+        type: string
+        default: ""
+      sonobuoy_mode:
+        description: "Sonobuoy mode for the `sonobuoy` scenario: quick | non-disruptive-conformance | certified-conformance."
+        type: string
+        default: ""
+      name_suffix:
+        description: "Suffix appended to CLUSTER_NAME + concurrency group + artifact name so parallel matrix legs (per version) never collide."
+        type: string
+        default: ""
     # Auth secrets are forwarded by the caller via `secrets: inherit`, so they
     # need no explicit redeclaration here.
   workflow_dispatch:
@@ -73,6 +90,7 @@ on:
           - ubuntu-nodepool
           - component-toggle
           - version-ladder
+          - sonobuoy
       ops:
         description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
         type: string
@@ -115,7 +133,9 @@ permissions:
 # (same CLUSTER_NAME prefix). Queue rather than cancel: teardown is an `always()`
 # step, and cancelling mid-run could orphan billed resources before cleanup.
 concurrency:
-  group: e2e-openstack-${{ inputs.scenario || 'all' }}
+  # Include name_suffix so the conformance matrix's per-version legs (all
+  # scenario=sonobuoy) run in parallel instead of serializing behind one group.
+  group: e2e-openstack-${{ inputs.scenario || 'all' }}${{ inputs.name_suffix && format('-{0}', inputs.name_suffix) || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -152,7 +172,13 @@ jobs:
       OS_PROJECT_DOMAIN_NAME: ${{ vars.OS_PROJECT_DOMAIN_NAME }}
       # Magnum run config. Templates are version-pinned (template name == k8s
       # version), so the version comes from the template, not a kube_tag label.
-      CLUSTER_TEMPLATE: ${{ vars.MAGNUM_CLUSTER_TEMPLATE }}
+      # cluster_template input (conformance matrix) overrides the repo default.
+      CLUSTER_TEMPLATE: ${{ inputs.cluster_template || vars.MAGNUM_CLUSTER_TEMPLATE }}
+      # kube_tag override (conformance): test a version newer than any pinned
+      # template by merging kube_tag onto an existing template. Empty otherwise.
+      KUBE_TAG: ${{ inputs.kube_tag }}
+      # Sonobuoy mode for the `sonobuoy` scenario (empty => driver default quick).
+      SONOBUOY_MODE: ${{ inputs.sonobuoy_mode }}
       UPGRADE_TEMPLATE: ${{ vars.MAGNUM_UPGRADE_TEMPLATE }}
       # version-ladder upgrade walk (ordered template list). Empty => the driver's
       # built-in 1.20→1.36 ladder (used when SCENARIO=version-ladder). Ignored by
@@ -166,7 +192,7 @@ jobs:
       SSH_PRIVATE_KEY: ${{ vars.MAGNUM_SSH_PRIVATE_KEY }}
       # Scenario-tagged name keeps sequential matrix runs + teardown isolated.
       # Fallback to 'all' so the weekly schedule (no inputs) gets a clean name.
-      CLUSTER_NAME: recon-e2e-${{ inputs.scenario || 'all' }}-${{ github.run_id }}
+      CLUSTER_NAME: recon-e2e-${{ inputs.scenario || 'all' }}${{ inputs.name_suffix && format('-{0}', inputs.name_suffix) || '' }}-${{ github.run_id }}
       # Scenario preset (shape + op chain) and optional explicit op-chain override.
       # Schedule events carry no inputs, so default to the full 'all' sweep.
       SCENARIO: ${{ inputs.scenario || 'all' }}
@@ -227,6 +253,23 @@ jobs:
           chmod +x "${{ runner.temp }}/prebuilt/magnum-e2e"
           "${{ runner.temp }}/prebuilt/magnum-e2e" -preflight
 
+      # Sonobuoy CLI is only needed by the `sonobuoy` scenario. Install it here so
+      # the driver finds it via SONOBUOY_BIN; the conformance image matching the
+      # cluster's Kubernetes version is auto-selected by sonobuoy at run time.
+      - name: Install Sonobuoy
+        if: ${{ inputs.scenario == 'sonobuoy' }}
+        env:
+          SONOBUOY_VERSION: ${{ vars.SONOBUOY_VERSION || '0.57.3' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/sonobuoy"
+          url="https://github.com/vmware-tanzu/sonobuoy/releases/download/v${SONOBUOY_VERSION}/sonobuoy_${SONOBUOY_VERSION}_linux_amd64.tar.gz"
+          echo "downloading ${url}"
+          curl -fsSL "${url}" -o "${{ runner.temp }}/sonobuoy.tar.gz"
+          tar -xzf "${{ runner.temp }}/sonobuoy.tar.gz" -C "${{ runner.temp }}/sonobuoy" sonobuoy
+          chmod +x "${{ runner.temp }}/sonobuoy/sonobuoy"
+          "${{ runner.temp }}/sonobuoy/sonobuoy" version || true
+
       - name: Run OpenStack Magnum e2e
         # Stage the prebuilt reconciler into Swift unless an explicit
         # RECONCILER_BINARY_URL override is configured.
@@ -236,13 +279,15 @@ jobs:
           # here (node conditions, Warning events, logs of pods that won't start),
           # collected mid-run before teardown. Uploaded as an artifact below.
           DIAG_DIR: ${{ github.workspace }}/e2e-diagnostics
+          # Sonobuoy binary path (only the sonobuoy scenario installs/uses it).
+          SONOBUOY_BIN: ${{ inputs.scenario == 'sonobuoy' && format('{0}/sonobuoy/sonobuoy', runner.temp) || '' }}
         run: "${{ runner.temp }}/prebuilt/magnum-e2e"
 
       - name: Upload node diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-node-diagnostics-${{ inputs.scenario || 'all' }}-${{ github.run_id }}
+          name: e2e-node-diagnostics-${{ inputs.scenario || 'all' }}${{ inputs.name_suffix && format('-{0}', inputs.name_suffix) || '' }}-${{ github.run_id }}
           path: ${{ github.workspace }}/e2e-diagnostics
           if-no-files-found: ignore
           retention-days: 14

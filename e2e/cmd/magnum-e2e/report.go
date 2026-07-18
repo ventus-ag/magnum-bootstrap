@@ -32,6 +32,7 @@ var opDescriptions = map[string]string{
 	"upgrade":               "rolling k8s upgrade to the target version",
 	"cloud-smoke":           "OCCM LB serves HTTP 200 + Cinder PVC create/resize",
 	"autoscale":             "cluster-autoscaler scales workers up >2 then back down",
+	"sonobuoy":              "Sonobuoy conformance (SONOBUOY_MODE, default quick)",
 	"ca-rotate":             "rotate the cluster CA (dual-CA, zero-downtime)",
 	"post-rotate":           "add a node after CA rotation (SA-key trust)",
 	"verify-sa":             "service-account key consistency across nodes",

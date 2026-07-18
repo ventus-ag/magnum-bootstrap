@@ -96,6 +96,8 @@ var (
 	flagList          = flag.Bool("list", false, "list cluster templates + keypairs visible to the project, then exit")
 	flagClusters      = flag.Bool("clusters", false, "list all Magnum clusters + their status (diagnostic), then exit")
 	flagStageSelftest = flag.Bool("stage-selftest", false, "stage -bootstrap-binary into Swift, fetch it back anonymously, verify, unstage, then exit")
+	flagResolveConf   = flag.Int("resolve-conformance-matrix", 0, "resolve the N newest Kubernetes versions into a Sonobuoy conformance matrix (JSON legs) and exit; writes to -conformance-out when set")
+	flagConfOut       = flag.String("conformance-out", "", "file to write the -resolve-conformance-matrix JSON to (keeps it off stdout, which carries init logs)")
 )
 
 func envOr(key, def string) string {
@@ -246,6 +248,11 @@ func main() {
 	}
 
 	switch {
+	case *flagResolveConf > 0:
+		if err := r.resolveConformanceMatrix(ctx, *flagResolveConf, *flagConfOut); err != nil {
+			die("resolve-conformance-matrix: %v", err)
+		}
+		return
 	case *flagList:
 		if err := r.listResources(ctx); err != nil {
 			die("list: %v", err)
