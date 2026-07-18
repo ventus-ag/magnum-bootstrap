@@ -408,6 +408,23 @@ cmd_dump_state() {
   kc get pods -A -o wide 2>&1 | sed 's/^/    | /' || true
   echo "    --- helm releases ---"
   KUBECONFIG="$ADMIN_KUBECONFIG" "$(helm_bin)" list -A 2>&1 | sed 's/^/    | /' || true
+  # Problem pods: anything not Running/Completed, or with restarts. A crash-
+  # looping addon (e.g. flannel on one node) is otherwise a black box in CI —
+  # the pod listing shows "Error" but never WHY. Dump describe-events plus
+  # current AND previous container logs, bounded so a wide outage can't flood
+  # the harness log.
+  echo "    --- problem pods: events + logs ---"
+  kc get pods -A --no-headers 2>/dev/null \
+    | awk '$4 != "Running" && $4 != "Completed" && $4 != "Succeeded" || $5+0 > 0 {print $1" "$2}' \
+    | head -10 | while read -r ns pod; do
+      [ -n "$pod" ] || continue
+      echo "    | ===== $ns/$pod ====="
+      kc describe pod "$pod" -n "$ns" 2>&1 | sed -n '/^Events:/,$p' | tail -15 | sed 's/^/    | /' || true
+      echo "    | ----- logs (current) -----"
+      kc logs "$pod" -n "$ns" --all-containers --tail=60 2>&1 | sed 's/^/    | /' || true
+      echo "    | ----- logs (previous attempt) -----"
+      kc logs "$pod" -n "$ns" --all-containers --previous --tail=60 2>&1 | sed 's/^/    | /' || true
+    done
 }
 
 # cmd_kubelet_version [node] — print a node's reported kubelet version (defaults

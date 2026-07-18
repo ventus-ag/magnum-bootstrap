@@ -73,10 +73,16 @@ WORKER_CPUS="${WORKER_CPUS:-1}"
 # from the CI run id; else 0. (A single self-hosted runner runs one job at a
 # time, so concurrency only happens with multiple runner instances per host —
 # the slot makes that safe.)
+# E2E_SLOT_OFFSET spreads concurrent matrix legs of the SAME CI run onto distinct
+# slots: they share one GITHUB_RUN_ID, so without an offset every leg derives the
+# identical slot and collides on subnet/mcast/host-ports when run in parallel on
+# one host (multiple runner agents). Offsets 0/1/2 map to +0/+50/+100 → three
+# residues that are always distinct mod 150, while the run-id base still varies
+# the slot across separate pipelines.
 SLOT="${E2E_SLOT:-}"
 if [ -z "$SLOT" ]; then
-  if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0}) % 150 ))
-  else SLOT=0; fi
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0} + ${E2E_SLOT_OFFSET:-0} * 50) % 150 ))
+  else SLOT=$(( (${E2E_SLOT_OFFSET:-0} * 50) % 150 )); fi
 fi
 # Unique /24, unique mcast group+port, unique SSH port window per slot.
 CNET="${CNET:-192.168.$((100 + SLOT % 150))}"
@@ -277,10 +283,24 @@ gscp() { local p="$1"; shift; scp "${SSHBASE[@]}" -P "$p" "$@"; }
 cleanup() {
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    err "failure (rc=$rc) — collecting master diagnostics"
-    gssh "$(ssh_port master)" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null' 2>/dev/null || true
-    # Also dump the cluster's nodes/pods so a failure shows what did/didn't come up.
+    err "failure (rc=$rc) — collecting diagnostics from every node"
+    # Per-node reconciler state: a multi-master join failure lives on master-1/2
+    # and a worker addon crash on the minion — master-0's log alone hides both.
+    local _dn _di
+    _dn="master"
+    for _di in $(seq 1 $((${MASTERS:-1} - 1))); do _dn="$_dn master$_di"; done
+    for _di in $(seq 0 $((${WORKERS:-0} - 1))); do _dn="$_dn worker$_di"; done
+    for _di in $_dn; do
+      err "--- node $_di: reconciler-last-run.json + magnum-reconcile.log tail ---"
+      gssh "$(ssh_port "$_di")" 'cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null; echo; tail -120 /var/log/magnum-reconcile.log 2>/dev/null; echo "--- unit states (etcd kubelet containerd kube-proxy) ---"; systemctl is-active etcd kubelet containerd kube-proxy 2>/dev/null; echo "--- kube-proxy journal tail ---"; journalctl -u kube-proxy --no-pager -o short-iso 2>/dev/null | tail -60; echo "--- kubelet journal errors ---"; journalctl -u kubelet --no-pager -o short-iso 2>/dev/null | grep -E " E[0-9]{4} " | tail -40; echo "--- podman containers ---"; podman ps -a 2>/dev/null' 2>/dev/null || true
+    done
+    # Cluster view incl. problem-pod events + current/previous logs.
     gssh "$(ssh_port master)" "$GUEST_E2E_DIR/guest-run.sh dump-state" 2>/dev/null || true
+    # Multi-master: the etcd member table (voter vs learner) is the first thing
+    # a join wedge needs answered.
+    if multimaster; then
+      gssh "$(ssh_port master)" '/usr/local/bin/etcdctl --endpoints=https://127.0.0.1:2379 --command-timeout=5s --cacert=/etc/etcd/certs/ca.crt --cert=/etc/etcd/certs/server.crt --key=/etc/etcd/certs/server.key member list -w table' 2>/dev/null || true
+    fi
   fi
   if [ "$KEEP_VM" = "1" ]; then
     log "KEEP_VM=1 — leaving VMs up (master: ssh -p $(ssh_port master) -i $WORKDIR/id_ed25519 root@127.0.0.1)"

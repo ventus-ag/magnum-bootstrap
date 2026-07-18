@@ -276,6 +276,7 @@ func TestClassifyPromoteErr(t *testing.T) {
 		{"member not found is success", errString("etcdserver: member not found"), promoteAlreadyVoter},
 		{"transient no leader retries", errString("rpc error: code = Unavailable: no leader"), promoteRetry},
 		{"context deadline retries", errString("context deadline exceeded"), promoteRetry},
+		{"routed onto learner retries", errString("etcdserver: rpc not supported for learner"), promoteRetry},
 		{"cert error is fatal", errString("etcdserver: invalid certificate"), promoteFatal},
 	}
 	for _, c := range cases {
@@ -287,7 +288,36 @@ func TestClassifyPromoteErr(t *testing.T) {
 	}
 }
 
-func TestSelectSelfAndPromoteAction(t *testing.T) {
+func TestParseMemberListClientURL(t *testing.T) {
+	ms := parseMemberList("aaaa, started, kube-x-master-0, https://10.0.0.1:2380, https://10.0.0.1:2379, false")
+	if len(ms) != 1 || ms[0].clientURL != "https://10.0.0.1:2379" {
+		t.Fatalf("clientURL mis-parsed: %+v", ms)
+	}
+	// 4-field row: no clientURL, must not panic.
+	ms = parseMemberList("bbbb, unstarted, , https://10.0.0.2:2380")
+	if len(ms) != 1 || ms[0].clientURL != "" {
+		t.Fatalf("missing clientURL must default to empty: %+v", ms)
+	}
+}
+
+func TestVoterClientEndpoint(t *testing.T) {
+	members := []etcdMember{
+		{id: "self", name: "m2", clientURL: "https://10.0.0.3:2379", started: true, isLearner: true},
+		{id: "unstarted", name: "", clientURL: "https://10.0.0.4:2379", started: false},
+		{id: "learner2", name: "m3", clientURL: "https://10.0.0.5:2379", started: true, isLearner: true},
+		{id: "voter", name: "m0", clientURL: "https://10.0.0.1:2379", started: true},
+	}
+	// Must skip self, unstarted and learners — only the started voter qualifies.
+	if got := voterClientEndpoint(members, "self"); got != "https://10.0.0.1:2379" {
+		t.Fatalf("voterClientEndpoint = %q, want the started voter", got)
+	}
+	// No voter at all → empty (caller falls back to the LB).
+	if got := voterClientEndpoint(members[:3], "self"); got != "" {
+		t.Fatalf("expected empty endpoint with no voters, got %q", got)
+	}
+}
+
+func TestSelectSelf(t *testing.T) {
 	members := []etcdMember{
 		{id: "1", name: "kube-x-master-0", peerURL: "https://10.0.0.1:2380", isLearner: false},
 		{id: "2", name: "kube-x-master-1", peerURL: "https://10.0.0.2:2380", isLearner: true},
@@ -299,22 +329,56 @@ func TestSelectSelfAndPromoteAction(t *testing.T) {
 	if !ok || self.id != "2" {
 		t.Fatalf("selectSelf picked wrong row: %+v ok=%t", self, ok)
 	}
-	if promoteAction(self, ok) != promoteDo {
-		t.Fatal("a learner self must be promoted")
+	if !self.isLearner {
+		t.Fatal("expected the learner row")
 	}
 
-	// A voter self is a no-op.
+	// A voter self is found and is not a learner.
 	voter, ok := selectSelf(members, "kube-x-master-0", "https://10.0.0.1:2380")
-	if !ok || promoteAction(voter, ok) != promoteNoop {
-		t.Fatalf("a voter self must be a no-op: %+v ok=%t", voter, ok)
+	if !ok || voter.isLearner {
+		t.Fatalf("a voter self must be found and non-learner: %+v ok=%t", voter, ok)
 	}
 
-	// Not a member → no-op.
+	// Not a member → not found.
 	if _, ok := selectSelf(members, "kube-x-master-9", "https://10.0.0.9:2380"); ok {
 		t.Fatal("absent node must not match")
 	}
-	if promoteAction(etcdMember{}, false) != promoteNoop {
-		t.Fatal("not-found must be a no-op")
+}
+
+// TestSelectSelfByPeerFindsUnstartedLearner is the multi-master batch-create
+// wedge regression: a learner in the window between `member add --learner` and
+// finishing its join shows up as "unstarted" with an EMPTY NAME. selectSelf
+// (name+peer) misses it, which made ensurePromoted falsely conclude "not a
+// member, nothing to do" and strand the node as a learner forever (its apiserver
+// then answering "etcdserver: rpc not supported for learner"). selectSelfByPeer
+// must find that row by peer URL so promotion actually runs.
+func TestSelectSelfByPeerFindsUnstartedLearner(t *testing.T) {
+	myPeer := "https://10.0.0.2:2380"
+	members := []etcdMember{
+		{id: "1", name: "kube-x-master-0", peerURL: "https://10.0.0.1:2380", started: true, isLearner: false},
+		// Just-added learner: unstarted, name still empty, but carries its peer URL.
+		{id: "2", name: "", peerURL: myPeer, started: false, isLearner: true},
+	}
+
+	// name+peer misses the empty-name row (the bug)...
+	if _, ok := selectSelf(members, "kube-x-master-1", myPeer); ok {
+		t.Fatal("selectSelf unexpectedly matched an empty-name row")
+	}
+	// ...but peer-only finds it (the fix), and it is a learner to promote.
+	self, ok := selectSelfByPeer(members, myPeer)
+	if !ok || self.id != "2" || !self.isLearner {
+		t.Fatalf("selectSelfByPeer must find the unstarted learner: %+v ok=%t", self, ok)
+	}
+
+	// A started voter is likewise found by peer and reported non-learner.
+	voter, ok := selectSelfByPeer(members, "https://10.0.0.1:2380")
+	if !ok || voter.isLearner {
+		t.Fatalf("selectSelfByPeer must find the voter as non-learner: %+v ok=%t", voter, ok)
+	}
+
+	// Absent peer → not found (ensurePromoted then keeps retrying).
+	if _, ok := selectSelfByPeer(members, "https://10.0.0.9:2380"); ok {
+		t.Fatal("absent peer must not match")
 	}
 }
 

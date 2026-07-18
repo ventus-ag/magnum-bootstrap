@@ -488,9 +488,20 @@ error and retries with a targeted recovery (helpers in `cluster-helm/helper.go`)
 The periodic reconciler runs via `magnum-reconcile.timer`:
 - **First tick**: 5 min after timer activation (`OnActiveSec=5min`)
 - **Subsequent**: daily at midnight (`OnCalendar=*-*-* 00:00:00`)
+- **Jitter**: `RandomizedDelaySec=45min` de-synchronizes the fleet — without it
+  every node reconciles at midnight sharp, so any change that triggers a service
+  restart (cert heal, containerd config, apiserver arg change) would restart
+  etcd/apiserver on all masters simultaneously = brief quorum/API loss. The
+  per-node random delay staggers those restarts. Applies to every trigger
+  (both the boot tick and the daily tick), so a post-reboot drift run may be
+  delayed up to ~45min — fine, the node came up from persisted config.
 - **Persistent**: fires on next boot if node was off at midnight
 
 The timer is started AFTER the synchronous Heat-triggered run to avoid racing.
+OS auto-upgrades (FCoS/zincati) are staggered by a SEPARATE mechanism — the
+`zincati` module derives a per-node reboot window from the node IP
+(`last_octet * 10 mod 360` minutes, `strategy = "periodic"`), spreading node
+reboots across a 6h range so masters never reboot together.
 
 ## E2E Test Runner
 

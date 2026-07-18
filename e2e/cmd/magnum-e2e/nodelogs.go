@@ -22,6 +22,11 @@ const nodeLogCmd = `set +e
 echo '### uname / os'; uname -a; cat /etc/os-release 2>/dev/null | grep -E '^(PRETTY_NAME|VERSION)='
 echo '### /etc/sysconfig/heat-params (KUBE_TAG/NUMBER_OF_MASTERS/role)'; sudo grep -E '^(KUBE_TAG|KUBE_VERSION|NUMBER_OF_MASTERS|NODEGROUP_ROLE|MASTER_INDEX|CA_ROTATION_ID)=' /etc/sysconfig/heat-params 2>/dev/null
 echo '### reconciler-last-run.json'; sudo cat /var/lib/magnum/reconciler-last-run.json 2>/dev/null
+# Decision-critical reconcile lines, grepped from the WHOLE log so they survive
+# regardless of tail position. A multi-master etcd join/promotion trail sits in
+# the early etcd phase and scrolls out of a plain tail once the later phases
+# spam kubectl retries — this is what a learner-never-promoted wedge needs.
+echo '### magnum-reconcile.log (etcd/join/promotion/phase-failure trail)'; sudo grep -aE 'etcd:|member (add|list|promote)|promoted learner|learner .* (not yet in sync|did not become)|too many learner|not enough started|hasData=|isMember=|selfIsLearner|rpc not supported|running phase=|phase .* failed|reconcile failed|apiserver not ready|advertise-address' /var/log/magnum-reconcile.log 2>/dev/null | tail -n 400
 echo '### magnum-reconcile.log (tail 500)'; sudo tail -n 500 /var/log/magnum-reconcile.log 2>/dev/null
 echo '### journalctl heat-container-agent (tail 200)'; sudo journalctl -u heat-container-agent --no-pager -n 200 2>/dev/null
 echo '### journalctl magnum-reconcile* (tail 200)'; sudo journalctl -u 'magnum-reconcile*' --no-pager -n 200 2>/dev/null

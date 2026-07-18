@@ -215,6 +215,10 @@ jobs:
             kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
             scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
             workers: 0
+            # Distinct slot offset so this leg's subnet/mcast/host-ports never
+            # collide with the concurrently-scheduled `latest` leg on a host
+            # running multiple runner agents (see E2E_SLOT_OFFSET below).
+            slot_offset: 0
           # One worker VM on the latest entry only (TCG makes each extra VM
           # expensive): without it the worker reconcile path (worker-certs,
           # kube-worker-config, registry) has ZERO per-PR coverage.
@@ -223,6 +227,7 @@ jobs:
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
             scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
             workers: 1
+            slot_offset: 1
     steps:
       - name: Checkout magnum-bootstrap
         uses: actions/checkout@v4
@@ -270,6 +275,7 @@ jobs:
           KUBE_TAG_UPGRADE: ${{ matrix.kube_tag_upgrade }}
           SCENARIOS: ${{ matrix.scenarios }}
           WORKERS: ${{ matrix.workers }}
+          E2E_SLOT_OFFSET: ${{ matrix.slot_offset }}
           WORKDIR: ${{ runner.temp }}/fcos-e2e-${{ matrix.name }}
         run: |
           chmod +x "$PREBUILT_BOOTSTRAP" "$PREBUILT_HOST_PROVIDER" || true
@@ -384,7 +390,12 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-fcos-multimaster:
     name: e2e-fcos-multimaster
-    needs: [build, resolve]
+    # Depends on e2e-fcos (not just build/resolve) so the 5-VM multi-master run
+    # never shares the 8-vCPU box with the two concurrent single-master legs —
+    # that would oversubscribe TCG and collapse etcd raft timing. It starts once
+    # both single-master legs finish; the legs run concurrently, so this still
+    # ends sooner than the old fully-serial pinned→latest→multimaster chain.
+    needs: [build, resolve, e2e-fcos]
     runs-on: self-hosted
     # Non-blocking: multi-master etcd formation across 3 emulated VMs is flaky on
     # the TCG-only runner (nested AMD-V, no KVM — etcd raft heartbeat/election

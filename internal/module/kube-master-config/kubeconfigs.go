@@ -200,6 +200,17 @@ func buildAPIServerArgs(cfg config.Config) string {
 		"--runtime-config=api/all=true",
 		"--kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP",
 	}
+	// Without --advertise-address the apiserver publishes its auto-detected
+	// default-route interface IP as the default/kubernetes Endpoints entry.
+	// On any host whose default route is NOT the cluster network (e2e QEMU
+	// slirp is the canonical case: every VM owns 10.0.2.15), kube-proxy on
+	// every OTHER node then DNATs the kubernetes ClusterIP to an address that
+	// is local-but-dead there — every in-cluster API client on workers
+	// (flannel, CNI-dependent addons) gets "connection refused" while the
+	// master itself works fine.
+	if nodeIP := cfg.ResolveNodeIP(); nodeIP != "" {
+		args = append(args, "--advertise-address="+nodeIP)
+	}
 	// --allow-privileged was documented as "removed" in K8s 1.27, but the
 	// default changed in K8s 1.34+ to disallow privileged containers.
 	// Always pass it explicitly to ensure infrastructure DaemonSets

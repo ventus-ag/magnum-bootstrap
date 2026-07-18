@@ -53,11 +53,36 @@ detect_pm() {
   die "no supported package manager found (apt/dnf/yum/pacman/zypper)"
 }
 
+# apt_get_locked runs apt-get safely on a SHARED self-hosted runner. The CI runs
+# several e2e jobs concurrently on one box, so two jobs hit apt-get at the same
+# instant and collide on its locks ("E: Could not get lock
+# /var/lib/apt/lists/lock. It is held by process N (apt-get)"). Three layers:
+#   1. flock on a shared lockfile serialises OUR concurrent provisioning jobs
+#      (one apt run at a time across all runner agents on this host).
+#   2. DPkg::Lock::Timeout=600 covers the dpkg/frontend lock — note it does NOT
+#      cover the lists lock that `apt-get update` takes on every apt version,
+#      which is why flock/retry are needed too.
+#   3. a retry loop rides out any system apt-daily/unattended-upgrades timer that
+#      grabbed a lock before our flock (a holder outside our lockfile).
+apt_get_locked() {
+  local i rc=0
+  for i in $(seq 1 30); do
+    if flock -w 600 /tmp/magnum-e2e-apt.lock \
+         apt-get -o DPkg::Lock::Timeout=600 "$@"; then
+      return 0
+    fi
+    rc=$?
+    log "apt-get '$1' locked/busy (attempt $i/30, rc=$rc); retrying in 10s"
+    sleep 10
+  done
+  return "$rc"
+}
+
 install_pkgs() {
   local pm="$1"; shift
   log "installing via $pm: $*"
   case "$pm" in
-    apt-get) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    apt-get) apt_get_locked update -y && DEBIAN_FRONTEND=noninteractive apt_get_locked install -y "$@" ;;
     dnf|yum) "$pm" install -y "$@" ;;
     pacman)  pacman -Sy --needed --noconfirm "$@" ;;
     zypper)  zypper --non-interactive install -y "$@" ;;
