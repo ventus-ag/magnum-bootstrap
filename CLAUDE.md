@@ -584,6 +584,38 @@ post-rotate add), `ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
 Focused manual presets remain available: `chained-single`, `chained-multinode`,
 and `component-toggle`.
 
+**`sonobuoy` (1m/1w) + the conformance sweep.** The `sonobuoy` scenario creates
+a cluster and runs a [Sonobuoy](https://sonobuoy.io) Kubernetes conformance test
+against it (`sonobuoy` op → `runSonobuoy`, `e2e/cmd/magnum-e2e/sonobuoy.go`). Mode
+is `SONOBUOY_MODE` (default `quick` — a single smoke test, ~10 min; the weekly
+sweep uses `certified-conformance` — the full ~400-test suite, hours). The driver
+writes an admin kubeconfig from the Magnum-signed client cert, locates the
+sonobuoy binary (`SONOBUOY_BIN`, else `$PATH` — the workflow installs it, gated to
+this scenario), runs `sonobuoy run --wait`, retrieves the results tarball into
+`DIAG_DIR`, extracts the plugin JUnit (CLI-free, via Go `archive/tar`), and fails
+the op if any test failed. Sonobuoy auto-selects the conformance image matching
+the cluster's Kubernetes version, so one code path covers every version.
+
+The **`.github/workflows/conformance.yaml`** workflow runs this across the newest
+Kubernetes versions: a `resolve` job builds `magnum-e2e` and calls
+`-resolve-conformance-matrix=N`, which reads the N newest minors' latest patches
+from `dl.k8s.io` and lists the cloud's templates, emitting one matrix leg per
+version as `{version, template, kubeTag, slug}`. If a template already pins a
+version it is used directly; otherwise the newest FCoS template is reused with the
+target appended as a `kube_tag` override (`merge_labels`) — so a version newer
+than any pinned template is still testable (`resolveConformanceLegs`, unit-tested;
+Ubuntu `-uNN` templates are excluded). The `conformance` job is a **parallel
+matrix** (one billed cluster + Actions job per version) that calls the reusable
+`e2e-openstack.yaml` with `scenario: sonobuoy`, the per-leg
+`cluster_template`/`kube_tag`, and `name_suffix=slug` (isolates each leg's
+`CLUSTER_NAME`, concurrency group, and diagnostics artifact). Schedules (default
+branch): **daily** cron → `quick`, **Saturday** cron → `certified-conformance`;
+`workflow_dispatch` picks mode + count. Each leg's result lands in its
+`GITHUB_STEP_SUMMARY` (a status table via `writeSonobuoySummary`) plus a
+`junit-sonobuoy-<version>.xml` + results tarball in its diagnostics artifact. A
+single **`quick`** `sonobuoy` leg also runs on **every PR** (added to `ci.yaml`'s
+per-PR `e2e-openstack` matrix), using the default template.
+
 **`version-ladder` (1m/1w).** A long multi-version upgrade walk: create at the
 first version, then for every rung `upgrade → cloud-smoke → autoscale`. Its op
 chain is **generated** from the upgrade ladder (not a static preset), so it lives

@@ -1,0 +1,126 @@
+# Sonobuoy conformance sweep across the newest Kubernetes versions.
+#
+#   resolve → (build magnum-e2e, ask the cloud + dl.k8s.io for the N newest
+#             Kubernetes versions, map each to a create recipe) → matrix
+#   conformance → one PARALLEL leg per version, each its own billed cluster +
+#             Actions job, running the `sonobuoy` scenario via the reusable
+#             e2e-openstack workflow. Per-version result lands in that leg's
+#             GITHUB_STEP_SUMMARY + a JUnit/results-tarball artifact.
+#
+# Schedules (default branch only):
+#   * daily  → SONOBUOY_MODE=quick                 (~10 min/cluster, pipeline + smoke)
+#   * weekly → SONOBUOY_MODE=certified-conformance (full ~400-test suite, hours)
+# workflow_dispatch lets you pick the mode + how many newest versions to sweep.
+name: conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Sonobuoy mode"
+        type: choice
+        options:
+          - quick
+          - non-disruptive-conformance
+          - certified-conformance
+        default: quick
+      count:
+        description: "How many newest Kubernetes versions (minors) to sweep"
+        type: string
+        default: "4"
+  schedule:
+    # daily quick sweep — 03:23 UTC (off the :00 fleet spike)
+    - cron: "23 3 * * *"
+    # weekly full certified-conformance — Saturday 02:41 UTC
+    - cron: "41 2 * * 6"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One conformance sweep at a time; a new sweep supersedes a queued one but not
+  # a running one (per-leg clusters are billed — let them finish).
+  group: conformance
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve newest versions
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      mode: ${{ steps.mode.outputs.mode }}
+    env:
+      # Same OpenStack auth contract as e2e-openstack.yaml (gophercloud OS_*).
+      OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+      OS_REGION_NAME: ${{ vars.OS_REGION_NAME }}
+      OS_INTERFACE: ${{ vars.OS_INTERFACE || 'public' }}
+      OS_IDENTITY_API_VERSION: "3"
+      OS_APPLICATION_CREDENTIAL_ID: ${{ secrets.OS_APPLICATION_CREDENTIAL_ID }}
+      OS_APPLICATION_CREDENTIAL_SECRET: ${{ secrets.OS_APPLICATION_CREDENTIAL_SECRET }}
+      OS_USERNAME: ${{ secrets.OS_USERNAME }}
+      OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+      OS_USER_DOMAIN_NAME: ${{ vars.OS_USER_DOMAIN_NAME }}
+      OS_USER_DOMAIN_ID: ${{ vars.OS_USER_DOMAIN_ID }}
+      OS_PROJECT_ID: ${{ vars.OS_PROJECT_ID }}
+      OS_PROJECT_NAME: ${{ vars.OS_PROJECT_NAME }}
+      OS_PROJECT_DOMAIN_ID: ${{ vars.OS_PROJECT_DOMAIN_ID }}
+      OS_PROJECT_DOMAIN_NAME: ${{ vars.OS_PROJECT_DOMAIN_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build driver
+        run: CGO_ENABLED=0 go build -trimpath -o "${{ runner.temp }}/magnum-e2e" ./e2e/cmd/magnum-e2e
+
+      # Mode: dispatch → chosen input; the weekly Saturday cron → full
+      # certified-conformance; every other schedule (the daily cron) → quick.
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            mode="${{ inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "41 2 * * 6" ]; then
+            mode="certified-conformance"
+          else
+            mode="quick"
+          fi
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "resolved sonobuoy mode: ${mode}"
+
+      - name: Resolve conformance matrix
+        id: resolve
+        run: |
+          count="${{ inputs.count || '4' }}"
+          "${{ runner.temp }}/magnum-e2e" -resolve-conformance-matrix="${count}" -conformance-out="${{ runner.temp }}/matrix.json"
+          matrix="$(cat "${{ runner.temp }}/matrix.json")"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Conformance sweep — mode \`${{ steps.mode.outputs.mode }}\`"
+            echo ""
+            echo '```json'
+            echo "${matrix}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  conformance:
+    name: sonobuoy ${{ matrix.leg.version }}
+    needs: resolve
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        leg: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    uses: ./.github/workflows/e2e-openstack.yaml
+    with:
+      scenario: sonobuoy
+      cluster_template: ${{ matrix.leg.template }}
+      kube_tag: ${{ matrix.leg.kubeTag }}
+      name_suffix: ${{ matrix.leg.slug }}
+      sonobuoy_mode: ${{ needs.resolve.outputs.mode }}
+      use_prebuilt: false
+    secrets: inherit

@@ -384,6 +384,9 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 	case "cloud-smoke":
 		return r.smokeCloudIntegration(ctx)
 
+	case "sonobuoy":
+		return r.runSonobuoy(ctx)
+
 	case "verify-sa":
 		return r.verifySAConsistency(ctx)
 

@@ -40,6 +40,7 @@ var knownOps = map[string]bool{
 	"cloud-smoke":     true,
 	"verify-sa":       true,
 	"autoscale":       true,
+	"sonobuoy":        true,
 	// component toggle: flip an addon label on the live cluster, then assert the
 	// reconciler installed/uninstalled it (see toggle.go).
 	"disable-autoscaler":    true,
@@ -214,6 +215,17 @@ var scenarios = map[string]scenarioDef{
 		template:         ubuntuTemplate131,
 		sshUser:          "ubuntu",
 		nodepoolTemplate: ubuntuTemplate131,
+	},
+	// sonobuoy — create a cluster and run a Sonobuoy conformance test against it.
+	// Mode is SONOBUOY_MODE (default "quick" for the daily/PR sweep; the weekly
+	// cron sets "certified-conformance"). The conformance workflow runs one leg
+	// per Kubernetes version (matrix), each its own cluster + Actions job, so the
+	// scenario itself is a single-cluster 1m/1w shape. The create version comes
+	// from CLUSTER_TEMPLATE (+ optional KUBE_TAG override for versions newer than
+	// any pinned template — see resolveConformanceLegs).
+	"sonobuoy": {
+		masters: 1, workers: 1,
+		ops: "sonobuoy",
 	},
 	// component-toggle — flip cluster addon labels on a live cluster and assert the
 	// reconciler installs/uninstalls: disable autoscaler (Pulumi prunes the Helm
