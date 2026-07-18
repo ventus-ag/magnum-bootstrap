@@ -83,11 +83,25 @@ func (r *runner) runSonobuoy(ctx context.Context) error {
 	}
 
 	// Retrieve results tarball into DIAG_DIR (uploaded as a CI artifact).
+	// `sonobuoy retrieve <dir>` writes an auto-named tarball INTO <dir> and prints
+	// its full path on stdout — capture that path rather than guessing a name (the
+	// -f flag is a bare filename, not a full path, and mis-joins if given one).
 	diag := envOr("DIAG_DIR", "e2e-diagnostics")
 	_ = os.MkdirAll(diag, 0o755)
-	tarball := filepath.Join(diag, "sonobuoy-"+sanitizeFilename(version)+".tar.gz")
-	if err := r.runStreaming(runCtx, bin, "retrieve", "--kubeconfig", kubeconfig, "-f", tarball); err != nil {
+	retrieved, err := r.runCapture(runCtx, bin, "retrieve", diag, "--kubeconfig", kubeconfig)
+	if err != nil {
 		return fmt.Errorf("sonobuoy retrieve: %w", err)
+	}
+	tarball, err := resolveRetrievedTarball(retrieved, diag)
+	if err != nil {
+		return fmt.Errorf("sonobuoy retrieve: %w", err)
+	}
+	// Normalize to a stable, version-tagged name for the artifact.
+	named := filepath.Join(diag, "sonobuoy-"+sanitizeFilename(version)+".tar.gz")
+	if named != tarball {
+		if rerr := os.Rename(tarball, named); rerr == nil {
+			tarball = named
+		}
 	}
 	r.log("sonobuoy: results tarball -> %s", tarball)
 
@@ -171,6 +185,39 @@ func (r *runner) runStreaming(ctx context.Context, bin string, args ...string) e
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// runCapture runs a command capturing stdout (returned) while streaming stderr to
+// the CI log, so a command whose result is a value it prints (e.g. `sonobuoy
+// retrieve` printing the tarball path) can be both watched and parsed.
+func (r *runner) runCapture(ctx context.Context, bin string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+// resolveRetrievedTarball turns `sonobuoy retrieve` stdout into the tarball path.
+// retrieve prints the written path (usually the full path under dir; sometimes a
+// bare filename). Take the last non-empty line and resolve it to an existing file
+// under dir.
+func resolveRetrievedTarball(stdout, dir string) (string, error) {
+	var line string
+	for _, l := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if s := strings.TrimSpace(l); s != "" {
+			line = s
+		}
+	}
+	if line == "" {
+		return "", fmt.Errorf("retrieve printed no path")
+	}
+	candidates := []string{line, filepath.Join(dir, filepath.Base(line))}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("retrieved tarball %q not found under %q", line, dir)
 }
 
 // sonobuoyDelete tears down the in-cluster sonobuoy state (best-effort).

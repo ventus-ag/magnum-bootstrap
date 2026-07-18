@@ -99,6 +99,34 @@ func TestExtractSonobuoyJUnit(t *testing.T) {
 	}
 }
 
+func TestResolveRetrievedTarball(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "202607181657_sonobuoy_abc.tar.gz")
+	if err := os.WriteFile(real, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Full path on stdout (with trailing progress noise on other lines).
+	got, err := resolveRetrievedTarball("uploading...\n"+real+"\n", dir)
+	if err != nil || got != real {
+		t.Fatalf("full-path: got (%q,%v), want %q", got, err, real)
+	}
+
+	// Bare filename on stdout → resolved against dir.
+	got, err = resolveRetrievedTarball(filepath.Base(real)+"\n", dir)
+	if err != nil || got != real {
+		t.Fatalf("bare-name: got (%q,%v), want %q", got, err, real)
+	}
+
+	// Nothing printed / file absent → error.
+	if _, err := resolveRetrievedTarball("", dir); err == nil {
+		t.Fatal("expected error on empty stdout")
+	}
+	if _, err := resolveRetrievedTarball("nope.tar.gz\n", dir); err == nil {
+		t.Fatal("expected error when named file does not exist")
+	}
+}
+
 func TestExtractSonobuoyJUnitMissing(t *testing.T) {
 	dir := t.TempDir()
 	tarball := filepath.Join(dir, "empty.tar.gz")
