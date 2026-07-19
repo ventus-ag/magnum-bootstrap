@@ -303,6 +303,62 @@ cmd_assert_node_ready() {
   return 1
 }
 
+# assert-node-metadata <node> <want-labels> <want-taints> <absent-label-keys> <absent-taint-keys>
+# Lists use ';' separators; "-" means "none". Labels are matched as exact
+# key=value pairs via --show-labels; taints via a jsonpath key=value:effect
+# render (avoids jsonpath label-key escaping and any jq dependency). Retries
+# briefly: the reconcile that applied the change has already run, so this only
+# absorbs API/watch latency.
+cmd_assert_node_metadata() {
+  local node="$1" want_labels="$2" want_taints="$3" absent_labels="$4" absent_taints="$5"
+  log "asserting node metadata on '${node}' (labels='${want_labels}' taints='${want_taints}' absent-labels='${absent_labels}' absent-taints='${absent_taints}')"
+  local attempt why labels taints item key
+  for attempt in $(seq 1 "$(scaled 12)"); do  # up to 1 min (x wait-scale)
+    why=""
+    labels="$(kc get node "$node" --show-labels --no-headers 2>/dev/null | awk '{print $NF}')" || labels=""
+    taints="$(kc get node "$node" -o jsonpath='{range .spec.taints[*]}{.key}={.value}:{.effect}{"\n"}{end}' 2>/dev/null)" || taints=""
+    if [ "$want_labels" != "-" ]; then
+      IFS=';'
+      for item in $want_labels; do
+        case ",$labels," in *",$item,"*) ;; *) why="label '$item' missing" ;; esac
+      done
+      unset IFS
+    fi
+    if [ -z "$why" ] && [ "$absent_labels" != "-" ]; then
+      IFS=';'
+      for key in $absent_labels; do
+        case ",$labels," in *",$key="*) why="label '$key' still present" ;; esac
+      done
+      unset IFS
+    fi
+    if [ -z "$why" ] && [ "$want_taints" != "-" ]; then
+      IFS=';'
+      for item in $want_taints; do
+        printf '%s
+' "$taints" | grep -qxF "$item" || why="taint '$item' missing"
+      done
+      unset IFS
+    fi
+    if [ -z "$why" ] && [ "$absent_taints" != "-" ]; then
+      IFS=';'
+      for key in $absent_taints; do
+        printf '%s
+' "$taints" | grep -q "^$key=" && why="taint '$key' still present"
+      done
+      unset IFS
+    fi
+    if [ -z "$why" ]; then
+      log "node '${node}' metadata OK (labels + taints match)"
+      return 0
+    fi
+    sleep 5
+  done
+  err "node '${node}' metadata mismatch: ${why}"
+  err "labels: ${labels}"
+  err "taints: ${taints:-<none>}"
+  return 1
+}
+
 cmd_assert_noop() {
   local hp="$1" name="$2"
   log "scenario '${name}': idempotency re-run"
@@ -550,6 +606,7 @@ main() {
     apply)            cmd_apply "$@" ;;
     assert-ready)     cmd_assert_ready ;;
     assert-node-ready) cmd_assert_node_ready "$@" ;;
+    assert-node-metadata) cmd_assert_node_metadata "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
     assert-periodic-heal) cmd_assert_periodic_heal ;;
     cert-hashes)      cmd_cert_hashes ;;

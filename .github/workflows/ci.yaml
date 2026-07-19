@@ -223,10 +223,13 @@ jobs:
           # One worker VM on the latest entry only (TCG makes each extra VM
           # expensive): without it the worker reconcile path (worker-certs,
           # kube-worker-config, registry) has ZERO per-PR coverage.
+          # node-metadata (needs the worker) covers the per-nodegroup
+          # NODE_LABELS/NODE_TAINTS lifecycle: single+multiple add, partial +
+          # full delete, converged on the Node object.
           - name: latest
             kube_tag: v1.31.4
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
-            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create node-metadata ca-rotate upgrade periodic' }}
             workers: 1
             slot_offset: 1
     steps:

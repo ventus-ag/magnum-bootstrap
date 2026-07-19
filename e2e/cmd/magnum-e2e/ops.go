@@ -36,6 +36,10 @@ var knownOps = map[string]bool{
 	"resize-nodepool": true,
 	"add-nodepool":    true,
 	"del-nodepool":    true,
+	// nodepool-metadata: patch node_labels/node_taints on the active nodepool
+	// (single + multiple add, partial + full delete) and verify Node objects +
+	// taint scheduling semantics after every stage (see nodepool_metadata.go).
+	"nodepool-metadata": true,
 	"post-rotate":     true,
 	"cloud-smoke":     true,
 	"verify-sa":       true,
@@ -142,7 +146,8 @@ const (
 //   - smoke             — default 1m/1w coverage: addon label toggles, upgrade,
 //     worker resize, repeated CA-rotation/upgrade wedge sequence, then
 //     post-rotation master add + SA check.
-//   - multinode         — default 3m/2w coverage: extra nodepool lifecycle,
+//   - multinode         — default 3m/2w coverage: extra nodepool lifecycle
+//     (including the node_labels/node_taints add+delete metadata cycle),
 //     worker+nodepool resize up/down, repeated upgrade/CA-rotation wedge sequence,
 //     then post-rotation add-node + SA check.
 //   - chained-single    — the repeated-op wedge sequence on 1 node.
@@ -158,7 +163,7 @@ var scenarios = map[string]scenarioDef{
 	},
 	"multinode": {
 		masters: 3, workers: 2,
-		ops: "add-nodepool=2,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
+		ops: "add-nodepool=2,nodepool-metadata,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
 		// 3-master coverage: the 3 `upgrade` ops climb 1.31→1.32→1.33 (see
 		// climbLadder) so multimaster upgrades exercise real minor bumps.
 		upgradeLadder: climbLadder,
@@ -211,7 +216,7 @@ var scenarios = map[string]scenarioDef{
 	// fork's cluster_template_id label path (same OS, same version → within skew).
 	"ubuntu-nodepool": {
 		masters: 1, workers: 1,
-		ops:              "add-nodepool=1,resize-nodepool=2,del-nodepool",
+		ops:              "add-nodepool=1,nodepool-metadata,resize-nodepool=2,del-nodepool",
 		template:         ubuntuTemplate131,
 		sshUser:          "ubuntu",
 		nodepoolTemplate: ubuntuTemplate131,

@@ -83,10 +83,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			changes = append(changes, serviceResult.Changes...)
 		}
 
-		labelChanges, err := kubecommon.EnsureNodeLabels(cfg, executor, kubectl, kubeconfig, true, 30, 5*time.Second)
+		labelChanges, err := kubecommon.EnsureNodeMetadata(cfg, executor, kubectl, kubecommon.MetadataKubeconfig(cfg), true, 30, 5*time.Second)
 		changes = append(changes, labelChanges...)
 		if err != nil && req.Logger != nil {
-			req.Logger.Warnf("start-services: failed to reconcile node labels for %s: %v", cfg.Shared.InstanceName, err)
+			req.Logger.Warnf("start-services: failed to reconcile node metadata for %s: %v", cfg.Shared.InstanceName, err)
 		}
 	}
 

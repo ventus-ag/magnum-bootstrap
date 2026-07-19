@@ -38,6 +38,8 @@ func main() {
 		etcdLBVIP    = flag.String("etcd-lb-vip", "", "master: ETCD_LB_VIP — the etcd_lb VIP in multi-master (empty = single-master bootstrap)")
 		etcdInitial  = flag.String("etcd-initial-cluster", "", "master: ETCD_INITIAL_CLUSTER — static etcd member list 'name0=https://ip0:2380,...' (empty = first/single master self-bootstraps)")
 		numMasters   = flag.Int("number-of-masters", 1, "master: NUMBER_OF_MASTERS")
+		nodeLabels   = flag.String("node-labels", "", "NODE_LABELS — per-nodegroup Kubernetes node labels (k1=v1;k2=v2)")
+		nodeTaints   = flag.String("node-taints", "", "NODE_TAINTS — per-nodegroup Kubernetes node taints (key=value:Effect;...)")
 		kubeTag      = flag.String("kube-tag", "v1.30.5", "Kubernetes version tag")
 		clusterUUID  = flag.String("cluster-uuid", "11111111-1111-1111-1111-111111111111", "Magnum cluster UUID")
 		authURL      = flag.String("auth-url", "http://127.0.0.1:9511/v3", "Keystone auth URL")
@@ -96,6 +98,8 @@ func main() {
 		EtcdLBVIP:                 *etcdLBVIP,
 		InitialCluster:            *etcdInitial,
 		NumberOfMasters:           *numMasters,
+		NodeLabels:                *nodeLabels,
+		NodeTaints:                *nodeTaints,
 		KubeTag:                   *kubeTag,
 		CARotationID:              *caRotationID,
 		AuthURL:                   *authURL,

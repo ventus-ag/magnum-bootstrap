@@ -96,6 +96,12 @@ type Config struct {
 	// scenarios set this so the reconciler serializes control-plane restarts.
 	NumberOfMasters int
 
+	// Per-nodegroup node metadata, written as NODE_LABELS / NODE_TAINTS
+	// ("k1=v1;k2=v2" / "key=value:Effect;..."). Empty = none (the production
+	// default for clusters without the feature).
+	NodeLabels string
+	NodeTaints string
+
 	// RunTimeoutSeconds -> RECONCILER_RUN_TIMEOUT_SECONDS (default 4800). The
 	// launcher sources heat-params, so this is the Heat-driven reconcile budget
 	// the binary self-cancels within; e2e must carry it to exercise that path.
@@ -273,6 +279,10 @@ func (c Config) pairs() []KV {
 	put("AUTO_SCALING_ENABLED", "false")
 	put("GPU_OPERATOR_ENABLED", "false")
 	put("CERT_MANAGER_API", "true")
+
+	// Per-nodegroup node metadata (empty -> none; see NodeLabels/NodeTaints).
+	put("NODE_LABELS", c.NodeLabels)
+	put("NODE_TAINTS", c.NodeTaints)
 
 	// Component option passthroughs (empty -> reconciler defaults).
 	put("KUBELET_OPTIONS", "")

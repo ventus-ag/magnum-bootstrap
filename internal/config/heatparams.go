@@ -132,6 +132,14 @@ func Load(path string) (Config, error) {
 		},
 	}
 
+	// Per-nodegroup node labels/taints. Invalid entries are skipped with
+	// warnings (surfaced by prereq-validation) — never wedge the node on them.
+	nodeLabels, labelWarnings := ParseNodeLabels(raw["NODE_LABELS"])
+	nodeTaints, taintWarnings := ParseNodeTaints(raw["NODE_TAINTS"])
+	cfg.Shared.NodeLabels = nodeLabels
+	cfg.Shared.NodeTaints = nodeTaints
+	cfg.Shared.NodeMetadataWarnings = append(labelWarnings, taintWarnings...)
+
 	// Node OS family: an explicit OS_DISTRO heat-param wins (handy for tests),
 	// otherwise detect from the node's os-release. Unknown ⇒ IsFCoS() (default).
 	if d := strings.ToLower(strings.TrimSpace(raw["OS_DISTRO"])); d != "" {

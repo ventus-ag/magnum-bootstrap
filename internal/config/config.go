@@ -173,6 +173,13 @@ type SharedConfig struct {
 	LeadNodeRoleName string `json:"leadNodeRoleName"`
 	KubeImageDigest  string `json:"kubeImageDigest"`
 
+	// Per-nodegroup Kubernetes node metadata (NODE_LABELS / NODE_TAINTS).
+	// Invalid entries are dropped at parse time; the warnings are surfaced by
+	// prereq-validation so a bad entry never wedges convergence.
+	NodeLabels           map[string]string `json:"nodeLabels,omitempty"`
+	NodeTaints           []NodeTaint       `json:"nodeTaints,omitempty"`
+	NodeMetadataWarnings []string          `json:"nodeMetadataWarnings,omitempty"`
+
 	// Cluster addons (master-0 only, after API ready)
 	RegionName string `json:"regionName"`
 

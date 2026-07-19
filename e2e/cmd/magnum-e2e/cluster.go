@@ -378,6 +378,9 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 		}
 		return nil
 
+	case "nodepool-metadata":
+		return r.nodepoolMetadataCycle(ctx)
+
 	case "post-rotate":
 		return r.postRotateScale(ctx)
 
@@ -962,6 +965,17 @@ func (r *runner) waitTransition(ctx context.Context, before *clusters.Cluster) e
 // probe. The retry loop is what lets a chained op (e.g. ca-rotate right after an
 // upgrade) survive Magnum's lagging status instead of racing it into a 400.
 func (r *runner) runMutation(ctx context.Context, name string, disruptive bool, trigger func() error) error {
+	if err := r.runMutationNoBundle(ctx, name, trigger); err != nil {
+		return err
+	}
+	return r.verifyBundle(ctx, name, disruptive)
+}
+
+// runMutationNoBundle is runMutation without the trailing verifyBundle — for
+// ops whose post-state intentionally breaks a bundle assumption (e.g. a
+// freshly tainted nodepool fails the untolerated schedulability probe) and
+// which run their own targeted verification instead.
+func (r *runner) runMutationNoBundle(ctx context.Context, name string, trigger func() error) error {
 	r.log("=== op: %s ===", name)
 	if err := r.ensureSettled(ctx); err != nil {
 		return fmt.Errorf("pre-op settle: %w", err)
@@ -1000,10 +1014,7 @@ func (r *runner) runMutation(ctx context.Context, name string, disruptive bool, 
 	if err := r.waitTransition(ctx, before); err != nil {
 		return fmt.Errorf("wait for update to start: %w", err)
 	}
-	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
-		return err
-	}
-	return r.verifyBundle(ctx, name, disruptive)
+	return r.waitStatus(ctx, "UPDATE_COMPLETE")
 }
 
 // listClusters prints every Magnum cluster in the project with its status —

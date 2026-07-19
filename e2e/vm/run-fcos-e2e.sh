@@ -42,7 +42,8 @@
 #   FCOS_VERSION (pin an older, pre-composefs build, e.g. 38.20231027.3.2 — old
 #                 FCoS + v1 containerd layout, the production node layout)
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade;
-#                             also: scale-masters [1->MASTERS, needs MASTERS>=2])
+#                             also: scale-masters [1->MASTERS, needs MASTERS>=2],
+#                             node-metadata [worker label/taint lifecycle, needs WORKERS>=1])
 #   WORKERS 0          MASTERS 1            MASTER_LB_ENABLED true
 #   MASTER_MEM_MB 2048 MASTER_CPUS 1        WORKER_MEM_MB 2048   WORKER_CPUS 1
 #   LB_MEM_MB 768      LB_CPUS 1
@@ -656,6 +657,12 @@ scenario_extra_flags() {
     _out+=(-number-of-masters "${MASTERS:-1}")
     if lb_enabled; then _out+=(-api-ip "$API_VIP" -etcd-lb-vip "$ETCD_VIP"); fi
   fi
+  if [ "$role" = worker ]; then
+    # Per-stage node metadata for the node-metadata scenario (empty = absent
+    # from heat-params, the production default).
+    [ -n "${WORKER_NODE_LABELS:-}" ] && _out+=(-node-labels "$WORKER_NODE_LABELS")
+    [ -n "${WORKER_NODE_TAINTS:-}" ] && _out+=(-node-taints "$WORKER_NODE_TAINTS")
+  fi
 }
 
 # render_and_push <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
@@ -795,6 +802,47 @@ scenario_create() {
   for_each_worker _create_worker
 }
 _create_worker() { apply_worker "$1" create "$KUBE_TAG"; assert_worker_joined "$1"; }
+
+# scenario_node_metadata — per-nodegroup node_labels/node_taints lifecycle on
+# worker0 (needs WORKERS>=1 and a created cluster). Four stages, each = render
+# heat-params with the stage's NODE_LABELS/NODE_TAINTS -> run-once -> assert
+# the Node object matches (present AND removed entries):
+#   add-single    one label + one NoSchedule taint
+#   add-multiple  three labels (incl. a node-role.kubernetes.io/* one that only
+#                 the API/node-manager path can apply) + two taints
+#   delete-single one label and one taint removed, the rest must survive
+#   delete-all    everything removed — the worker ends clean
+scenario_node_metadata() {
+  multinode || die "node-metadata scenario requires WORKERS>=1"
+  log "=== SCENARIO: node-metadata (worker0 label/taint add+delete, single+multiple) ==="
+  local node="e2e-minion-0" mp; mp="$(ssh_port master)"
+
+  # NOTE: plain assignments (not `VAR=x fn` prefixes) — a prefix assignment on
+  # a bash FUNCTION call persists after it returns, which would leak stage
+  # values into the delete-all stage.
+  log "--- stage add-single ---"
+  WORKER_NODE_LABELS="e2e-team=magnum"
+  WORKER_NODE_TAINTS="e2e-dedicated=np:NoSchedule"
+  apply_worker 0 create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node 'e2e-team=magnum' 'e2e-dedicated=np:NoSchedule' - -"
+
+  log "--- stage add-multiple ---"
+  WORKER_NODE_LABELS="e2e-team=magnum;e2e-env=ci;node-role.kubernetes.io/e2e-tier="
+  WORKER_NODE_TAINTS="e2e-dedicated=np:NoSchedule;e2e-phase=test:PreferNoSchedule"
+  apply_worker 0 create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node 'e2e-team=magnum;e2e-env=ci;node-role.kubernetes.io/e2e-tier=;node-role.kubernetes.io/worker=' 'e2e-dedicated=np:NoSchedule;e2e-phase=test:PreferNoSchedule' - -"
+
+  log "--- stage delete-single ---"
+  WORKER_NODE_LABELS="e2e-team=magnum;node-role.kubernetes.io/e2e-tier="
+  WORKER_NODE_TAINTS="e2e-dedicated=np:NoSchedule"
+  apply_worker 0 create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node 'e2e-team=magnum;node-role.kubernetes.io/e2e-tier=' 'e2e-dedicated=np:NoSchedule' 'e2e-env' 'e2e-phase'"
+
+  log "--- stage delete-all ---"
+  unset WORKER_NODE_LABELS WORKER_NODE_TAINTS
+  apply_worker 0 create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node - - 'e2e-team;e2e-env;node-role.kubernetes.io/e2e-tier' 'e2e-dedicated;e2e-phase'"
+}
 
 # scenario_ca_rotate — drive one CA rotation and assert it did real work, not
 # just exit 0: the API server leaf cert content must change (the reconciler
@@ -1023,6 +1071,7 @@ main() {
       ca-rotate)     scenario_ca_rotate;      record_scenario "$s" PASS "API server leaf cert re-keyed" ;;
       upgrade)       scenario_upgrade;        record_scenario "$s" PASS "kubelet ${KUBE_TAG} -> ${KUBE_TAG_UPGRADE}" ;;
       periodic)      scenario_periodic;       record_scenario "$s" PASS "drift healed by run-periodic, steady state zero-change" ;;
+      node-metadata) scenario_node_metadata;  record_scenario "$s" PASS "worker0 labels/taints add+delete (single+multiple) converged" ;;
       *) die "unknown scenario: $s" ;;
     esac
   done
