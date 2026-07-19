@@ -144,9 +144,13 @@ jobs:
           set -euo pipefail
           mode="${{ needs.resolve.outputs.mode }}"
           # Per-leg conclusions: reusable-workflow legs surface in the jobs API
-          # as "sonobuoy <version> / e2e-openstack".
-          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" --paginate \
-            --jq '.jobs[] | select(.name | startswith("sonobuoy ")) | [.name, .conclusion // "pending"] | @tsv' > jobs.tsv
+          # as "sonobuoy <version> / e2e-openstack". curl, not gh — the
+          # self-hosted runners carry no gh CLI.
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+            | jq -r '.jobs[] | select(.name | startswith("sonobuoy ")) | [.name, .conclusion // "pending"] | @tsv' > jobs.tsv
           cat jobs.tsv
           message=""
           color="brightgreen"
