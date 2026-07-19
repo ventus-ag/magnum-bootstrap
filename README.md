@@ -66,7 +66,7 @@ make build
 --diff                 Show diff-oriented output
 --allow-partial        Skip unimplemented modules, run only implemented ones
 --refresh              Pulumi refresh provider-managed resources before preview/up (default: true except run-once)
---target-phase STRING  Execute only the specified phase
+--target STRING        Run only the specified phase (other phases register-only; Pulumi apply scoped via --target so nothing is pruned)
 --parallelism INT      Maximum phase/resource operations to run in parallel (default: 10)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL

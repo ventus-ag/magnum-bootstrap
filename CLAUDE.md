@@ -39,7 +39,7 @@ bootstrap print-last-result # Print last result JSON
 --diff                 Show diff-oriented output
 --allow-partial        Skip unimplemented modules and continue
 --refresh              Pulumi refresh before run (default: true except run-once)
---target-phase STRING  Execute only specified phase
+--target STRING        Run only the specified phase (other phases register-only; Pulumi apply scoped via --target so nothing is pruned)
 --parallelism INT      Maximum phase/resource operations to run in parallel (default: 0 = auto-scale to host RAM/CPU; ≤2 GiB nodes serialize to avoid OOM)
 --debug                Enable Pulumi debug logging and verbose event output
 --backend-url STRING   Override Pulumi backend URL

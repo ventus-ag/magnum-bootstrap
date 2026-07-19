@@ -68,3 +68,19 @@ func TestPruneStackHistoryMissingRootIsSafe(t *testing.T) {
 	// Empty stateDir: must be a no-op.
 	pruneStackHistory("", nil)
 }
+
+func TestTargetPhaseURNs(t *testing.T) {
+	urns := targetPhaseURNs("node-master-0", "magnum-bootstrap", "cluster-coredns")
+	want := []string{
+		"urn:pulumi:node-master-0::magnum-bootstrap::*::node-master-0-cluster-coredns",
+		"urn:pulumi:node-master-0::magnum-bootstrap::*::node-master-0-cluster-coredns-*",
+	}
+	if len(urns) != len(want) {
+		t.Fatalf("got %d urns, want %d", len(urns), len(want))
+	}
+	for i := range want {
+		if urns[i] != want[i] {
+			t.Errorf("urn[%d] = %q, want %q", i, urns[i], want[i])
+		}
+	}
+}

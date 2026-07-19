@@ -6,6 +6,11 @@ type Phase struct {
 	ID         string `json:"id"`
 	Summary    string `json:"summary"`
 	Disruptive bool   `json:"disruptive"`
+	// SkipRun marks a phase whose imperative Run() must not execute in this
+	// run. The phase still registers its Pulumi resources so the program
+	// mirrors the full plan and untargeted resources are never deleted from
+	// state (a targeted run additionally scopes the apply via pulumi --target).
+	SkipRun bool `json:"skipRun,omitempty"`
 }
 
 type Plan struct {
@@ -49,20 +54,46 @@ func (p Plan) PhaseIDs() []string {
 	return ids
 }
 
-// FilterToPhase returns a plan containing only the phase with the given ID.
-// If no phase matches, the returned plan has no phases.
-func (p Plan) FilterToPhase(phaseID string) Plan {
-	filtered := make([]Phase, 0, 1)
-	for _, phase := range p.Phases {
+// LimitRunToPhase returns a plan that keeps every phase (so the Pulumi
+// program still registers the complete resource tree) but marks all phases
+// except the given one as SkipRun. Reports whether the phase exists in the
+// plan.
+func (p Plan) LimitRunToPhase(phaseID string) (Plan, bool) {
+	found := false
+	limited := make([]Phase, len(p.Phases))
+	for i, phase := range p.Phases {
+		phase.SkipRun = phase.ID != phaseID
 		if phase.ID == phaseID {
-			filtered = append(filtered, phase)
+			found = true
 		}
+		limited[i] = phase
 	}
 	return Plan{
 		Role:      p.Role,
 		Operation: p.Operation,
-		Phases:    filtered,
+		Phases:    limited,
+	}, found
+}
+
+// RunTarget returns the single phase ID whose Run() is enabled when the plan
+// was limited with LimitRunToPhase, or "" for a normal full plan.
+func (p Plan) RunTarget() string {
+	target := ""
+	skipped := false
+	for _, phase := range p.Phases {
+		if phase.SkipRun {
+			skipped = true
+			continue
+		}
+		if target != "" {
+			return ""
+		}
+		target = phase.ID
 	}
+	if !skipped {
+		return ""
+	}
+	return target
 }
 
 func newPhase(id, summary string, disruptive bool) Phase {

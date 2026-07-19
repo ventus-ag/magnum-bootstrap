@@ -256,13 +256,15 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 					return nil
 				}
 
-				acc.RecordPhase(phase.ID, phaseRun.result)
+				if !phase.SkipRun {
+					acc.RecordPhase(phase.ID, phaseRun.result)
+				}
 				phaseRes, err := mod.Register(ctx, metadata.StackName+"-"+phase.ID, heat, regOpts...)
 				if err != nil {
 					return err
 				}
 				phaseResources[phase.ID] = phaseRes
-				executedPhases[phase.ID] = true
+				executedPhases[phase.ID] = !phase.SkipRun
 				return nil
 			})
 		if runErr != nil {

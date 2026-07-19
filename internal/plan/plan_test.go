@@ -71,18 +71,35 @@ func TestBuildWorkerPlan(t *testing.T) {
 	}
 }
 
-func TestFilterToPhase(t *testing.T) {
+func TestLimitRunToPhase(t *testing.T) {
 	p := Build(masterConfig())
-	one := p.FilterToPhase("etcd")
-	if len(one.Phases) != 1 || one.Phases[0].ID != "etcd" {
-		t.Fatalf("FilterToPhase(etcd) = %v, want single etcd phase", one.PhaseIDs())
+	limited, ok := p.LimitRunToPhase("etcd")
+	if !ok {
+		t.Fatal("LimitRunToPhase(etcd) reported not found")
 	}
-	if one.Role != p.Role || one.Operation != p.Operation {
-		t.Error("FilterToPhase must preserve role + operation")
+	if len(limited.Phases) != len(p.Phases) {
+		t.Fatalf("limited plan has %d phases, want %d (all phases must stay registered)", len(limited.Phases), len(p.Phases))
 	}
-	none := p.FilterToPhase("does-not-exist")
-	if len(none.Phases) != 0 {
-		t.Errorf("FilterToPhase(missing) = %v, want empty", none.PhaseIDs())
+	if limited.Role != p.Role || limited.Operation != p.Operation {
+		t.Error("LimitRunToPhase must preserve role + operation")
+	}
+	for _, phase := range limited.Phases {
+		if phase.ID == "etcd" && phase.SkipRun {
+			t.Error("targeted phase must not have SkipRun set")
+		}
+		if phase.ID != "etcd" && !phase.SkipRun {
+			t.Errorf("phase %s must have SkipRun set", phase.ID)
+		}
+	}
+	if got := limited.RunTarget(); got != "etcd" {
+		t.Errorf("RunTarget() = %q, want etcd", got)
+	}
+	if got := p.RunTarget(); got != "" {
+		t.Errorf("RunTarget() on full plan = %q, want empty", got)
+	}
+
+	if _, ok := p.LimitRunToPhase("does-not-exist"); ok {
+		t.Error("LimitRunToPhase(missing) reported found")
 	}
 }
 

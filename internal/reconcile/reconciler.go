@@ -221,6 +221,18 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 	previewPlanText := ""
 	pulumiSummaryText := ""
 
+	// A run limited to a single phase scopes the Pulumi apply to that phase's
+	// resources. Without this, resources of every other phase would still be
+	// diffed (and, before the full-plan registration, deleted) even though
+	// their Run() never executed.
+	var targetURNs []string
+	if target := reconcilePlan.RunTarget(); target != "" {
+		targetURNs = targetPhaseURNs(cfg.StackName(), metadata.ProjectName, target)
+		if req.Logger != nil {
+			req.Logger.Infof("scoping pulumi %s to phase=%s targets=%s", mode, target, strings.Join(targetURNs, ","))
+		}
+	}
+
 	switch mode {
 	case "preview":
 		start := time.Now()
@@ -241,6 +253,9 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		if pulumiDebugOpts != nil {
 			previewOpts = append(previewOpts, optpreview.DebugLogging(*pulumiDebugOpts))
+		}
+		if len(targetURNs) > 0 {
+			previewOpts = append(previewOpts, optpreview.Target(targetURNs))
 		}
 		var previewRes auto.PreviewResult
 		var err error
@@ -288,6 +303,9 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 		}
 		if pulumiDebugOpts != nil {
 			baseUpOpts = append(baseUpOpts, optup.DebugLogging(*pulumiDebugOpts))
+		}
+		if len(targetURNs) > 0 {
+			baseUpOpts = append(baseUpOpts, optup.Target(targetURNs))
 		}
 		firstUpOpts := baseUpOpts
 		if eventCh != nil {
@@ -843,6 +861,16 @@ func buildModuleFailureResult(cfg config.Config, _ paths.Paths, phaseID string, 
 		ErrorCode:  "phase_failed",
 		Details:    details,
 	}
+}
+
+// targetPhaseURNs returns pulumi --target glob patterns that scope an apply to
+// a single phase's component resource and its children. The URN's type segment
+// embeds the full parent type chain, so it is matched with a wildcard; child
+// resources follow the name+"-suffix" naming convention, which gives every
+// descendant the phase component's name as a prefix.
+func targetPhaseURNs(stackName, projectName, phaseID string) []string {
+	component := fmt.Sprintf("urn:pulumi:%s::%s::*::%s-%s", stackName, projectName, stackName, phaseID)
+	return []string{component, component + "-*"}
 }
 
 func pulumiProgressWriters(logger *logging.Logger, debugEnabled bool) ([]io.Writer, []io.Writer) {

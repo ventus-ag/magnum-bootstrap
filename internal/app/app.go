@@ -119,7 +119,7 @@ func addRunFlags(cmd *cobra.Command, f *runFlags, refreshDefault bool) {
 	cmd.Flags().BoolVar(&f.diff, "diff", false, "show diff-oriented output")
 	cmd.Flags().BoolVar(&f.allowPartial, "allow-partial", false, "allow missing phase implementations and run only implemented modules")
 	cmd.Flags().BoolVar(&f.refresh, "refresh", refreshDefault, "run pulumi refresh before preview or up to sync state with actual node state")
-	cmd.Flags().StringVar(&f.targetPhase, "target-phase", "", "run only the specified phase (empty means all phases in the plan)")
+	cmd.Flags().StringVar(&f.targetPhase, "target", "", "run only the specified phase: other phases skip their imperative Run() and the Pulumi apply is scoped to the phase's resources via --target (empty means all phases in the plan)")
 	cmd.Flags().IntVar(&f.parallelism, "parallelism", 0, "maximum number of phases/Pulumi operations to run in parallel (0 = auto-scale to host RAM and CPU)")
 	cmd.Flags().BoolVar(&f.debug, "debug", false, "enable Pulumi debug logging and verbose event output")
 	cmd.Flags().StringVar(&f.backendURL, "backend-url", "", "override Pulumi backend URL (default: $MAGNUM_PULUMI_BACKEND_URL or file:///var/lib/magnum/pulumi)")
@@ -360,7 +360,16 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 
 	reconcilePlan := plan.Build(cfg)
 	if f.targetPhase != "" {
-		reconcilePlan = reconcilePlan.FilterToPhase(f.targetPhase)
+		limited, ok := reconcilePlan.LimitRunToPhase(f.targetPhase)
+		if !ok {
+			msg := fmt.Sprintf("unknown --target phase %q; valid phases: %s", f.targetPhase, strings.Join(reconcilePlan.PhaseIDs(), ", "))
+			writeFailure(runtimePaths.ResultFile, "input", msg)
+			logger.Errorf("%s", msg)
+			fmt.Fprintln(stderr, msg)
+			return 1
+		}
+		reconcilePlan = limited
+		logger.Infof("targeted run: only phase %s runs; other phases register-only, pulumi apply scoped via --target", f.targetPhase)
 	}
 
 	logger.Infof("loaded desired input instance=%s role=%s operation=%s checksum=%s",

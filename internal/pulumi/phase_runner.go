@@ -85,6 +85,13 @@ func runPhaseDAG(ctx context.Context, phases []plan.Phase, registry map[string]m
 			running++
 
 			go func(phaseID string, task phaseTask) {
+				if task.phase.SkipRun {
+					if req.Logger != nil {
+						req.Logger.Infof("skipping phase=%s run (not targeted; register-only)", phaseID)
+					}
+					resultCh <- phaseRunResult{phaseID: phaseID}
+					return
+				}
 				if req.Logger != nil {
 					req.Logger.Infof("running phase=%s apply=%t", phaseID, req.Apply)
 				}
