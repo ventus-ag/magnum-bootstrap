@@ -40,11 +40,11 @@ var knownOps = map[string]bool{
 	// (single + multiple add, partial + full delete) and verify Node objects +
 	// taint scheduling semantics after every stage (see nodepool_metadata.go).
 	"nodepool-metadata": true,
-	"post-rotate":     true,
-	"cloud-smoke":     true,
-	"verify-sa":       true,
-	"autoscale":       true,
-	"sonobuoy":        true,
+	"post-rotate":       true,
+	"cloud-smoke":       true,
+	"verify-sa":         true,
+	"autoscale":         true,
+	"sonobuoy":          true,
 	// component toggle: flip an addon label on the live cluster, then assert the
 	// reconciler installed/uninstalled it (see toggle.go).
 	"disable-autoscaler":    true,
