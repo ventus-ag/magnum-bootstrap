@@ -8,6 +8,7 @@ import (
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
+	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
@@ -42,10 +43,17 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, dirResult.Changes...)
 
-	caBundle := hostresource.CopySpec{
-		Source: caBundleSource(cfg),
-		Path:   "/etc/kubernetes/ca-bundle.crt",
-		Mode:   0o644,
+	bundle, dropped, err := sanitizedCABundle(cfg)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
+	if dropped > 0 && req.Logger != nil {
+		req.Logger.Infof("kube-os-config: dropped %d certificate(s) with negative serial or unparseable DER from %s", dropped, caBundleSource(cfg))
+	}
+	caBundle := hostresource.FileSpec{
+		Path:    "/etc/kubernetes/ca-bundle.crt",
+		Content: bundle,
+		Mode:    0o644,
 	}
 	copyResult, err := caBundle.Apply(executor)
 	if err != nil {
@@ -120,6 +128,25 @@ func caBundleSource(cfg config.Config) string {
 	return "/etc/pki/tls/certs/ca-bundle.crt"
 }
 
+// sanitizedCABundle reads the system trust store and strips certificates a
+// Go >=1.23 x509 parser rejects (negative serial numbers, malformed DER).
+// Addon components (OCCM, cluster-autoscaler, magnum-auto-healer) load
+// /etc/kubernetes/ca-bundle.crt as their OpenStack ca-file and hard-fail
+// startup on the first bad cert, so the bundle must be filtered at write
+// time rather than copied verbatim.
+func sanitizedCABundle(cfg config.Config) ([]byte, int, error) {
+	source := caBundleSource(cfg)
+	raw, err := os.ReadFile(source)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read system CA bundle %s: %w", source, err)
+	}
+	clean, dropped := certutil.SanitizeTrustBundle(raw)
+	if len(clean) == 0 {
+		return nil, 0, fmt.Errorf("system CA bundle %s contains no usable certificates", source)
+	}
+	return clean, dropped, nil
+}
+
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
 	res := &Resource{}
@@ -136,13 +163,17 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	if err != nil {
 		return nil, err
 	}
-	caBundle := hostresource.CopySpec{
-		Source: caBundleSource(heat.Cfg),
-		Path:   "/etc/kubernetes/ca-bundle.crt",
-		Mode:   0o644,
+	bundle, _, err := sanitizedCABundle(heat.Cfg)
+	if err != nil {
+		return nil, err
+	}
+	caBundle := hostresource.FileSpec{
+		Path:    "/etc/kubernetes/ca-bundle.crt",
+		Content: bundle,
+		Mode:    0o644,
 	}
 	copyOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirRes)
-	if _, err := hostsdk.RegisterCopySpec(ctx, name+"-ca-bundle", caBundle, copyOpts...); err != nil {
+	if _, err := hostsdk.RegisterFileSpec(ctx, name+"-ca-bundle", caBundle, copyOpts...); err != nil {
 		return nil, err
 	}
 	for _, file := range []struct {

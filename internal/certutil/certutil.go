@@ -330,3 +330,34 @@ func containsIP(values []net.IP, target net.IP) bool {
 	}
 	return false
 }
+
+// SanitizeTrustBundle filters a PEM trust bundle down to certificates that
+// Go >=1.23 x509 accepts. Old system stores (FCoS 34 era) carry roots with
+// negative serial numbers (e.g. the EC-ACC root), which modern Go rejects
+// with "x509: negative serial number" — cloud-provider-openstack, the
+// cluster autoscaler, and magnum-auto-healer then hard-fail startup when
+// such a cert is present in their ca-file. Unparseable and negative-serial
+// certificates are dropped; surviving certs are re-encoded in order.
+// Returns the sanitized bundle and the number of dropped certificates.
+func SanitizeTrustBundle(bundle []byte) ([]byte, int) {
+	var out bytes.Buffer
+	dropped := 0
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil || cert.SerialNumber == nil || cert.SerialNumber.Sign() < 0 {
+			dropped++
+			continue
+		}
+		_ = pem.Encode(&out, &pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})
+	}
+	return out.Bytes(), dropped
+}
