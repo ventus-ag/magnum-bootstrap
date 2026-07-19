@@ -1,1 +1,1 @@
-{"schemaVersion": 1, "label": "k8s conformance (quick)", "message": "v1.36 ✔", "color": "brightgreen", "cacheSeconds": 300}
+{"schemaVersion": 1, "label": "k8s conformance (certified-conformance)", "message": "v1.33 ✔ · v1.34 ✔ · v1.35 ✔ · v1.36 ✔", "color": "brightgreen", "cacheSeconds": 300}
