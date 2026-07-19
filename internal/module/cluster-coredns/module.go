@@ -2,10 +2,12 @@ package clustercoredns
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/kubeletconfig"
 	"github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
@@ -21,7 +23,27 @@ func (Module) PhaseID() string        { return "cluster-coredns" }
 func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	return clusterhelm.RunNoop(ctx, cfg, req, cfg.IsFirstMaster(), "coredns", "kube-system")
+	res, err := clusterhelm.RunNoop(ctx, cfg, req, cfg.IsFirstMaster(), "coredns", "kube-system")
+	if err == nil && cfg.IsFirstMaster() && req.Apply {
+		ensureServiceTCPPort(req)
+	}
+	return res, err
+}
+
+func ensureServiceTCPPort(req moduleapi.Request) {
+	executor := host.NewExecutor(req.Apply, req.Logger)
+	protos, err := executor.RunCapture("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+		"get", "service", "kube-dns", "-n", "kube-system",
+		"-o", "jsonpath={.spec.ports[*].protocol}")
+	if err != nil || strings.Contains(protos, "TCP") {
+		return
+	}
+	if req.Logger != nil {
+		req.Logger.Warnf("cluster-coredns: kube-dns Service has no TCP port; adding tcp-53")
+	}
+	_ = executor.Run("kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+		"patch", "service", "kube-dns", "-n", "kube-system", "--type=json",
+		"-p", `[{"op":"add","path":"/spec/ports/-","value":{"name":"tcp-53","port":53,"protocol":"TCP","targetPort":53}}]`)
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
@@ -170,7 +192,8 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				map[string]interface{}{
 					"zones": []interface{}{
 						map[string]interface{}{
-							"zone": ".",
+							"zone":    ".",
+							"use_tcp": true,
 						},
 					},
 					"port": 53,
@@ -260,13 +283,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 //	                                kubeadm version via corednsImageTags)
 //	chart 1.31.0 → CoreDNS 1.11.1  (K8s 1.29-1.30)
 //	chart 1.36.1 → CoreDNS 1.11.3  (K8s 1.31-1.32)
-//	chart 1.42.2 → CoreDNS 1.12.0  (K8s 1.33)
+//	chart 1.42.4 → CoreDNS 1.12.2  (K8s 1.33; image stays v1.12.0 via corednsImageTags)
 //	chart 1.44.3 → CoreDNS 1.12.3  (K8s 1.34)
 //	chart 1.45.2 → CoreDNS 1.13.1  (K8s 1.35)
 var corednsChartVersions = map[string]string{
 	"1.35": "1.45.2",
 	"1.34": "1.44.3",
-	"1.33": "1.42.2",
+	"1.33": "1.42.4",
 	"1.32": "1.36.1",
 	"1.31": "1.36.1",
 	"1.30": "1.31.0",
