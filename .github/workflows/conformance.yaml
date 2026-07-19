@@ -124,3 +124,64 @@ jobs:
       sonobuoy_mode: ${{ needs.resolve.outputs.mode }}
       use_prebuilt: false
     secrets: inherit
+
+  # Refresh the per-version status badge on the `badges` branch. The README
+  # embeds it via a shields.io endpoint badge, so the live status never needs
+  # a commit to main — only this branch moves.
+  badge:
+    name: Update status badge
+    needs: [resolve, conformance]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Build badge JSON from leg results
+        run: |
+          set -euo pipefail
+          mode="${{ needs.resolve.outputs.mode }}"
+          # Per-leg conclusions: reusable-workflow legs surface in the jobs API
+          # as "sonobuoy <version> / e2e-openstack".
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" --paginate \
+            --jq '.jobs[] | select(.name | startswith("sonobuoy ")) | [.name, .conclusion // "pending"] | @tsv' > jobs.tsv
+          cat jobs.tsv
+          message=""
+          color="brightgreen"
+          while IFS=$'\t' read -r name conclusion; do
+            version="$(echo "$name" | sed -E 's/^sonobuoy (v[^ ]+) \/.*/\1/')"
+            short="${version%.*}"
+            case "$conclusion" in
+              success) mark="✔" ;;
+              skipped|cancelled) mark="∅"; [ "$color" = "brightgreen" ] && color="yellow" ;;
+              *) mark="✖"; color="red" ;;
+            esac
+            message="${message:+$message · }${short} ${mark}"
+          done < <(sort -u jobs.tsv)
+          if [ -z "$message" ]; then
+            message="no legs"
+            color="lightgrey"
+          fi
+          printf '{"schemaVersion": 1, "label": "k8s conformance (%s)", "message": "%s", "color": "%s", "cacheSeconds": 300}\n' \
+            "$mode" "$message" "$color" > conformance.json
+          cat conformance.json
+
+      - name: Push badge to badges branch
+        run: |
+          set -euo pipefail
+          rm -rf badges-branch
+          git clone --depth 1 --branch badges \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" badges-branch
+          cp conformance.json badges-branch/conformance.json
+          cd badges-branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "badge unchanged"
+            exit 0
+          fi
+          git add conformance.json
+          git commit -m "badges: conformance ${{ github.run_id }}"
+          git push origin badges
