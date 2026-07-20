@@ -270,34 +270,41 @@ func (r *runner) nodepoolMetadataSmoke(ctx context.Context) error {
 	return nil
 }
 
-// patchNodepoolMetadata replaces the nodepool's node_labels/node_taints Magnum
-// labels (empty string removes the key) via a raw JSON-patch — gophercloud's
-// nodegroups.Update builder only whitelists the min/max node count paths.
+// patchNodepoolMetadata sets/removes the nodepool's node_labels/node_taints
+// Magnum labels (empty string removes the key) via a raw JSON-patch —
+// gophercloud's nodegroups.Update builder only whitelists the min/max node
+// count paths. Ops are PER-KEY ("/labels/node_labels"): Magnum's
+// JsonPatchType only accepts string/int values, so a whole-map
+// `replace /labels {dict}` is rejected with a wsme 400. "add" upserts per RFC
+// 6902; "remove" is only emitted when the key exists (strict jsonpatch errors
+// on removing a missing key).
 func (r *runner) patchNodepoolMetadata(ctx context.Context, nodeLabels, nodeTaints string) error {
 	ng, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
 	if err != nil {
 		return err
 	}
-	labels := map[string]string{}
-	for k, v := range ng.Labels {
-		labels[k] = v
+	var ops []map[string]any
+	setOrRemove := func(key, value string) {
+		_, exists := ng.Labels[key]
+		switch {
+		case value != "":
+			ops = append(ops, map[string]any{"op": "add", "path": "/labels/" + key, "value": value})
+		case exists:
+			ops = append(ops, map[string]any{"op": "remove", "path": "/labels/" + key})
+		}
 	}
-	if nodeLabels == "" {
-		delete(labels, "node_labels")
-	} else {
-		labels["node_labels"] = nodeLabels
+	setOrRemove("node_labels", nodeLabels)
+	setOrRemove("node_taints", nodeTaints)
+	if len(ops) == 0 {
+		// Nothing would change → Magnum would never start an UPDATE and the
+		// caller's transition wait could only hang. Fail loud instead.
+		return fmt.Errorf("patch nodegroup %q: no metadata changes to apply (node_labels=%q node_taints=%q already absent)", ng.Name, nodeLabels, nodeTaints)
 	}
-	if nodeTaints == "" {
-		delete(labels, "node_taints")
-	} else {
-		labels["node_taints"] = nodeTaints
-	}
-	ops := []map[string]any{{"op": "replace", "path": "/labels", "value": labels}}
 	url := r.magnum.ServiceURL("clusters", r.cfg.clusterName, "nodegroups", ng.UUID)
 	if _, err := r.magnum.Patch(ctx, url, ops, nil, &gophercloud.RequestOpts{OkCodes: []int{200, 202}}); err != nil {
 		return fmt.Errorf("patch nodegroup %q labels: %w", ng.Name, err)
 	}
-	r.log("nodepool %q labels patched: node_labels=%q node_taints=%q", ng.Name, nodeLabels, nodeTaints)
+	r.log("nodepool %q labels patched (%d op(s)): node_labels=%q node_taints=%q", ng.Name, len(ops), nodeLabels, nodeTaints)
 	return nil
 }
 
