@@ -381,6 +381,9 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 	case "nodepool-metadata":
 		return r.nodepoolMetadataCycle(ctx)
 
+	case "nodepool-metadata-smoke":
+		return r.nodepoolMetadataSmoke(ctx)
+
 	case "post-rotate":
 		return r.postRotateScale(ctx)
 
@@ -721,6 +724,15 @@ func (r *runner) nodepoolName() string {
 // nodegroup version-skew guard rejects more). MergeLabels keeps the template's
 // CNI/runtime/reconciler labels (see merge_labels gotcha).
 func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
+	return r.triggerNodepoolCreateMetadata(ctx, count, "", "")
+}
+
+// triggerNodepoolCreateMetadata creates the extra nodepool and, when
+// nodeLabels/nodeTaints are non-empty, bakes them into the nodegroup labels at
+// CREATE time (the node_labels/node_taints transport). This exercises the
+// kubelet registration path (registerWithTaints + --node-labels) as opposed to
+// the day-2 PATCH path, so a node is born already labelled and tainted.
+func (r *runner) triggerNodepoolCreateMetadata(ctx context.Context, count int, nodeLabels, nodeTaints string) error {
 	n := count
 	merge := true
 	opts := nodegroups.CreateOpts{
@@ -740,6 +752,18 @@ func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
 		}
 		opts.Labels = map[string]string{"cluster_template_id": tmplID}
 		tmplLabel = fmt.Sprintf(", cluster_template_id=%s (%s)", r.cfg.nodepoolTemplate, tmplID)
+	}
+	if nodeLabels != "" || nodeTaints != "" {
+		if opts.Labels == nil {
+			opts.Labels = map[string]string{}
+		}
+		if nodeLabels != "" {
+			opts.Labels["node_labels"] = nodeLabels
+		}
+		if nodeTaints != "" {
+			opts.Labels["node_taints"] = nodeTaints
+		}
+		tmplLabel += fmt.Sprintf(", node_labels=%q, node_taints=%q", nodeLabels, nodeTaints)
 	}
 	ng, err := nodegroups.Create(ctx, r.magnum, r.cfg.clusterName, opts).Extract()
 	if err != nil {

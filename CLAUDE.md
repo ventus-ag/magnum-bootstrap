@@ -622,10 +622,17 @@ untolerated nodepool probe would fail while the pool is tainted); one full
 bundle runs at the end. Wired into the `multinode` and `ubuntu-nodepool`
 presets right after `add-nodepool`.
 Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Default-sweep
-presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade, worker
+presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade,
+`nodepool-metadata-smoke` [create a nodepool with a label+taint baked in →
+prove the taint → PATCH them away → verify removal → delete the pool], worker
 resize, repeated CA-rotate/upgrade wedge, post-rotate add), `multinode` (3m/2w
-Fedora + extra worker nodepool: nodepool/worker resize up/down, repeated wedge,
-post-rotate add), `ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+Fedora + extra worker nodepool: `nodepool-metadata` 4-stage add/delete cycle,
+nodepool/worker resize up/down, repeated wedge, post-rotate add),
+`ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+`smoke` runs on **every push/PR** (per-PR e2e-openstack matrix), so nodepool
+label/taint create+remove is exercised on a real cluster each MR;
+`nodepool-metadata`'s deeper 4-stage cycle runs in `multinode` (nightly `all`
+sweep + label-gated).
 Focused manual presets remain available: `chained-single`, `chained-multinode`,
 and `component-toggle`.
 

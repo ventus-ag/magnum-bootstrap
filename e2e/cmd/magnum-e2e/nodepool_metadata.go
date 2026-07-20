@@ -149,6 +149,76 @@ func (r *runner) nodepoolMetadataCycle(ctx context.Context) error {
 	return r.verifyBundle(ctx, "nodepool-metadata", false)
 }
 
+// nodepoolMetadataSmoke is the "nodepool-metadata-smoke" op: a compact
+// create → verify → remove → verify → delete lifecycle for the smoke scenario.
+// Unlike the full nodepool-metadata op (which patches an existing pool through
+// four stages), this CREATES a fresh nodepool with a label + a NoSchedule
+// taint baked in at creation (exercising the kubelet registration path), then
+// removes them via a single PATCH, then deletes the pool. Self-contained — it
+// owns the pool's whole lifetime, so it needs no add-nodepool/del-nodepool
+// bracketing in the op chain.
+func (r *runner) nodepoolMetadataSmoke(ctx context.Context) error {
+	nodeLabels := npLabelTeamKey + "=" + npLabelTeamVal
+	nodeTaints := npTaintMainKey + "=" + npTaintMainVal + ":NoSchedule"
+
+	// 1. Create the pool with the label + taint baked in.
+	prevActive := r.nodepoolActive
+	r.nodepoolActive = true
+	if err := r.runMutationNoBundle(ctx, "nodepool-metadata-smoke create (label+taint)", func() error {
+		return r.triggerNodepoolCreateMetadata(ctx, 1, nodeLabels, nodeTaints)
+	}); err != nil {
+		r.nodepoolActive = prevActive
+		return err
+	}
+
+	present := npMetaStage{
+		name:       "smoke-present",
+		wantLabels: map[string]string{npLabelTeamKey: npLabelTeamVal},
+		wantTaints: []npExpectedTaint{{key: npTaintMainKey, value: npTaintMainVal, effect: corev1.TaintEffectNoSchedule}},
+	}
+	if err := r.waitNodepoolNodeMetadata(ctx, present); err != nil {
+		return err
+	}
+	// The taint was set at registration — prove it: untolerated pod rejected,
+	// tolerated pod runs.
+	if err := r.verifyTaintBlocksScheduling(ctx); err != nil {
+		return err
+	}
+	if err := r.verifyTolerationSchedules(ctx); err != nil {
+		return err
+	}
+
+	// 2. Remove the label + taint via a single PATCH; verify the node converges.
+	if err := r.runMutationNoBundle(ctx, "nodepool-metadata-smoke remove (label+taint)", func() error {
+		return r.patchNodepoolMetadata(ctx, "", "")
+	}); err != nil {
+		return err
+	}
+	absent := npMetaStage{
+		name:         "smoke-absent",
+		absentLabels: []string{npLabelTeamKey},
+		absentTaints: []string{npTaintMainKey},
+	}
+	if err := r.waitNodepoolNodeMetadata(ctx, absent); err != nil {
+		return err
+	}
+	// Taint gone → the untolerated pod shape now schedules.
+	if err := r.verifyUntoleratedSchedules(ctx); err != nil {
+		return err
+	}
+
+	// 3. Delete the pool (full bundle after: pool gone, cluster back to base).
+	r.nodepoolActive = false
+	if err := r.runMutation(ctx, "nodepool-metadata-smoke delete", true, func() error {
+		return r.triggerNodepoolDelete(ctx)
+	}); err != nil {
+		r.nodepoolActive = true
+		return err
+	}
+	r.log("nodepool metadata smoke (create+label+taint → remove → delete) OK ✅")
+	return nil
+}
+
 // patchNodepoolMetadata replaces the nodepool's node_labels/node_taints Magnum
 // labels (empty string removes the key) via a raw JSON-patch — gophercloud's
 // nodegroups.Update builder only whitelists the min/max node count paths.

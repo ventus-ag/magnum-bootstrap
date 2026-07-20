@@ -40,11 +40,14 @@ var knownOps = map[string]bool{
 	// (single + multiple add, partial + full delete) and verify Node objects +
 	// taint scheduling semantics after every stage (see nodepool_metadata.go).
 	"nodepool-metadata": true,
-	"post-rotate":       true,
-	"cloud-smoke":       true,
-	"verify-sa":         true,
-	"autoscale":         true,
-	"sonobuoy":          true,
+	// nodepool-metadata-smoke: compact create-with-label+taint -> remove ->
+	// delete lifecycle for the smoke scenario (see nodepool_metadata.go).
+	"nodepool-metadata-smoke": true,
+	"post-rotate":             true,
+	"cloud-smoke":             true,
+	"verify-sa":               true,
+	"autoscale":               true,
+	"sonobuoy":                true,
 	// component toggle: flip an addon label on the live cluster, then assert the
 	// reconciler installed/uninstalled it (see toggle.go).
 	"disable-autoscaler":    true,
@@ -156,7 +159,7 @@ const (
 var scenarios = map[string]scenarioDef{
 	"smoke": {
 		masters: 1, workers: 1,
-		ops: "disable-autoscaler,enable-metrics-server,upgrade,cloud-smoke,resize-workers=2,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate",
+		ops: "disable-autoscaler,enable-metrics-server,upgrade,cloud-smoke,nodepool-metadata-smoke,resize-workers=2,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate",
 		// The 3 `upgrade` ops climb a real version ladder (see climbLadder) instead
 		// of re-upgrading to 1.31 three times — one rung per `upgrade` op.
 		upgradeLadder: climbLadder,
