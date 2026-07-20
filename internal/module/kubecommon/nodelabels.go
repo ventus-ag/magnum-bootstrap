@@ -67,13 +67,20 @@ func EnsureNodeMetadata(cfg config.Config, executor *host.Executor, kubectl, kub
 	if err != nil {
 		return nil, err
 	}
-	nodeName := cfg.Shared.InstanceName
-	var changes []host.Change
-
 	run := func(args ...string) error {
 		full := append([]string{"--kubeconfig=" + kubeconfig}, args...)
 		return executor.Run(kubectl, full...)
 	}
+	return reconcileNodeMetadata(cfg, cfg.Shared.InstanceName, node, run, apply)
+}
+
+// reconcileNodeMetadata is the pure decision + emission core of
+// EnsureNodeMetadata: given the fetched node state it computes and (when
+// apply) executes the ordered kubectl operations via the injected run func.
+// Split out so the add/update/remove and managed-annotation union/narrow
+// logic is unit-testable without a live cluster or an executor.
+func reconcileNodeMetadata(cfg config.Config, nodeName string, node *nodeDocument, run func(args ...string) error, apply bool) ([]host.Change, error) {
+	var changes []host.Change
 
 	// ---- Labels ----
 	desired, remove := desiredNodeLabels(cfg)
