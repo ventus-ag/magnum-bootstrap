@@ -229,9 +229,11 @@ func (r *runner) waitNodepoolNodeMetadata(ctx context.Context, stage npMetaStage
 // nodeMetadataMismatch returns "" when the node matches the stage's expected
 // state, else a human-readable reason.
 func nodeMetadataMismatch(node corev1.Node, stage npMetaStage) string {
-	// The reconciler's own worker role label must hold in every stage.
-	if _, ok := node.Labels["node-role.kubernetes.io/worker"]; !ok {
-		return "label node-role.kubernetes.io/worker missing"
+	// Workers carry NO node-role.kubernetes.io/* label by default (empty ROLES,
+	// matching GKE/kubeadm); the canonical worker identity is
+	// magnum.openstack.org/role=worker, set by the kubelet at registration.
+	if node.Labels["magnum.openstack.org/role"] != "worker" {
+		return "label magnum.openstack.org/role != worker"
 	}
 	for key, want := range stage.wantLabels {
 		got, ok := node.Labels[key]

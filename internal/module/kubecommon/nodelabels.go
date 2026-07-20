@@ -324,19 +324,14 @@ func desiredNodeLabels(cfg config.Config) (map[string]string, []string) {
 			desired["node-role.kubernetes.io/master"] = ""
 			remove = append(remove, "node-role.kubernetes.io/control-plane")
 		}
-	} else {
-		// Workers get a visible ROLES column entry. NodeRestriction blocks the
-		// kubelet from self-setting node-role.* — applied via node-manager
-		// (or master admin) credentials only.
-		desired["node-role.kubernetes.io/"+workerRoleName(cfg.Shared.NodegroupRole)] = ""
 	}
+	// Workers get NO node-role.kubernetes.io/* label by default — matching
+	// kubeadm/GKE/EKS, where the ROLES column is empty for workers. Their
+	// group identity is magnum.openstack.org/role=worker (kubelet-self-set at
+	// registration, non-restricted). An operator who wants a visible role adds
+	// node-role.kubernetes.io/<x> explicitly via NODE_LABELS (applied through
+	// the node-manager credential). Keeping the default empty means a plain
+	// worker reconcile writes only non-restricted labels and never depends on
+	// the node-manager path.
 	return desired, remove
-}
-
-func workerRoleName(role string) string {
-	role = strings.ToLower(strings.TrimSpace(role))
-	if role == "" || role == "minion" {
-		return "worker"
-	}
-	return role
 }

@@ -830,7 +830,7 @@ scenario_node_metadata() {
   WORKER_NODE_LABELS="e2e-team=magnum;e2e-env=ci;node-role.kubernetes.io/e2e-tier="
   WORKER_NODE_TAINTS="e2e-dedicated=np:NoSchedule;e2e-phase=test:PreferNoSchedule"
   apply_worker 0 create "$KUBE_TAG"
-  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node 'e2e-team=magnum;e2e-env=ci;node-role.kubernetes.io/e2e-tier=;node-role.kubernetes.io/worker=' 'e2e-dedicated=np:NoSchedule;e2e-phase=test:PreferNoSchedule' - -"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node 'e2e-team=magnum;e2e-env=ci;node-role.kubernetes.io/e2e-tier=' 'e2e-dedicated=np:NoSchedule;e2e-phase=test:PreferNoSchedule' - -"
 
   log "--- stage delete-single ---"
   WORKER_NODE_LABELS="e2e-team=magnum;node-role.kubernetes.io/e2e-tier="
