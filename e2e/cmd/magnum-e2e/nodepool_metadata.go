@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/nodegroups"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -279,9 +280,15 @@ func (r *runner) nodepoolMetadataSmoke(ctx context.Context) error {
 // 6902; "remove" is only emitted when the key exists (strict jsonpatch errors
 // on removing a missing key).
 func (r *runner) patchNodepoolMetadata(ctx context.Context, nodeLabels, nodeTaints string) error {
-	ng, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
+	resolved, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
 	if err != nil {
 		return err
+	}
+	// The nodegroup LIST view is a summary WITHOUT labels — diffing against it
+	// makes every key look absent. Fetch the detail view for the real labels.
+	ng, err := nodegroups.Get(ctx, r.magnum, r.cfg.clusterName, resolved.UUID).Extract()
+	if err != nil {
+		return fmt.Errorf("get nodegroup %q detail: %w", resolved.Name, err)
 	}
 	var ops []map[string]any
 	setOrRemove := func(key, value string) {
