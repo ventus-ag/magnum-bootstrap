@@ -1,7 +1,6 @@
 package kubecommon
 
 import (
-	"sort"
 	"strings"
 	"testing"
 
@@ -135,7 +134,7 @@ func TestReconcileRemovesManagedPreservesForeign(t *testing.T) {
 			config.ManagedTaintsAnnotation: "dedicated:NoSchedule",
 		},
 		[]nodeTaintDoc{
-			{Key: "dedicated", Value: "gpu", Effect: "NoSchedule"}, // managed, now undesired
+			{Key: "dedicated", Value: "gpu", Effect: "NoSchedule"},       // managed, now undesired
 			{Key: "node.kubernetes.io/unreachable", Effect: "NoExecute"}, // foreign condition taint
 		},
 	)
@@ -194,8 +193,6 @@ func TestReconcileIdempotent(t *testing.T) {
 		map[string]string{"team": "ml"},
 		[]config.NodeTaint{{Key: "dedicated", Value: "gpu", Effect: "NoSchedule"}},
 	)
-	managedLabels := []string{"team"}
-	sort.Strings(managedLabels)
 	node := nodeDoc(
 		map[string]string{
 			"magnum.openstack.org/role":      "worker",
