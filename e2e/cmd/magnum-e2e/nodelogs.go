@@ -113,19 +113,39 @@ func (r *runner) clusterNodeIPs(ctx context.Context) ([]nodeAddr, error) {
 	// Nova server names are "<stackname>-master-N" / "<stackname>-node-N", and the
 	// stack name is the truncated cluster name + a stack short-id — NOT the cluster
 	// name — so filter by the resolved stack name. Fall back to the cluster name.
+	// Extra NODEPOOL stacks truncate the cluster name even harder
+	// ("<cluster[:20]>-<npname[:9]>-<shortid>"), so a second query with the
+	// 20-char cluster prefix catches nodepool servers the main-stack filter
+	// misses (this blind spot hid the nodepool node from a diagnostics bundle).
 	nameFilter := r.cfg.clusterName
 	if c, cerr := r.getCluster(ctx); cerr == nil && c.StackID != "" {
 		if sn, serr := r.resolveStackName(ctx, c.StackID); serr == nil {
 			nameFilter = sn
 		}
 	}
-	pages, err := servers.List(nova, servers.ListOpts{Name: nameFilter}).AllPages(ctx)
-	if err != nil {
-		return nil, err
+	filters := []string{nameFilter}
+	if prefix := r.cfg.clusterName; len(prefix) > 20 {
+		filters = append(filters, prefix[:20])
+	} else if prefix != nameFilter {
+		filters = append(filters, prefix)
 	}
-	srvs, err := servers.ExtractServers(pages)
-	if err != nil {
-		return nil, err
+	seen := map[string]bool{}
+	var srvs []servers.Server
+	for _, filter := range filters {
+		pages, err := servers.List(nova, servers.ListOpts{Name: filter}).AllPages(ctx)
+		if err != nil {
+			return nil, err
+		}
+		got, err := servers.ExtractServers(pages)
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range got {
+			if !seen[s.ID] {
+				seen[s.ID] = true
+				srvs = append(srvs, s)
+			}
+		}
 	}
 	var out []nodeAddr
 	for _, s := range srvs {

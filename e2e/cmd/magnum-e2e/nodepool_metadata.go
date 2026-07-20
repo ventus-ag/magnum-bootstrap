@@ -114,6 +114,13 @@ func (r *runner) nodepoolMetadataCycle(ctx context.Context) error {
 	if !r.nodepoolActive {
 		return fmt.Errorf("nodepool-metadata op requires an active nodepool — put add-nodepool before it in the op chain")
 	}
+	supported, err := r.nodepoolMetadataSupported(ctx)
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return fmt.Errorf("nodepool-metadata: %s", nodepoolMetadataUnsupportedMsg)
+	}
 	for _, stage := range npMetaStages {
 		// No verifyBundle per stage: its nodepool probe pod is untolerated and
 		// would fail while the pool is tainted. Each stage runs its own
@@ -149,6 +156,38 @@ func (r *runner) nodepoolMetadataCycle(ctx context.Context) error {
 	return r.verifyBundle(ctx, "nodepool-metadata", false)
 }
 
+// nodepoolMetadataSupported reports whether the DEPLOYED Magnum renders the
+// node_labels/node_taints heat params into the nodepool's stack. A pre-feature
+// magnum_victoria accepts the labels on the nodegroup (arbitrary labels always
+// pass) but silently drops them before heat-params — the node then never sees
+// the metadata and the convergence wait can only time out. Probing the stack
+// parameters turns that 25-minute red herring into an immediate, actionable
+// failure (these ops are required gates and never skip).
+func (r *runner) nodepoolMetadataSupported(ctx context.Context) (bool, error) {
+	ng, err := r.resolveNodeGroupByName(ctx, r.nodepoolName())
+	if err != nil {
+		return false, err
+	}
+	orch, err := r.orchClient()
+	if err != nil {
+		return false, err
+	}
+	var resp struct {
+		Stack struct {
+			Parameters map[string]any `json:"parameters"`
+		} `json:"stack"`
+	}
+	if _, err := orch.Get(ctx, orch.ServiceURL("stacks", ng.StackID), &resp, &gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
+		return false, fmt.Errorf("get nodepool stack %s: %w", ng.StackID, err)
+	}
+	_, ok := resp.Stack.Parameters["node_labels"]
+	return ok, nil
+}
+
+const nodepoolMetadataUnsupportedMsg = "deployed Magnum does not render node_labels/node_taints heat params " +
+	"(pre-feature magnum_victoria on this cloud) — metadata is stored on the nodegroup but never reaches the nodes; " +
+	"this cloud must run the magnum_victoria fork with nodepool metadata support"
+
 // nodepoolMetadataSmoke is the "nodepool-metadata-smoke" op: a compact
 // create → verify → remove → verify → delete lifecycle for the smoke scenario.
 // Unlike the full nodepool-metadata op (which patches an existing pool through
@@ -169,6 +208,18 @@ func (r *runner) nodepoolMetadataSmoke(ctx context.Context) error {
 	}); err != nil {
 		r.nodepoolActive = prevActive
 		return err
+	}
+
+	// Fail FAST (seconds, with the real reason) when the cloud's Magnum
+	// predates the feature — otherwise the convergence wait below can only
+	// burn its full timeout on a misleading "label missing". This op is a
+	// required gate: it must never silently skip.
+	supported, err := r.nodepoolMetadataSupported(ctx)
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return fmt.Errorf("nodepool-metadata-smoke: %s", nodepoolMetadataUnsupportedMsg)
 	}
 
 	present := npMetaStage{
