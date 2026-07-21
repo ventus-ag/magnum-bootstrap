@@ -118,14 +118,38 @@ func runtimeKnownEntryCount(executor *host.Executor) (int, error) {
 		return 0, err
 	}
 	count := len(strings.Fields(out))
-	// Sandboxes live in a separate store on containerd 2.x and may not appear
-	// in `containers ls`. Best-effort: older ctr lacks the subcommand — a
-	// failure there adds nothing (containers count already collected).
+	// Sandboxes live in a separate store on containerd 2.x; count them explicitly
+	// in case a version does not also surface them via `containers ls` (2.3 does,
+	// see the overlap note below). `ctr sandboxes ls` does NOT accept `-q` (2.3
+	// rejects it: "flag provided but not defined: -q"), so run the plain table
+	// form and drop its header row. This count MUST be included: it is half the
+	// heal's "zero containers AND zero sandboxes" wedge gate — dropping it (the
+	// old `-q` call silently errored out) lets a node running only sandboxes and
+	// no workload containers be misjudged as wedged, killing live sandbox shims.
+	// Best-effort only for a genuinely older ctr lacking the subcommand (err).
+	// Sandbox IDs may overlap `containers ls` (containerd 2.3 lists pause
+	// sandboxes in both) — overcounting is fine, the gate only tests zero vs
+	// non-zero; only an UNDERCOUNT toward zero is dangerous, so never drop this.
 	if out, err := executor.RunCapture(ctr, "--address", "/run/containerd/containerd.sock",
-		"--namespace", "k8s.io", "sandboxes", "ls", "-q"); err == nil {
-		count += len(strings.Fields(out))
+		"--namespace", "k8s.io", "sandboxes", "ls"); err == nil {
+		count += countTableRowsSkippingHeader(out)
 	}
 	return count, nil
+}
+
+// countTableRowsSkippingHeader counts data rows in a `ctr ... ls` table,
+// dropping the single header line. Empty or header-only output returns 0.
+func countTableRowsSkippingHeader(out string) int {
+	rows := 0
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			rows++
+		}
+	}
+	if rows <= 1 {
+		return 0
+	}
+	return rows - 1
 }
 
 // runtimeMainStartTick returns the start tick of the containerd main process.

@@ -206,3 +206,24 @@ func TestPollUntilTick_ReissuesWhileWaiting(t *testing.T) {
 		t.Fatal("tick never fired while waiting")
 	}
 }
+
+func TestCountTableRowsSkippingHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{"empty", "", 0},
+		{"header only", "ID CONTROLLER READY\n", 0},
+		{"header plus two", "ID CONTROLLER READY\nabc runc true\ndef runc true\n", 2},
+		{"blank lines ignored", "ID X\n\n  \nabc y\n", 1},
+		{"quiet-style no header still counts minus one", "id1\nid2\nid3", 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := countTableRowsSkippingHeader(c.in); got != c.want {
+				t.Fatalf("got %d, want %d", got, c.want)
+			}
+		})
+	}
+}
