@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -303,18 +304,19 @@ func relocateLiveRuntimeStore(executor *host.Executor, req moduleapi.Request, st
 		return nil, fmt.Errorf("storage: %s still active after stop; refusing to relocate a live store", runtimeService)
 	}
 
-	// Kill leftover shims: every orphan pod dies with its shim, releasing RWO
-	// volume mounts, host ports and CNI IPs. pkill exits 1 when nothing
-	// matches — not an error.
-	_ = executor.Run("pkill", "-9", "-f", "containerd-shim")
-	for i := 0; i < 30 && leftoverShimsRunning(executor); i++ {
-		time.Sleep(500 * time.Millisecond)
+	// Take the pods down before mounting over their store. Politely first: a
+	// stateful workload (e.g. a database) gets a SIGTERM and a grace window to
+	// flush and shut down cleanly; a well-behaved container exits and its shim
+	// exits with it. Only shims that ignore the polite stop are then force-killed.
+	runtimeStateDir := "/run/containerd"
+	if runtimeService == "docker" {
+		runtimeStateDir = "/run/docker"
 	}
-	if leftoverShimsRunning(executor) {
-		return nil, fmt.Errorf("storage: leftover containerd-shim processes survived SIGKILL; refusing to mount over a busy store")
+	if err := stopLeftoverPodShims(executor, req, storageDir, runtimeStateDir); err != nil {
+		return nil, err
 	}
 	changes = append(changes, host.Change{Action: host.ActionDelete, Path: storageDir,
-		Summary: "stop runtime and kill leftover pod shims before store relocation"})
+		Summary: "gracefully stop pods, then kill leftover shims before store relocation"})
 
 	// Container rootfs overlays (and sandbox shm mounts) linger after their
 	// processes die; unmount deepest-first so the store content is removable.
@@ -324,10 +326,6 @@ func relocateLiveRuntimeStore(executor *host.Executor, req moduleapi.Request, st
 		// A mount we cannot detach even lazily would make the clear below
 		// fail with an opaque EBUSY — name the offender instead.
 		return nil, fmt.Errorf("storage: mounts still busy under %s after unmount attempts: %s", storageDir, strings.Join(leftover, ", "))
-	}
-	runtimeStateDir := "/run/containerd"
-	if runtimeService == "docker" {
-		runtimeStateDir = "/run/docker"
 	}
 	uc, leftover = unmountAllUnder(executor, runtimeStateDir)
 	changes = append(changes, uc...)
@@ -355,6 +353,132 @@ func relocateLiveRuntimeStore(executor *host.Executor, req moduleapi.Request, st
 		req.Restarts.Add("kubelet", "runtime store relocated to dedicated volume")
 	}
 	return changes, nil
+}
+
+const (
+	// defaultRelocateGracePeriod is how long a container gets to shut down after
+	// SIGTERM before it is force-killed. Sized above the 30s Kubernetes default
+	// terminationGracePeriodSeconds so a database has time to flush.
+	defaultRelocateGracePeriod = 90 * time.Second
+	// defaultRelocateForceWait bounds the SIGKILL phase. The old value was a
+	// fixed 15s, which tripped the guard on shims that were merely slow to die
+	// (dozens of pods plus their CSI/overlay mounts tearing down on a real node).
+	defaultRelocateForceWait = 120 * time.Second
+
+	relocateGraceEnv = "MAGNUM_STORAGE_RELOCATE_GRACE_SECONDS"
+	relocateForceEnv = "MAGNUM_STORAGE_RELOCATE_FORCE_SECONDS"
+)
+
+// stopLeftoverPodShims takes down the pods still running on the root-disk store
+// before the dedicated volume is mounted over it. It escalates:
+//  1. polite — SIGTERM each container's init process and wait the grace window,
+//     so a stateful workload flushes and exits cleanly (its shim exits with it);
+//  2. force — SIGKILL any shim that ignored the polite stop, re-issuing the kill
+//     periodically because the container-runtime phase restarts containerd right
+//     before storage runs and it re-adopts the old shims, racing a one-shot kill;
+//  3. last resort — a shim stuck in uninterruptible sleep (D-state) on an
+//     overlay/CSI mount cannot be reaped until that I/O unblocks, so lazy-unmount
+//     the store and runtime state dir to release it, then try once more.
+//
+// It returns an error only if shims genuinely refuse to die, which on a real
+// node means a hung mount backend that only a reboot clears.
+func stopLeftoverPodShims(executor *host.Executor, req moduleapi.Request, storageDir, runtimeStateDir string) error {
+	grace := resolveRelocateDuration(relocateGraceEnv, defaultRelocateGracePeriod)
+	force := resolveRelocateDuration(relocateForceEnv, defaultRelocateForceWait)
+
+	// 1. Polite: SIGTERM the container inits (children of the shims), not the
+	// shims themselves — signalling PID 1 inside each container is what lets the
+	// workload shut down cleanly. podman/conmon system units (kube-proxy,
+	// heat-container-agent carrying the Heat signal) are not containerd shims and
+	// are left untouched.
+	if inits := containerInitPIDs(executor); len(inits) > 0 && grace > 0 {
+		req.Logger.Infof("storage: SIGTERM %d container workload(s) before relocation, grace %s", len(inits), grace)
+		for _, pid := range inits {
+			_ = executor.Run("kill", "-TERM", pid)
+		}
+		pollUntil(grace, func() bool { return !leftoverShimsRunning(executor) })
+	}
+	if !leftoverShimsRunning(executor) {
+		return nil
+	}
+
+	// 2. Force: SIGKILL, re-issuing every 10s to defeat the re-adopt race.
+	req.Logger.Warnf("storage: shims still present after grace; force-killing (timeout %s)", force)
+	kill := func() { _ = executor.Run("pkill", "-9", "-f", "containerd-shim") }
+	kill()
+	if pollUntilTick(force, 10*time.Second, func() bool { return !leftoverShimsRunning(executor) }, kill) {
+		return nil
+	}
+
+	// 3. Last resort: release a D-state shim by detaching the mounts it is stuck
+	// on (these unmounts also run on the success path below — harmless to repeat).
+	req.Logger.Warnf("storage: shims survived SIGKILL; lazy-unmounting %s to release stuck mounts", storageDir)
+	_, _ = unmountAllUnder(executor, storageDir)
+	_, _ = unmountAllUnder(executor, runtimeStateDir)
+	kill()
+	if pollUntil(10*time.Second, func() bool { return !leftoverShimsRunning(executor) }) {
+		return nil
+	}
+	return fmt.Errorf("storage: leftover containerd-shim processes survived SIGTERM+SIGKILL and mount release; a container is wedged on a hung mount — reboot the node to clear it")
+}
+
+// containerInitPIDs returns the PID of every container's init process — the
+// direct child of each leftover containerd shim. These, not the shims, are what
+// get SIGTERM so the in-container workload can shut down cleanly.
+func containerInitPIDs(executor *host.Executor) []string {
+	out, err := executor.RunCapture("pgrep", "-f", "containerd-shim")
+	if err != nil {
+		return nil
+	}
+	var pids []string
+	for _, shim := range strings.Fields(out) {
+		cout, cerr := executor.RunCapture("pgrep", "-P", shim)
+		if cerr != nil {
+			continue
+		}
+		pids = append(pids, strings.Fields(cout)...)
+	}
+	return pids
+}
+
+// resolveRelocateDuration reads env (seconds, non-negative int) or falls back to
+// def. Garbage or a negative value uses def; 0 means "skip that wait".
+func resolveRelocateDuration(env string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(env))
+	if v == "" {
+		return def
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return def
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// pollUntil polls done every 500ms until it returns true or timeout elapses,
+// reporting whether the condition was met. A zero/negative timeout checks once.
+func pollUntil(timeout time.Duration, done func() bool) bool {
+	return pollUntilTick(timeout, 0, done, nil)
+}
+
+// pollUntilTick is pollUntil that additionally invokes tick every tickEvery
+// while it waits (used to re-issue a kill). A zero tickEvery disables ticking.
+func pollUntilTick(timeout, tickEvery time.Duration, done func() bool, tick func()) bool {
+	deadline := time.Now().Add(timeout)
+	nextTick := time.Now().Add(tickEvery)
+	for {
+		if done() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		if tick != nil && tickEvery > 0 && !time.Now().Before(nextTick) {
+			tick()
+			nextTick = time.Now().Add(tickEvery)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // unmountAllUnder unmounts every mountpoint at or below prefix, deepest first,

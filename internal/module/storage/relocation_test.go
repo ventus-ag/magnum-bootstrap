@@ -3,7 +3,9 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRuntimeStoreHasData_ContainerdFreshSkeleton(t *testing.T) {
@@ -137,5 +139,70 @@ func TestClearDirContents(t *testing.T) {
 	// Missing dir is a no-op, not an error.
 	if err := clearDirContents(filepath.Join(dir, "gone")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResolveRelocateDuration(t *testing.T) {
+	const env = "MAGNUM_TEST_RELOCATE_DUR"
+	def := 90 * time.Second
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want time.Duration
+	}{
+		{"unset falls back", false, "", def},
+		{"valid seconds", true, "30", 30 * time.Second},
+		{"zero means skip", true, "0", 0},
+		{"empty falls back", true, "  ", def},
+		{"negative falls back", true, "-5", def},
+		{"garbage falls back", true, "abc", def},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			os.Unsetenv(env)
+			if c.set {
+				t.Setenv(env, c.val)
+			}
+			if got := resolveRelocateDuration(env, def); got != c.want {
+				t.Fatalf("got %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+func TestPollUntil_ConditionFlips(t *testing.T) {
+	var calls int32
+	// False on the first check, true afterwards → must return true.
+	ok := pollUntil(5*time.Second, func() bool {
+		return atomic.AddInt32(&calls, 1) > 1
+	})
+	if !ok {
+		t.Fatal("pollUntil gave up before the condition became true")
+	}
+}
+
+func TestPollUntil_TimesOut(t *testing.T) {
+	start := time.Now()
+	if pollUntil(300*time.Millisecond, func() bool { return false }) {
+		t.Fatal("pollUntil returned true for an always-false condition")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("pollUntil waited too long: %s", elapsed)
+	}
+}
+
+func TestPollUntilTick_ReissuesWhileWaiting(t *testing.T) {
+	var ticks int32
+	// Never satisfied within the window; tick must fire at least once (the
+	// re-kill that defeats the containerd re-adopt race).
+	ok := pollUntilTick(1500*time.Millisecond, 400*time.Millisecond,
+		func() bool { return false },
+		func() { atomic.AddInt32(&ticks, 1) })
+	if ok {
+		t.Fatal("expected timeout for always-false condition")
+	}
+	if atomic.LoadInt32(&ticks) < 1 {
+		t.Fatal("tick never fired while waiting")
 	}
 }
