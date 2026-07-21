@@ -2,8 +2,7 @@
 
 [![CI](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/ci.yaml?query=branch%3Amain)
 [![e2e-openstack](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/e2e-openstack.yaml/badge.svg?branch=main)](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/e2e-openstack.yaml?query=branch%3Amain)
-[![conformance](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/conformance.yaml/badge.svg?branch=main)](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/conformance.yaml?query=branch%3Amain)
-[![k8s conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fventus-ag%2Fmagnum-bootstrap%2Fbadges%2Fconformance.json)](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/conformance.yaml?query=branch%3Amain)
+[![k8s conformance (full)](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fventus-ag%2Fmagnum-bootstrap%2Fbadges%2Fconformance.json)](https://github.com/ventus-ag/magnum-bootstrap/actions/workflows/conformance.yaml?query=branch%3Amain)
 [![release](https://img.shields.io/github/v/release/ventus-ag/magnum-bootstrap)](https://github.com/ventus-ag/magnum-bootstrap/releases/latest)
 
 Kubernetes node reconciliation engine for OpenStack Magnum. Replaces legacy bash-based Heat scripts with a single Go binary that converges nodes to desired state using Pulumi for declarative tracking.

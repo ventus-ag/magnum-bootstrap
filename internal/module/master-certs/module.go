@@ -139,6 +139,79 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		}
 	}
 
+	// Locally-restored CA fallback: when Barbican's CA is unusable, mismatched,
+	// or unreachable but the node carries a valid, matching ca.crt/ca.key pair
+	// (typical after an operator hand-restored an expired cluster with a
+	// locally-minted CA), keep converging on that local CA and sign leaf certs
+	// locally instead of wedging. The cluster stays alive on the "unknown" CA;
+	// the operator later triggers a CA rotation (ca-rotate), which mints a new
+	// canonical CA in Barbican and carries the local CA in the dual-CA trust
+	// bundle as the old side — reconverging everything without downtime.
+	caKeyPath := certDir + "/ca.key"
+	signLocally := false
+	var warnings []string
+	fallBackToLocalCA := func(reason string) bool {
+		if ok, why := certutil.LocalCAUsable(caCertPath, caKeyPath); !ok {
+			// The certs-dir pair is unusable, but a hand-rotated CA may live in
+			// the live kubeconfigs instead (operator updated admin.conf and the
+			// component kubeconfigs without rewriting certs/ca.crt). Adopt the
+			// kubeconfig-embedded CA when it is valid and pairs with ca.key.
+			recovered := false
+			for _, kubeconfigPath := range []string{"/etc/kubernetes/admin.conf"} {
+				kcCA, kcErr := certutil.CAFromKubeconfig(kubeconfigPath)
+				if kcErr != nil {
+					continue
+				}
+				if bad, _ := certutil.CertPEMNeedsRefresh(kcCA); bad {
+					continue
+				}
+				if !certutil.CertPEMMatchesKeyFile(kcCA, caKeyPath) {
+					continue
+				}
+				fileResult, applyErr := (hostresource.FileSpec{Path: caCertPath, Content: kcCA, Mode: 0o444}).Apply(executor)
+				if applyErr != nil {
+					req.Logger.Warnf("master-certificates: cannot adopt hand-rotated CA from %s: %v", kubeconfigPath, applyErr)
+					return false
+				}
+				changes = append(changes, fileResult.Changes...)
+				req.Logger.Warnf("master-certificates: adopted hand-rotated CA from %s into %s (it pairs with ca.key)", kubeconfigPath, caCertPath)
+				recovered = true
+				break
+			}
+			if !recovered {
+				// Last resort: the cluster's own CA expired before anyone
+				// rotated it (Barbican serves the same expired CA, so neither
+				// fetch nor adoption can help). Re-date it from its own key:
+				// same public key, same subject, fresh validity — every
+				// existing leaf still chains, SA keys untouched. Refuses to
+				// touch a non-expired CA or a cert/key non-pair.
+				renewedPEM, renewErr := certutil.RenewExpiredCA(caCertPath, caKeyPath)
+				if renewErr == nil {
+					fileResult, applyErr := (hostresource.FileSpec{Path: caCertPath, Content: renewedPEM, Mode: 0o444}).Apply(executor)
+					if applyErr != nil {
+						req.Logger.Warnf("master-certificates: cannot install renewed CA: %v", applyErr)
+						return false
+					}
+					changes = append(changes, fileResult.Changes...)
+					req.Logger.Warnf("master-certificates: cluster CA was expired — renewed it from its own key (same public key, fresh validity)")
+					recovered = true
+				} else {
+					req.Logger.Infof("master-certificates: expired-CA renewal unavailable (%v)", renewErr)
+				}
+			}
+			if !recovered {
+				req.Logger.Infof("master-certificates: local CA fallback unavailable (%s)", why)
+				return false
+			}
+		}
+		msg := fmt.Sprintf("%s; the local ca.crt/ca.key pair is valid — continuing on the locally-restored CA and signing leaf certificates locally. Trigger a CA rotation (ca-rotate) to reconverge on the canonical Barbican CA", reason)
+		req.Logger.Warnf("master-certificates: %s", msg)
+		warnings = append(warnings, msg)
+		signLocally = true
+		caNeedsRefresh = false
+		return true
+	}
+
 	var client *magnumapi.Client
 	token := ""
 	if needsSigning {
@@ -150,7 +223,7 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		)
 
 		token, err = client.GetToken()
-		if err != nil {
+		if err != nil && !fallBackToLocalCA(fmt.Sprintf("cannot authenticate to OpenStack for certificate signing (%v)", err)) {
 			return moduleapi.Result{}, fmt.Errorf("master-certificates: %w", err)
 		}
 	}
@@ -159,37 +232,42 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	if caNeedsRefresh {
 		caPEM, err := client.FetchCACert(token)
 		if err != nil {
-			return moduleapi.Result{}, fmt.Errorf("master-certificates: %w", err)
+			if !fallBackToLocalCA(fmt.Sprintf("cannot fetch the CA certificate from Barbican (%v)", err)) {
+				return moduleapi.Result{}, fmt.Errorf("master-certificates: %w", err)
+			}
+		} else {
+			// Recovery guards (normal reconcile only — a ca-rotate supplies
+			// fresh, mutually-consistent material via the ca-rotation phase and
+			// never reaches here with a broken CA). Installing an unusable CA
+			// over the live material corrupts a wedged-but-consistent cluster
+			// into a split state, and the doomed control-plane restart that
+			// follows would burn the whole Heat window. Fall back to a valid
+			// local CA pair when one exists; otherwise fail fast at this phase
+			// with an actionable message.
+			haveCAKey := false
+			if _, statErr := os.Stat(caKeyPath); statErr == nil {
+				haveCAKey = true
+			}
+			if expired, why := certutil.CertPEMNeedsRefresh([]byte(caPEM)); expired {
+				if !fallBackToLocalCA(fmt.Sprintf("Barbican serves an unusable CA cert (%s)", why)) {
+					msg := fmt.Sprintf("Barbican serves an unusable CA cert (%s); this node cannot self-recover on a normal reconcile — trigger a CA rotation (ca-rotate) to mint a new CA", why)
+					req.Logger.Warnf("master-certificates: %s", msg)
+					return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("master-certificates: %s", msg)
+				}
+			} else if haveCAKey && !certutil.CertPEMMatchesKeyFile([]byte(caPEM), caKeyPath) {
+				if !fallBackToLocalCA("Barbican's CA does not match this cluster's CA signing key (ca.key)") {
+					msg := "Barbican CA no longer matches this cluster's CA signing key (ca.key); installing it would split the CA cert/key pair and crashloop kube-controller-manager — preserving the working pair. Trigger a CA rotation (ca-rotate) to converge"
+					req.Logger.Warnf("master-certificates: %s", msg)
+					return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("master-certificates: %s", msg)
+				}
+			} else {
+				fileResult, err := (hostresource.FileSpec{Path: caCertPath, Content: []byte(caPEM), Mode: 0o444}).Apply(executor)
+				if err != nil {
+					return moduleapi.Result{}, err
+				}
+				changes = append(changes, fileResult.Changes...)
+			}
 		}
-
-		// Recovery guards (normal reconcile only — a ca-rotate supplies fresh,
-		// mutually-consistent material via the ca-rotation phase and never
-		// reaches here with a broken CA). Installing an unusable CA over the
-		// live material corrupts a wedged-but-consistent cluster into a split
-		// state, and the doomed control-plane restart that follows would burn
-		// the whole Heat window. Fail fast at this phase with an actionable
-		// message instead.
-		caKeyPath := certDir + "/ca.key"
-		haveCAKey := false
-		if _, statErr := os.Stat(caKeyPath); statErr == nil {
-			haveCAKey = true
-		}
-		if expired, why := certutil.CertPEMNeedsRefresh([]byte(caPEM)); expired {
-			msg := fmt.Sprintf("Barbican serves an unusable CA cert (%s); this node cannot self-recover on a normal reconcile — trigger a CA rotation (ca-rotate) to mint a new CA", why)
-			req.Logger.Warnf("master-certificates: %s", msg)
-			return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("master-certificates: %s", msg)
-		}
-		if haveCAKey && !certutil.CertPEMMatchesKeyFile([]byte(caPEM), caKeyPath) {
-			msg := "Barbican CA no longer matches this cluster's CA signing key (ca.key); installing it would split the CA cert/key pair and crashloop kube-controller-manager — preserving the working pair. Trigger a CA rotation (ca-rotate) to converge"
-			req.Logger.Warnf("master-certificates: %s", msg)
-			return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("master-certificates: %s", msg)
-		}
-
-		fileResult, err := (hostresource.FileSpec{Path: caCertPath, Content: []byte(caPEM), Mode: 0o444}).Apply(executor)
-		if err != nil {
-			return moduleapi.Result{}, err
-		}
-		changes = append(changes, fileResult.Changes...)
 	}
 
 	// Generate and sign certificates in parallel, then write files in
@@ -203,7 +281,26 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		signSpecs = append(signSpecs, spec)
 	}
 
-	signedCerts, err := magnumapi.GenerateAndSignCerts(client, token, signSpecs)
+	var signedCerts []magnumapi.SignedCert
+	if signLocally {
+		signedCerts, err = magnumapi.GenerateLocalSignedCerts(caCertPath, caKeyPath, signSpecs)
+	} else {
+		signedCerts, err = magnumapi.GenerateAndSignCerts(client, token, signSpecs)
+		// Vet API-signed material against the on-disk CA before installing it.
+		// A hand-restored cluster whose leaves still chain to the local CA never
+		// triggers a CA refetch this run, so a Barbican mismatch is only visible
+		// here: Magnum signs with ITS CA, and installing those leaves over a
+		// node trusting the local CA breaks component auth until the next run.
+		if err == nil && anyLeafPEMChainBroken(signedCerts, caCertPath) {
+			if fallBackToLocalCA("Magnum-signed certificates do not chain to the on-disk CA (Barbican CA differs from the local CA)") {
+				signedCerts, err = magnumapi.GenerateLocalSignedCerts(caCertPath, caKeyPath, signSpecs)
+			} else {
+				msg := "Magnum-signed certificates do not chain to the on-disk CA and no usable local CA pair exists — trigger a CA rotation (ca-rotate) to converge"
+				req.Logger.Warnf("master-certificates: %s", msg)
+				return moduleapi.Result{Warnings: []string{msg}}, fmt.Errorf("master-certificates: %s", msg)
+			}
+		}
+	}
 	if err != nil {
 		return moduleapi.Result{}, err
 	}
@@ -315,8 +412,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	return moduleapi.Result{
-		Changes: changes,
-		Outputs: map[string]string{"certDir": certDir},
+		Changes:  changes,
+		Outputs:  map[string]string{"certDir": certDir},
+		Warnings: warnings,
 	}, nil
 }
 
@@ -441,6 +539,17 @@ func parseSANIPs(values []string) []net.IP {
 		}
 	}
 	return ips
+}
+
+// anyLeafPEMChainBroken reports whether any freshly signed certificate fails to
+// chain to the on-disk CA. Empty input reports false.
+func anyLeafPEMChainBroken(signed []magnumapi.SignedCert, caPath string) bool {
+	for _, sc := range signed {
+		if !certutil.LeafPEMSignedByCAFile([]byte(sc.CertPEM), caPath) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(ss []string, s string) bool {

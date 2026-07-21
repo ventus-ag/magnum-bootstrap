@@ -194,14 +194,15 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	// Reconcile node labels once the node object is visible. This fixes the
 	// create-time race where the API is up but the kubelet has not yet registered
 	// the node, and also corrects label drift on later runs.
+	metadataKubeconfig := kubecommon.MetadataKubeconfig(cfg)
 	if req.Apply {
-		labelChanges, err := kubecommon.EnsureNodeLabels(cfg, executor, "kubectl", "/etc/kubernetes/admin.conf", true, 30, 5*time.Second)
+		labelChanges, err := kubecommon.EnsureNodeMetadata(cfg, executor, "kubectl", metadataKubeconfig, true, 30, 5*time.Second)
 		changes = append(changes, labelChanges...)
 		if err != nil && req.Logger != nil {
-			req.Logger.Warnf("services: failed to reconcile node labels for %s: %v", cfg.Shared.InstanceName, err)
+			req.Logger.Warnf("services: failed to reconcile node metadata for %s: %v", cfg.Shared.InstanceName, err)
 		}
 	} else {
-		labelChanges, _ := kubecommon.EnsureNodeLabels(cfg, executor, "kubectl", "/etc/kubernetes/admin.conf", false, 1, 0)
+		labelChanges, _ := kubecommon.EnsureNodeMetadata(cfg, executor, "kubectl", metadataKubeconfig, false, 1, 0)
 		changes = append(changes, labelChanges...)
 	}
 

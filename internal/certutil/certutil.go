@@ -5,13 +5,17 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -329,6 +333,128 @@ func containsIP(values []net.IP, target net.IP) bool {
 		}
 	}
 	return false
+}
+
+// LocalCAUsable reports whether the on-disk CA material can act as a local
+// signing authority: the CA certificate parses and is inside its validity
+// window, the CA private key exists, and the two are a matching pair. Used by
+// the cert modules to decide whether a node whose Barbican CA is unusable,
+// mismatched, or unreachable can keep converging on a manually-restored local
+// CA instead of wedging (the operator later runs ca-rotate to reconverge on
+// the canonical CA). The reason string explains a false result.
+func LocalCAUsable(caCertPath, caKeyPath string) (bool, string) {
+	if needs, why := CertFileNeedsRefresh(caCertPath); needs {
+		return false, why
+	}
+	certPEM, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return false, err.Error()
+	}
+	if !CertPEMMatchesKeyFile(certPEM, caKeyPath) {
+		return false, fmt.Sprintf("CA certificate %s and key %s are not a matching pair (or the key is missing/unreadable)", caCertPath, caKeyPath)
+	}
+	return true, ""
+}
+
+// RenewExpiredCA mints a replacement CA certificate from the cluster's own CA
+// key: same public key, same subject, fresh validity window. Because the key
+// is unchanged, every leaf the old CA signed still chains to the renewed CA,
+// and the renewed CA still validates against anything keyed on the public key
+// — it is the cluster's "current CA" re-dated, not a new trust root. Used for
+// last-resort recovery of a cluster whose CA expired before anyone rotated it
+// (Barbican serves the same expired CA, so neither fetch nor local fallback
+// can help). Errors unless the on-disk cert parses, is actually expired, and
+// pairs with the key — so it can only ever re-date the cluster's own CA,
+// never fabricate or adopt foreign material.
+func RenewExpiredCA(certPath, keyPath string) ([]byte, error) {
+	cert, err := loadCertificate(certPath)
+	if err != nil {
+		return nil, err
+	}
+	if time.Now().Before(cert.NotAfter) {
+		return nil, fmt.Errorf("CA certificate %s is not expired; refusing to renew", certPath)
+	}
+	key, err := loadPrivateKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if !publicKeysMatch(cert.PublicKey, publicKey(key)) {
+		return nil, fmt.Errorf("key %s is not the pair of CA certificate %s; refusing to renew", keyPath, certPath)
+	}
+	signer, ok := key.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("key %s cannot sign (type %T)", keyPath, key)
+	}
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               cert.Subject,
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              cert.KeyUsage | x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, cert.PublicKey, signer)
+	if err != nil {
+		return nil, fmt.Errorf("renew CA certificate: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+}
+
+// LeafPEMSignedByCAFile reports whether the PEM-encoded leaf certificate was
+// signed by any certificate in caFile. Used to vet freshly API-signed material
+// before installing it over a cluster whose on-disk CA may differ from
+// Barbican's (a hand-restored cluster whose CA mismatch was not otherwise
+// observable this run). Returns true when caFile is missing or unparseable —
+// there is nothing to verify against, so the signed material is canonical.
+func LeafPEMSignedByCAFile(leafPEM []byte, caPath string) bool {
+	leaf, err := parseCertPEM(leafPEM)
+	if err != nil {
+		return false
+	}
+	cas, err := loadCACerts(caPath)
+	if err != nil || len(cas) == 0 {
+		return true
+	}
+	for _, ca := range cas {
+		if leafSignedBy(leaf, ca) {
+			return true
+		}
+	}
+	return false
+}
+
+// CAFromKubeconfig extracts the embedded cluster CA (certificate-authority-data)
+// from a kubeconfig file. Used to discover a hand-rotated CA that an operator
+// installed into the live kubeconfigs without updating the certs directory.
+// Line-scan on our own generated kubeconfig shape — no YAML dependency.
+func CAFromKubeconfig(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "certificate-authority-data:") {
+			continue
+		}
+		encoded := strings.TrimSpace(strings.TrimPrefix(trimmed, "certificate-authority-data:"))
+		if encoded == "" {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode certificate-authority-data in %s: %w", path, err)
+		}
+		return decoded, nil
+	}
+	return nil, fmt.Errorf("no certificate-authority-data in %s", path)
 }
 
 // SanitizeTrustBundle filters a PEM trust bundle down to certificates that

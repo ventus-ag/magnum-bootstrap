@@ -154,18 +154,9 @@ func writeKubeletConfig(cfg config.Config, executor *host.Executor) ([]host.Chan
 
 	// Taint master nodes so workloads don't schedule on them.
 	// K8s < 1.25 used "master", K8s >= 1.25 uses "control-plane".
-	registerWithTaints := ""
-	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
-		registerWithTaints = `registerWithTaints:
-  - effect: "NoSchedule"
-    key: "node-role.kubernetes.io/control-plane"
-`
-	} else {
-		registerWithTaints = `registerWithTaints:
-  - effect: "NoSchedule"
-    key: "node-role.kubernetes.io/master"
-`
-	}
+	// Custom NODE_TAINTS (if the nodegroup carries any) render after it.
+	registerWithTaints := kubecommon.RenderRegisterWithTaints(
+		[]config.NodeTaint{kubecommon.MasterBuiltinTaint(cfg.Shared.KubeTag)}, cfg.Shared.NodeTaints)
 
 	opts := kubecommon.KubeletConfigOpts{
 		CertDir:            "/etc/kubernetes/certs",
@@ -325,18 +316,8 @@ func registerKubeletConfigResources(ctx *pulumi.Context, name string, cfg config
 	if dnsClusterDomain == "" {
 		dnsClusterDomain = "cluster.local"
 	}
-	registerWithTaints := ""
-	if kubeletconfig.KubeMinorAtLeast(cfg.Shared.KubeTag, 25) {
-		registerWithTaints = `registerWithTaints:
-  - effect: "NoSchedule"
-    key: "node-role.kubernetes.io/control-plane"
-`
-	} else {
-		registerWithTaints = `registerWithTaints:
-  - effect: "NoSchedule"
-    key: "node-role.kubernetes.io/master"
-`
-	}
+	registerWithTaints := kubecommon.RenderRegisterWithTaints(
+		[]config.NodeTaint{kubecommon.MasterBuiltinTaint(cfg.Shared.KubeTag)}, cfg.Shared.NodeTaints)
 	optsCfg := kubecommon.KubeletConfigOpts{
 		CertDir:            "/etc/kubernetes/certs",
 		CgroupDriver:       cfg.ResolveCgroupDriver(),

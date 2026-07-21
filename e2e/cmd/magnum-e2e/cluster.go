@@ -378,6 +378,12 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 		}
 		return nil
 
+	case "nodepool-metadata":
+		return r.nodepoolMetadataCycle(ctx)
+
+	case "nodepool-metadata-smoke":
+		return r.nodepoolMetadataSmoke(ctx)
+
 	case "post-rotate":
 		return r.postRotateScale(ctx)
 
@@ -718,6 +724,15 @@ func (r *runner) nodepoolName() string {
 // nodegroup version-skew guard rejects more). MergeLabels keeps the template's
 // CNI/runtime/reconciler labels (see merge_labels gotcha).
 func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
+	return r.triggerNodepoolCreateMetadata(ctx, count, "", "")
+}
+
+// triggerNodepoolCreateMetadata creates the extra nodepool and, when
+// nodeLabels/nodeTaints are non-empty, bakes them into the nodegroup labels at
+// CREATE time (the node_labels/node_taints transport). This exercises the
+// kubelet registration path (registerWithTaints + --node-labels) as opposed to
+// the day-2 PATCH path, so a node is born already labelled and tainted.
+func (r *runner) triggerNodepoolCreateMetadata(ctx context.Context, count int, nodeLabels, nodeTaints string) error {
 	n := count
 	merge := true
 	opts := nodegroups.CreateOpts{
@@ -737,6 +752,18 @@ func (r *runner) triggerNodepoolCreate(ctx context.Context, count int) error {
 		}
 		opts.Labels = map[string]string{"cluster_template_id": tmplID}
 		tmplLabel = fmt.Sprintf(", cluster_template_id=%s (%s)", r.cfg.nodepoolTemplate, tmplID)
+	}
+	if nodeLabels != "" || nodeTaints != "" {
+		if opts.Labels == nil {
+			opts.Labels = map[string]string{}
+		}
+		if nodeLabels != "" {
+			opts.Labels["node_labels"] = nodeLabels
+		}
+		if nodeTaints != "" {
+			opts.Labels["node_taints"] = nodeTaints
+		}
+		tmplLabel += fmt.Sprintf(", node_labels=%q, node_taints=%q", nodeLabels, nodeTaints)
 	}
 	ng, err := nodegroups.Create(ctx, r.magnum, r.cfg.clusterName, opts).Extract()
 	if err != nil {
@@ -962,6 +989,17 @@ func (r *runner) waitTransition(ctx context.Context, before *clusters.Cluster) e
 // probe. The retry loop is what lets a chained op (e.g. ca-rotate right after an
 // upgrade) survive Magnum's lagging status instead of racing it into a 400.
 func (r *runner) runMutation(ctx context.Context, name string, disruptive bool, trigger func() error) error {
+	if err := r.runMutationNoBundle(ctx, name, trigger); err != nil {
+		return err
+	}
+	return r.verifyBundle(ctx, name, disruptive)
+}
+
+// runMutationNoBundle is runMutation without the trailing verifyBundle — for
+// ops whose post-state intentionally breaks a bundle assumption (e.g. a
+// freshly tainted nodepool fails the untolerated schedulability probe) and
+// which run their own targeted verification instead.
+func (r *runner) runMutationNoBundle(ctx context.Context, name string, trigger func() error) error {
 	r.log("=== op: %s ===", name)
 	if err := r.ensureSettled(ctx); err != nil {
 		return fmt.Errorf("pre-op settle: %w", err)
@@ -1000,10 +1038,7 @@ func (r *runner) runMutation(ctx context.Context, name string, disruptive bool, 
 	if err := r.waitTransition(ctx, before); err != nil {
 		return fmt.Errorf("wait for update to start: %w", err)
 	}
-	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
-		return err
-	}
-	return r.verifyBundle(ctx, name, disruptive)
+	return r.waitStatus(ctx, "UPDATE_COMPLETE")
 }
 
 // listClusters prints every Magnum cluster in the project with its status —

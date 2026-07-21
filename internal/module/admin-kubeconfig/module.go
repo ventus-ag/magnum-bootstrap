@@ -91,6 +91,17 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, exportResult.Changes...)
 
+	// Workers additionally get the node-manager kubeconfig: a scoped
+	// credential for node metadata (labels/taints) reconciliation that is not
+	// subject to NodeRestriction like the kubelet identity above.
+	if nmContent, ok := BuildNodeManagerContent(cfg); ok {
+		result, err := (hostresource.FileSpec{Path: "/etc/kubernetes/node-manager.conf", Content: []byte(nmContent), Mode: 0o600}).Apply(executor)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+		changes = append(changes, result.Changes...)
+	}
+
 	return moduleapi.Result{
 		Changes: changes,
 		Outputs: map[string]string{
@@ -107,6 +118,7 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 		req.Logger.Infof("admin-kubeconfig destroy: removing kubeconfig files")
 	}
 	_ = os.Remove("/etc/kubernetes/admin.conf")
+	_ = os.Remove("/etc/kubernetes/node-manager.conf")
 	_ = os.Remove("/root/.kube/config")
 	for _, user := range []string{"core", "ubuntu"} {
 		_ = os.RemoveAll("/home/" + user + "/.kube")
@@ -172,6 +184,13 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 	exportOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, adminConfRes)
 	if _, err := hostsdk.RegisterExportSpec(ctx, name+"-bashrc-export", hostresource.ExportSpec{Path: "/etc/bashrc", VarName: "KUBECONFIG", Value: "/etc/kubernetes/admin.conf", Mode: 0o644}, exportOpts...); err != nil {
 		return nil, err
+	}
+
+	if nmContent, ok := BuildNodeManagerContent(cfg); ok {
+		nmOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, dirResources["/etc/kubernetes"])
+		if _, err := hostsdk.RegisterFileSpec(ctx, name+"-node-manager-conf", hostresource.FileSpec{Path: "/etc/kubernetes/node-manager.conf", Content: []byte(nmContent), Mode: 0o600}, nmOpts...); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := ctx.RegisterResourceOutputs(res, pulumi.Map{
@@ -282,4 +301,45 @@ func readBase64(path string) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// BuildNodeManagerContent renders the worker node-manager kubeconfig (scoped
+// node metadata credential). Returns ok=false on masters, TLS-disabled
+// clusters, or while the node-manager cert has not been issued yet — callers
+// simply skip the file and converge on a later run.
+func BuildNodeManagerContent(cfg config.Config) (string, bool) {
+	const certDir = "/etc/kubernetes/certs"
+	if cfg.Role() == config.RoleMaster || cfg.Worker == nil || cfg.Shared.TLSDisabled {
+		return "", false
+	}
+	if _, err := os.Stat(certDir + "/node-manager.crt"); err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(certDir + "/node-manager.key"); err != nil {
+		return "", false
+	}
+	user := "magnum:node-manager:" + cfg.Shared.InstanceName
+	server := fmt.Sprintf("https://%s:%d", cfg.Worker.KubeMasterIP, cfg.Shared.KubeAPIPort)
+	return strings.TrimSpace(fmt.Sprintf(`
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority: %s/ca.crt
+    server: %s
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: %s
+  name: default
+current-context: default
+kind: Config
+preferences: {}
+users:
+- name: %s
+  user:
+    as-user-extra: {}
+    client-certificate: %s/node-manager.crt
+    client-key: %s/node-manager.key
+`, certDir, server, user, user, certDir, certDir)) + "\n", true
 }

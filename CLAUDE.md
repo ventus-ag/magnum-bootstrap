@@ -476,6 +476,36 @@ error and retries with a targeted recovery (helpers in `cluster-helm/helper.go`)
   clear signal; the operator's `ca-rotate` then drives the hard-rotate recovery
   above. A ca-rotate supplies fresh, mutually-consistent material via the earlier
   `ca-rotation` phase, so it never reaches these guards with a broken CA.
+- **Locally-restored CA fallback (manually-recovered clusters)**: an operator who
+  hand-recovers an expired cluster mints a CA locally, so Barbican still serves
+  the old (usually expired) CA and the guards above would wedge the adopt run.
+  When the fetched Barbican CA is unusable/mismatched — or Keystone/Barbican is
+  unreachable — and the node's `ca.crt`/`ca.key` pair is valid and matching
+  (`certutil.LocalCAUsable`), `master-`/`worker-certificates` instead **keep the
+  local CA and sign leaf certs locally** (`magnum.GenerateLocalSignedCerts`,
+  same subject style/EKUs/SANs/5y validity as API-signed material). If
+  `certs/ca.crt` itself is stale but the hand-rotated CA lives in the
+  kubeconfigs, the fallback adopts the `certificate-authority-data` CA from
+  `admin.conf` (workers also probe `kubelet.conf` and legacy
+  `kubelet-config.yaml`) when it pairs with `ca.key`. The run records a warning
+  telling the operator to trigger `ca-rotate`: rotation mints a new canonical CA
+  in Barbican and carries the local CA as the old side of the dual-CA trust
+  bundle, reconverging the cluster without downtime. Workers without a local
+  `ca.key` (the normal case) keep the fail-fast behavior; on healthy clusters
+  Barbican's CA matches `ca.key`, so the fallback never engages.
+- **Expired-CA self-renewal (same key)**: when the fallback finds no usable
+  local pair because the cluster's own CA simply expired before anyone rotated
+  it (Barbican serves the same expired CA — mass-expiry, nothing hand-restored
+  yet), `certutil.RenewExpiredCA` re-dates the CA from its own key: same public
+  key, same subject, fresh 10-year validity. Every existing leaf still chains
+  (same signing key) and SA keys are untouched; expired leaves are then signed
+  locally and the control plane resurrects without any manual cert work.
+  Strictly gated: the on-disk cert must parse, be actually expired, and pair
+  with `ca.key` — it can only re-date the cluster's own CA, never fabricate or
+  adopt foreign material, and it never fires while the CA is still valid.
+  In-cluster pods holding the old expired CA bytes still need a restart to
+  trust the renewed cert (first-adopt replaces flannel and rolls coredns;
+  a follow-up `ca-rotate` + `patchWorkloads` heals the rest canonically).
 
 ### Error Handling Philosophy
 - **Must succeed** (cert copy, config write, chmod): return error, halt phase
@@ -546,10 +576,16 @@ ssh ubuntu@185.226.43.12 '
 # then poll /home/ubuntu/e2e-validate/run-create.log
 ```
 
-Key env knobs: `SCENARIOS` (`create ca-rotate upgrade`), `MASTERS` (>=2 → multi-master
-+ 2 LBs, TCG-slow), `WORKERS`, `KEEP_VM=1` (leave VMs up — SSH the master via the
-per-workdir key `<workdir>/id_ed25519` on the hostfwd port printed in the log),
-`VICTORIA_DIR` (required). Reconcile output is streamed into the harness log.
+Key env knobs: `SCENARIOS` (`create ca-rotate upgrade`; also `periodic`,
+`scale-masters` [needs MASTERS>=2], `node-metadata` [needs WORKERS>=1 —
+worker0 NODE_LABELS/NODE_TAINTS lifecycle: add-single, add-multiple,
+delete-single, delete-all, each re-rendering heat-params → run-once →
+`guest-run.sh assert-node-metadata` on the Node object]), `MASTERS` (>=2 →
+multi-master + 2 LBs, TCG-slow), `WORKERS`, `KEEP_VM=1` (leave VMs up — SSH the
+master via the per-workdir key `<workdir>/id_ed25519` on the hostfwd port
+printed in the log), `VICTORIA_DIR` (required). Reconcile output is streamed
+into the harness log. The ci.yaml `e2e-fcos` `latest` leg (1 worker) runs
+`node-metadata` on every PR.
 
 ### CI path
 
@@ -574,13 +610,29 @@ The driver is an **op-engine**, not a fixed pipeline. `e2e/cmd/magnum-e2e`
 creates a cluster of a configured shape, then runs an ordered op chain
 (`internal` to the driver, file `e2e/cmd/magnum-e2e/ops.go`): `upgrade`,
 `ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
-`resize-nodepool=N`, `del-nodepool`, `post-rotate`, `cloud-smoke`, `verify-sa`,
-`autoscale`.
+`resize-nodepool=N`, `del-nodepool`, `nodepool-metadata`, `post-rotate`,
+`cloud-smoke`, `verify-sa`, `autoscale`.
+`nodepool-metadata` (nodepool_metadata.go, needs an active nodepool) drives the
+per-nodegroup node_labels/node_taints lifecycle through four Magnum labels
+PATCHes — add-single, add-multiple, delete-single (subset must survive),
+delete-all — asserting the Node objects converge after each stage and that the
+taint is real (untolerated pod Unschedulable, tolerated pod Runs, untolerated
+pod Runs again after delete-all). Stages use `runMutationNoBundle` (the bundle's
+untolerated nodepool probe would fail while the pool is tainted); one full
+bundle runs at the end. Wired into the `multinode` and `ubuntu-nodepool`
+presets right after `add-nodepool`.
 Selection precedence: `OPS` > `SCENARIO` > legacy `SKIP_*` flags. Default-sweep
-presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade, worker
+presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade,
+`nodepool-metadata-smoke` [create a nodepool with a label+taint baked in →
+prove the taint → PATCH them away → verify removal → delete the pool], worker
 resize, repeated CA-rotate/upgrade wedge, post-rotate add), `multinode` (3m/2w
-Fedora + extra worker nodepool: nodepool/worker resize up/down, repeated wedge,
-post-rotate add), `ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+Fedora + extra worker nodepool: `nodepool-metadata` 4-stage add/delete cycle,
+nodepool/worker resize up/down, repeated wedge, post-rotate add),
+`ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+`smoke` runs on **every push/PR** (per-PR e2e-openstack matrix), so nodepool
+label/taint create+remove is exercised on a real cluster each MR;
+`nodepool-metadata`'s deeper 4-stage cycle runs in `multinode` (nightly `all`
+sweep + label-gated).
 Focused manual presets remain available: `chained-single`, `chained-multinode`,
 and `component-toggle`.
 

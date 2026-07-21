@@ -32,6 +32,17 @@ func (Module) Run(_ context.Context, cfg config.Config, _ moduleapi.Request) (mo
 	validated := []string{"INSTANCE_NAME", "NODEGROUP_ROLE", "KUBE_TAG", "ARCH"}
 	var warnings []string
 
+	// Bad NODE_LABELS / NODE_TAINTS entries were skipped at parse time;
+	// surface them here so they land in the run result instead of silently
+	// disappearing.
+	warnings = append(warnings, cfg.Shared.NodeMetadataWarnings...)
+	if len(cfg.Shared.NodeLabels) > 0 {
+		validated = append(validated, "NODE_LABELS")
+	}
+	if len(cfg.Shared.NodeTaints) > 0 {
+		validated = append(validated, "NODE_TAINTS")
+	}
+
 	switch cfg.Role() {
 	case config.RoleMaster:
 		if cfg.Master == nil {

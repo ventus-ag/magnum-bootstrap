@@ -213,6 +213,51 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 
+	// ClusterRole: magnum:node-manager — scoped credential the worker
+	// reconciler uses for node metadata (labels/taints) convergence. The
+	// kubelet identity is blocked by NodeRestriction from modifying taints
+	// and node-role labels, so workers present a node-manager client cert
+	// (O=magnum:node-manager, signed via the Magnum CA) instead.
+	_, err = rbacv1.NewClusterRole(ctx, name+"-node-manager", &rbacv1.ClusterRoleArgs{
+		Metadata: mergeMetadata("magnum:node-manager", ""),
+		Rules: rbacv1.PolicyRuleArray{
+			&rbacv1.PolicyRuleArgs{
+				ApiGroups: pulumi.StringArray{pulumi.String("")},
+				Resources: pulumi.StringArray{pulumi.String("nodes")},
+				Verbs: pulumi.StringArray{
+					pulumi.String("get"),
+					pulumi.String("list"),
+					pulumi.String("watch"),
+					pulumi.String("patch"),
+					pulumi.String("update"),
+				},
+			},
+		},
+	}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// ClusterRoleBinding: magnum:node-manager -> group magnum:node-manager
+	_, err = rbacv1.NewClusterRoleBinding(ctx, name+"-node-manager-binding", &rbacv1.ClusterRoleBindingArgs{
+		Metadata: mergeMetadata("magnum:node-manager", ""),
+		RoleRef: &rbacv1.RoleRefArgs{
+			ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+			Kind:     pulumi.String("ClusterRole"),
+			Name:     pulumi.String("magnum:node-manager"),
+		},
+		Subjects: rbacv1.SubjectArray{
+			&rbacv1.SubjectArgs{
+				ApiGroup: pulumi.String("rbac.authorization.k8s.io"),
+				Kind:     pulumi.String("Group"),
+				Name:     pulumi.String("magnum:node-manager"),
+			},
+		},
+	}, childOpts...)
+	if err != nil {
+		return nil, err
+	}
+
 	// ClusterRole: system:pod-interactive-access
 	// K8s 1.35+ requires CREATE verb on pods/exec, pods/attach, pods/portforward
 	// subresources for WebSocket-based streaming operations.

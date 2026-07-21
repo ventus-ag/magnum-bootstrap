@@ -158,6 +158,17 @@ jobs:
           fi
           go test ./...
 
+      - name: Test e2e module (nodepool metadata smoke + scenario contract)
+        # The e2e driver is a SEPARATE Go module, so `go test ./...` above does
+        # not reach it. Run its unit tests here so every PR smoke-checks the
+        # nodepool label/taint feature: the reconcile add/remove decision core
+        # (internal, above) plus the e2e-side verification logic
+        # (nodepool_metadata_test.go) and the heat-params scenario contract.
+        # Pure Go, no cluster/cloud — fast and merge-blocking.
+        run: |
+          cd e2e
+          go test ./...
+
       - name: Build release binaries (reconciler + magnumhost provider + openstack e2e)
         run: |
           # `make build` builds BOTH dist/bootstrap and the Pulumi host provider
@@ -223,10 +234,13 @@ jobs:
           # One worker VM on the latest entry only (TCG makes each extra VM
           # expensive): without it the worker reconcile path (worker-certs,
           # kube-worker-config, registry) has ZERO per-PR coverage.
+          # node-metadata (needs the worker) covers the per-nodegroup
+          # NODE_LABELS/NODE_TAINTS lifecycle: single+multiple add, partial +
+          # full delete, converged on the Node object.
           - name: latest
             kube_tag: v1.31.4
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
-            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
+            scenarios: ${{ github.event.inputs.scenarios || 'create node-metadata ca-rotate upgrade periodic' }}
             workers: 1
             slot_offset: 1
     steps:

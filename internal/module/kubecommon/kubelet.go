@@ -101,6 +101,37 @@ containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
 		opts.CertDir, opts.CertDir, opts.FeatureGates)
 }
 
+// RenderRegisterWithTaints renders the registerWithTaints block for
+// kubelet-config.yaml. Builtin taints (the master control-plane taint) render
+// first, then the custom per-nodegroup NODE_TAINTS. Returns "" when there are
+// no taints so untainted workers keep the exact previous config bytes.
+// registerWithTaints only applies when the Node object is first created;
+// day-2 taint changes are converged by EnsureNodeMetadata via the API.
+func RenderRegisterWithTaints(builtin, custom []config.NodeTaint) string {
+	taints := append(append([]config.NodeTaint{}, builtin...), custom...)
+	if len(taints) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("registerWithTaints:\n")
+	for _, taint := range taints {
+		fmt.Fprintf(&b, "  - effect: %q\n    key: %q\n", taint.Effect, taint.Key)
+		if taint.Value != "" {
+			fmt.Fprintf(&b, "    value: %q\n", taint.Value)
+		}
+	}
+	return b.String()
+}
+
+// MasterBuiltinTaint returns the version-appropriate control-plane taint.
+func MasterBuiltinTaint(kubeTag string) config.NodeTaint {
+	key := "node-role.kubernetes.io/master"
+	if kubeletconfig.KubeMinorAtLeast(kubeTag, 25) {
+		key = "node-role.kubernetes.io/control-plane"
+	}
+	return config.NodeTaint{Key: key, Effect: "NoSchedule"}
+}
+
 // BuildKubeletArgs produces the KUBELET_ARGS value for kubelet.env.
 func BuildKubeletArgs(cfg config.Config) string {
 	nodeLabels := []string{
@@ -108,6 +139,13 @@ func BuildKubeletArgs(cfg config.Config) string {
 	}
 	if cfg.Shared.NodegroupName != "" {
 		nodeLabels = append(nodeLabels, fmt.Sprintf("magnum.openstack.org/nodegroup=%s", cfg.Shared.NodegroupName))
+	}
+	// Custom per-nodegroup labels (NODE_LABELS). Only kubelet-safe keys go
+	// through --node-labels; restricted namespaces (node-role.kubernetes.io/*
+	// etc.) are applied through the API by EnsureNodeMetadata instead.
+	safeLabels, _ := config.KubeletSafeLabels(cfg.Shared.NodeLabels)
+	for _, key := range config.SortedLabelKeys(safeLabels) {
+		nodeLabels = append(nodeLabels, fmt.Sprintf("%s=%s", key, safeLabels[key]))
 	}
 	args := []string{
 		"--kubeconfig /etc/kubernetes/kubelet.conf",
