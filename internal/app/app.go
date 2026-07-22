@@ -12,6 +12,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
 	"github.com/spf13/cobra"
 
+	"github.com/ventus-ag/magnum-bootstrap/internal/carotation"
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/display"
 	"github.com/ventus-ag/magnum-bootstrap/internal/journal"
@@ -357,6 +358,22 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	// the full ca-rotate plan on every periodic timer tick.
 	previousState, _ := state.Load(runtimePaths.StateFile)
 	cfg.Trigger.AppliedCARotationID = previousState.LastCARotationID
+	// The ca-rotation module writes a finalize marker
+	// (carotation.MarkerPath) the instant a rotation completes on this node,
+	// BEFORE the later phases run. reconciler-state.json's LastCARotationID is
+	// only persisted on a FULLY successful reconcile, so a node whose rotation
+	// finalized but whose reconcile then fails in a LATER phase (e.g. a stale
+	// leaf still signed by a superseded CA that the cert phase must re-sign)
+	// keeps reading Operation()==ca-rotate forever. That disables the leaf
+	// chain-check that would re-sign the stale cert — a permanent wedge (a new
+	// worker's node-manager cert 401s at the node-metadata step, the run fails,
+	// state is never persisted, repeat). Trust the marker when it already
+	// records the CURRENT rotation id: the rotation is finalized, so this run is
+	// ordinary convergence and the chain-check must be active. A newer rotation
+	// (id changed) leaves marker != CARotationID, so Operation() stays ca-rotate.
+	if marker := carotation.ReadMarker(); marker != "" && marker == cfg.Trigger.CARotationID {
+		cfg.Trigger.AppliedCARotationID = marker
+	}
 
 	reconcilePlan := plan.Build(cfg)
 	if f.targetPhase != "" {
