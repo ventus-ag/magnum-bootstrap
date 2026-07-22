@@ -119,6 +119,55 @@ func LeafChainBroken(leafPath, caFile string) bool {
 	return true
 }
 
+// LeafNotSignedByCurrentCA reports whether the leaf at leafPath is signed by a CA
+// OTHER than the one whose private key is caKeyPath — i.e. the leaf is stale
+// relative to the cluster's CURRENT signing CA.
+//
+// After a dual-CA rotation whose coordinated cutover barrier fails partway (a
+// wedged or absent node never reports its phase annotation, so the barrier
+// stalls), the prepare stage has already swapped ca.key + Barbican to the new CA
+// and added it to the ca.crt trust bundle, but the leaf certs were never
+// re-signed. Every leaf is still OLD-CA-signed yet still chains to the old CA
+// RETAINED in the bundle, so LeafChainBroken == false and the certificates phase
+// never re-signs them — the control plane keeps serving old-CA certs that a
+// freshly provisioned node (which fetches only the new Barbican CA) cannot
+// verify. This check flags those leaves so an ordinary reconcile completes the
+// skipped cutover out of band. That is safe because the target CA (the one
+// pairing with ca.key) is already in the local trust bundle and served by
+// Barbican — i.e. already trusted cluster-wide — so re-signing to it cannot make
+// any current node distrust the leaf.
+//
+// Returns false (do nothing) when any input is unreadable, when ca.key pairs with
+// no certificate in the bundle (cannot identify the current CA — stay
+// conservative; workers have no ca.key and always take this path), or when the
+// leaf IS already signed by the current CA.
+func LeafNotSignedByCurrentCA(leafPath, caFile, caKeyPath string) bool {
+	leaf, err := loadCertificate(leafPath)
+	if err != nil {
+		return false
+	}
+	cas, err := loadCACerts(caFile)
+	if err != nil || len(cas) == 0 {
+		return false
+	}
+	key, err := loadPrivateKey(caKeyPath)
+	if err != nil {
+		return false
+	}
+	keyPub := publicKey(key)
+	var current *x509.Certificate
+	for _, ca := range cas {
+		if publicKeysMatch(ca.PublicKey, keyPub) {
+			current = ca
+			break
+		}
+	}
+	if current == nil {
+		return false
+	}
+	return !leafSignedBy(leaf, current)
+}
+
 // leafSignedBy reports whether ca issued leaf. It prefers the standard
 // CheckSignatureFrom (which also validates CA basic constraints) but falls back
 // to a bare signature check against the CA public key when the CA certificate

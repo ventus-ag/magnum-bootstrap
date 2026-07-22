@@ -520,6 +520,20 @@ func certNeedsReconcile(certDir string, spec magnumapi.CertSpec, checkChain bool
 	if checkChain && certutil.LeafChainBroken(certPath, certDir+"/ca.crt") {
 		return true, "leaf no longer chains to CA"
 	}
+	// After a dual-CA rotation whose coordinated cutover barrier failed partway
+	// (a wedged/absent node stalled the barrier before the leaf-swap stage),
+	// ca.key + Barbican already point at the new CA but the leaves were never
+	// re-signed: each is still OLD-CA signed yet still chains to the old CA
+	// RETAINED in the ca.crt bundle, so the check above passes and it is never
+	// fixed. A freshly provisioned node then fetches only the new Barbican CA and
+	// cannot verify the old-signed control plane. Re-sign any leaf not signed by
+	// the CA that pairs with the current ca.key, completing the skipped cutover on
+	// an ordinary reconcile. Safe: that CA is already in the trust bundle and
+	// served by Barbican, so every node already trusts it. Masters carry ca.key;
+	// on a worker (no ca.key) this is a no-op.
+	if checkChain && certutil.LeafNotSignedByCurrentCA(certPath, certDir+"/ca.crt", certDir+"/ca.key") {
+		return true, "leaf not signed by current CA (completing a stalled ca-rotate cutover)"
+	}
 	return false, ""
 }
 

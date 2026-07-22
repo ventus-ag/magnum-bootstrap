@@ -395,3 +395,40 @@ func writeCertPair(certPath, keyPath string, spec Spec, notBefore, notAfter time
 	}
 	return os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
 }
+
+func TestLeafNotSignedByCurrentCA(t *testing.T) {
+	dir := t.TempDir()
+	newer := newCA(t) // current CA: ca.key pairs with this
+	older := newCA(t) // pre-rotation CA, still retained in the trust bundle
+	caPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	// Post-prepare, pre-cutover state: bundle trusts both, ca.key is the new CA.
+	writePEMCerts(t, caPath, newer.certDER, older.certDER)
+	writeKeyPEM(t, keyPath, newer.key)
+
+	// Leaf still signed by the OLD CA (cutover never ran) -> stale, must be flagged.
+	oldLeaf := filepath.Join(dir, "old.crt")
+	writeLeafSignedBy(t, older, oldLeaf)
+	if !LeafNotSignedByCurrentCA(oldLeaf, caPath, keyPath) {
+		t.Fatalf("old-CA-signed leaf must be flagged when ca.key is the new CA")
+	}
+
+	// Leaf signed by the current (new) CA -> healthy, must not be flagged.
+	newLeaf := filepath.Join(dir, "new.crt")
+	writeLeafSignedBy(t, newer, newLeaf)
+	if LeafNotSignedByCurrentCA(newLeaf, caPath, keyPath) {
+		t.Fatalf("current-CA-signed leaf must not be flagged")
+	}
+
+	// No ca.key (a worker) -> no-op (false), never churns worker leaves.
+	if LeafNotSignedByCurrentCA(oldLeaf, caPath, filepath.Join(dir, "missing.key")) {
+		t.Fatalf("missing ca.key must yield false")
+	}
+
+	// ca.key pairs with no CA in the bundle -> conservative false.
+	foreignKey := filepath.Join(dir, "foreign.key")
+	writeKeyPEM(t, foreignKey, newCA(t).key)
+	if LeafNotSignedByCurrentCA(oldLeaf, caPath, foreignKey) {
+		t.Fatalf("ca.key matching no bundle CA must yield false (cannot identify current CA)")
+	}
+}
