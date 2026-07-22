@@ -542,6 +542,35 @@ func Run(ctx context.Context, mode string, diff bool, refresh bool, debugEnabled
 					}
 				}
 			}
+			// An adopted native resource (patchForce/skipAwait) can be deleted
+			// from the cluster out-of-band -- e.g. cluster-auto-healer's Run()
+			// removes the legacy magnum-auto-healer DaemonSet before Register()
+			// recreates it, or an operator deletes an addon object by hand. With
+			// run-once's refresh=false, Pulumi state still lists the object, so
+			// `up` issues a PATCH the apiserver rejects with `... "<name>" not
+			// found` (and "unable to get cluster state") -- a permanent wedge no
+			// Helm branch matches. Reconcile state to reality (refresh drops the
+			// absent resource) so the retry CREATEs it fresh: the native-resource
+			// analog of the helm "no deployed releases" recovery above. Runs after
+			// the Helm branches so a Helm-specific error is repaired by its own
+			// (cheaper, no-refresh) branch first.
+			if err != nil && strings.Contains(err.Error(), "not found") &&
+				(strings.Contains(err.Error(), "update of resource") ||
+					strings.Contains(err.Error(), "unable to get cluster state")) {
+				if req.Logger != nil {
+					req.Logger.Warnf("adopted resource(s) present in Pulumi state but absent in the cluster; refreshing state and recreating (stack=%s)", cfg.StackName())
+				}
+				if _, refreshErr := stack.Refresh(ctx,
+					optrefresh.SuppressProgress(),
+					optrefresh.ProgressStreams(progressWriters...),
+					optrefresh.ErrorProgressStreams(errorProgressWriters...),
+				); refreshErr != nil {
+					if req.Logger != nil {
+						req.Logger.Warnf("refresh before adopted-resource recreate failed stack=%s err=%v; retrying up anyway", cfg.StackName(), refreshErr)
+					}
+				}
+				retryUp("up (adopted-resource recreate retry)")
+			}
 			if err == nil {
 				break
 			}
