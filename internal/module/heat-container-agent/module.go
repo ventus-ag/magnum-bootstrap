@@ -98,14 +98,10 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}, nil
 }
 
-// heatConfigRuntimeMarker is written by the agent's 20-os-apply-config step on
-// every os-refresh-config cycle. It lives under /var/run (tmpfs), so it is
-// absent at boot and appears once the agent completes its first poll.
-const heatConfigRuntimeMarker = "/var/run/heat-config/heat-config"
-
-// agentWedgeGrace is how long the unit must have been active before a missing
-// marker counts as wedged, so a node that just booted (or an agent restarted
-// seconds ago) is never misread mid-startup.
+// agentWedgeGrace is both the minimum time the unit must have been active
+// before it can be judged, and the window of container output examined. A node
+// that just booted (or an agent restarted seconds ago) is never misread
+// mid-startup.
 const agentWedgeGrace = 10 * time.Minute
 
 // healWedgedAgent restarts heat-container-agent when it is running but has
@@ -120,9 +116,20 @@ const agentWedgeGrace = 10 * time.Minute
 // since 2024-07-01 whose last processed deployment was dated 2023-09, so an
 // upgrade hung until each was restarted by hand.
 //
-// Detection: the unit is active but has never written the runtime marker. A
-// live agent recreates that file on its first cycle after boot, so "active for
-// longer than the grace period, no marker" means it is not polling at all.
+// Detection is BEHAVIOURAL: the agent's container exists but has produced no
+// output for the whole grace window. A live agent logs an os-refresh-config
+// cycle every poll, so prolonged total silence is the wedge -- and it is what
+// was actually observed (`podman logs heat-container-agent` on both stuck cs-02
+// nodes returned nothing at all).
+//
+// An earlier version keyed off a missing /var/run/heat-config/heat-config
+// marker instead. That was wrong: absence of the file proves only that this
+// agent does not write that path, not that it is stuck. It made the reconciler
+// restart a healthy agent on EVERY periodic run -- caught by the e2e periodic
+// scenario, whose node ships a deliberate no-op stub unit (Type=oneshot,
+// ExecStart=/bin/true) that is permanently active with no container at all.
+// Requiring positive evidence from a real container fixes both: the stub has no
+// container, so there is nothing to heal.
 //
 // PERIODIC ONLY. A run-once executes *underneath* this agent (it is the Heat
 // SoftwareDeployment), so restarting it there would kill the in-flight
@@ -143,17 +150,17 @@ func healWedgedAgent(executor *host.Executor, req moduleapi.Request) []host.Chan
 		// and an inactive unit is not the silent failure this heals.
 		return nil
 	}
-	if _, err := os.Stat(heatConfigRuntimeMarker); err == nil {
-		return nil
-	}
 	active, ok := unitActiveFor(executor, unitName)
 	if !ok || active < agentWedgeGrace {
 		return nil
 	}
+	if !agentContainerSilent(executor) {
+		return nil
+	}
 
 	logf(req, "warn",
-		"heat-container-agent has been active %s without ever writing %s: it is not polling Heat, so SoftwareDeployments would never be collected. Restarting it.",
-		active.Round(time.Second), heatConfigRuntimeMarker)
+		"heat-container-agent has been active %s and its container has logged nothing for %s: it is not polling Heat, so SoftwareDeployments would never be collected. Restarting it.",
+		active.Round(time.Second), agentWedgeGrace)
 	if !executor.Apply {
 		return []host.Change{{Action: host.ActionRestart, Path: unitName, Summary: "restart wedged heat-container-agent (not polling Heat)"}}
 	}
@@ -164,6 +171,26 @@ func healWedgedAgent(executor *host.Executor, req moduleapi.Request) []host.Chan
 		return nil
 	}
 	return []host.Change{{Action: host.ActionRestart, Path: unitName, Summary: "restarted wedged heat-container-agent (was not polling Heat)"}}
+}
+
+// agentContainerSilent reports whether a REAL agent container exists and has
+// emitted nothing for the grace window.
+//
+// Every negative answer is fail-safe (no restart). In particular a node with no
+// agent container at all -- a stub unit, a different container runtime, podman
+// absent -- returns false, because there is no evidence of a wedge to act on.
+// Only an existing container that is demonstrably silent qualifies.
+func agentContainerSilent(executor *host.Executor) bool {
+	if _, err := executor.RunCapture("podman", "container", "exists", unitName); err != nil {
+		return false
+	}
+	// Both streams: os-refresh-config writes its cycle output to stderr.
+	stdout, stderr, err := executor.RunCaptureBoth("podman", "logs",
+		"--since", fmt.Sprintf("%dm", int(agentWedgeGrace.Minutes())), unitName)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(stdout) == "" && strings.TrimSpace(stderr) == ""
 }
 
 // unitActiveFor reports how long a unit has been active, using systemd's

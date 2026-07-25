@@ -1,10 +1,10 @@
 package heatcontaineragent
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 )
 
 func TestReadUptime(t *testing.T) {
@@ -20,22 +20,16 @@ func TestReadUptime(t *testing.T) {
 	}
 }
 
-// The wedge signal is the ABSENCE of the runtime marker. These cases pin the
-// file-presence half of the decision, which is what distinguishes a silently
-// dead agent from a healthy one -- the case that hung golem-cs-02 twice.
-func TestHeatConfigRuntimeMarkerPresence(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "heat-config")
-
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("marker should not exist yet")
-	}
-
-	if err := os.WriteFile(marker, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Errorf("marker should exist after write: %v", err)
+// agentContainerSilent must answer "no wedge" for every case where it cannot
+// prove one. The e2e periodic scenario runs on a node whose heat-container-agent
+// unit is a no-op stub with NO container; an earlier marker-file-based check
+// restarted that healthy agent on every periodic run and broke the steady-state
+// idempotency invariant. podman is absent in the test environment, so this also
+// covers the "runtime missing" fail-safe.
+func TestAgentContainerSilentIsFailSafeWithoutAContainer(t *testing.T) {
+	executor := host.NewExecutor(false, nil)
+	if agentContainerSilent(executor) {
+		t.Error("no agent container present, must not report a wedge")
 	}
 }
 
