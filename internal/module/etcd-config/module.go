@@ -3,6 +3,7 @@ package etcdconfig
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -913,14 +914,59 @@ func listMembersPreferLB(executor *host.Executor, lbArgs, localArgs []string) ([
 
 // voterClientEndpoint returns the client URL of a started voting member other
 // than selfID, or "" when none is known.
+// voterClientEndpoint returns a client URL of some OTHER started voting member,
+// suitable for an RPC a learner cannot serve itself (MemberPromote, MemberList).
+//
+// It must skip LOOPBACK client URLs. etcd reports each member's own advertised
+// client URLs verbatim, and legacy Magnum masters advertise
+// `http://127.0.0.1:2379` first. Dialing a peer's advertised loopback does not
+// reach that peer -- it reaches US, the learner -- so promotion fails forever
+// with "etcdserver: rpc not supported for learner" while appearing to target a
+// voter. Observed live on golem-cs-02 (central-switzerland): a rebuilt master
+// retried `member promote --endpoints=http://127.0.0.1:2379` 40 times and never
+// joined.
 func voterClientEndpoint(members []etcdMember, selfID string) string {
 	for _, m := range members {
 		if m.id == selfID || m.isLearner || !m.started || m.clientURL == "" {
 			continue
 		}
-		return m.clientURL
+		if u := firstRoutableClientURL(m.clientURL); u != "" {
+			return u
+		}
 	}
 	return ""
+}
+
+// firstRoutableClientURL picks the first client URL that is meaningful when
+// dialed from a DIFFERENT host. The input may be a bare "," -joined list, which
+// is how etcd reports a member advertising several client URLs.
+func firstRoutableClientURL(raw string) string {
+	for _, candidate := range strings.Split(raw, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || isLoopbackURL(candidate) {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+// isLoopbackURL reports whether a client URL points at the local host. An
+// unparseable value is treated as routable: wrongly skipping a usable endpoint
+// would leave no voter to talk to, while wrongly keeping a bad one just fails
+// the RPC and retries.
+func isLoopbackURL(raw string) bool {
+	host := raw
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		host = u.Hostname()
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
 }
 
 // promoteHealthGate waits briefly for the (now promoted) local etcd to serve
@@ -1314,10 +1360,24 @@ type etcdMember struct {
 // missing status/isLearner field defaults to started=false/isLearner=false rather
 // than dropping the row, so a future or truncated format never silently loses a
 // member.
+//
+// Columns are separated by ", " but MULTIPLE URLS INSIDE a column are joined by
+// a bare ",". Splitting on "," therefore shifts every column after the first
+// multi-URL one. Legacy Magnum nodes advertise two client URLs
+// (`http://127.0.0.1:2379,https://<ip>:2379`), so on those clusters a bare-","
+// split yielded clientURL = the loopback URL alone and read isLearner from what
+// was actually the second URL -- i.e. a LEARNER with two client URLs parsed as
+// isLearner=false, ensurePromoted concluded "already a voter", and the node was
+// stranded a learner forever. Split on the real column separator; fall back to
+// "," only when that yields too few fields (unknown/truncated format), which is
+// still no worse than the old behaviour.
 func parseMemberList(out string) []etcdMember {
 	var ms []etcdMember
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		fields := strings.Split(line, ",")
+		fields := strings.Split(line, ", ")
+		if len(fields) < 4 {
+			fields = strings.Split(line, ",")
+		}
 		if len(fields) < 4 {
 			continue
 		}

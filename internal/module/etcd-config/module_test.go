@@ -446,3 +446,58 @@ func TestEtcdUnitTagRegex(t *testing.T) {
 		t.Fatalf("got %v", m)
 	}
 }
+
+// Verbatim `etcdctl member list` output from golem-cs-02 (central-switzerland),
+// a legacy cluster whose pre-reconciler masters advertise TWO client URLs with
+// the loopback first. Columns are ", "-joined; the URLs inside a column are
+// ","-joined.
+const legacyTwoClientURLMemberList = `4d4e822c56635ad0, started, golem-cs-02-jkscdnreptp4-master-0, https://10.0.0.181:2380, http://127.0.0.1:2379,https://10.0.0.181:2379, false
+8a515fffadf42e4a, started, golem-cs-02-jkscdnreptp4-master-1, https://10.0.0.73:2380, http://127.0.0.1:2379,https://10.0.0.73:2379, false
+d224339a041ed18e, started, golem-cs-02-jkscdnreptp4-master-2, https://10.0.0.178:2380, https://10.0.0.178:2379, true`
+
+func TestParseMemberListKeepsColumnsWithMultipleClientURLs(t *testing.T) {
+	ms := parseMemberList(legacyTwoClientURLMemberList)
+	if len(ms) != 3 {
+		t.Fatalf("want 3 members, got %d", len(ms))
+	}
+	if got := ms[0].clientURL; got != "http://127.0.0.1:2379,https://10.0.0.181:2379" {
+		t.Errorf("master-0 clientURL truncated at the intra-column comma: %q", got)
+	}
+	// The regression that matters: splitting on a bare "," shifted the columns,
+	// so isLearner was read from the second client URL and a learner advertising
+	// two client URLs parsed as a voter -- ensurePromoted would then declare it
+	// "already a voter" and strand it as a learner forever.
+	if ms[0].isLearner || ms[1].isLearner {
+		t.Errorf("voters misparsed as learners: %+v %+v", ms[0], ms[1])
+	}
+	if !ms[2].isLearner {
+		t.Errorf("learner misparsed as voter: %+v", ms[2])
+	}
+}
+
+func TestVoterClientEndpointSkipsLoopback(t *testing.T) {
+	ms := parseMemberList(legacyTwoClientURLMemberList)
+	got := voterClientEndpoint(ms, "d224339a041ed18e")
+	// Must never be the peer's advertised loopback: dialing that from the
+	// learner reaches the learner itself, which cannot serve MemberPromote.
+	if got != "https://10.0.0.181:2379" {
+		t.Fatalf("want master-0's routable client URL, got %q", got)
+	}
+}
+
+func TestFirstRoutableClientURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://127.0.0.1:2379,https://10.0.0.181:2379", "https://10.0.0.181:2379"},
+		{"https://10.0.0.178:2379", "https://10.0.0.178:2379"},
+		{"http://127.0.0.1:2379", ""},
+		{"http://localhost:2379,https://10.0.0.5:2379", "https://10.0.0.5:2379"},
+		{"http://[::1]:2379,https://10.0.0.6:2379", "https://10.0.0.6:2379"},
+		{"http://0.0.0.0:2379", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := firstRoutableClientURL(c.in); got != c.want {
+			t.Errorf("firstRoutableClientURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
