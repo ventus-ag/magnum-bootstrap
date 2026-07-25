@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -84,6 +86,9 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, result.Changes...)
 
+	wedgeChanges := healWedgedAgent(executor, req)
+	changes = append(changes, wedgeChanges...)
+
 	if req.Apply && !executor.WaitForSystemctlActive(unitName, 30*time.Second, 2*time.Second) {
 		return moduleapi.Result{}, fmt.Errorf("service %s did not become active", unitName)
 	}
@@ -91,6 +96,114 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 		Changes: changes,
 		Outputs: map[string]string{"service": unitName},
 	}, nil
+}
+
+// heatConfigRuntimeMarker is written by the agent's 20-os-apply-config step on
+// every os-refresh-config cycle. It lives under /var/run (tmpfs), so it is
+// absent at boot and appears once the agent completes its first poll.
+const heatConfigRuntimeMarker = "/var/run/heat-config/heat-config"
+
+// agentWedgeGrace is how long the unit must have been active before a missing
+// marker counts as wedged, so a node that just booted (or an agent restarted
+// seconds ago) is never misread mid-startup.
+const agentWedgeGrace = 10 * time.Minute
+
+// healWedgedAgent restarts heat-container-agent when it is running but has
+// stopped polling Heat.
+//
+// The container can stay "up" for years while the agent inside has silently
+// died: os-collect-config never polls, so Heat's SoftwareDeployments are never
+// collected and never signalled. Heat cannot see this -- it just waits out the
+// whole stack timeout, cancels, and leaves stale convergence locks that fail
+// every later update before it reaches a node. Observed live on golem-cs-02
+// (central-switzerland): TWO of three legacy nodes had agent containers running
+// since 2024-07-01 whose last processed deployment was dated 2023-09, so an
+// upgrade hung until each was restarted by hand.
+//
+// Detection: the unit is active but has never written the runtime marker. A
+// live agent recreates that file on its first cycle after boot, so "active for
+// longer than the grace period, no marker" means it is not polling at all.
+//
+// PERIODIC ONLY. A run-once executes *underneath* this agent (it is the Heat
+// SoftwareDeployment), so restarting it there would kill the in-flight
+// heat-config-notify signal and wedge the very update we are running -- the
+// same reason the tag-convergence restart below is deferred. The systemd timer
+// that drives run-periodic is independent of the agent, so a migrated node
+// still self-heals within a day without any Heat involvement.
+//
+// This cannot rescue a node's FIRST migration: an unmigrated node has no
+// reconciler installed, so nothing runs to notice. Those need the agent
+// bounced before the upgrade.
+func healWedgedAgent(executor *host.Executor, req moduleapi.Request) []host.Change {
+	if !req.Periodic {
+		return nil
+	}
+	if !executor.SystemctlIsActive(unitName) {
+		// Not running at all: the systemd spec above already drives it active,
+		// and an inactive unit is not the silent failure this heals.
+		return nil
+	}
+	if _, err := os.Stat(heatConfigRuntimeMarker); err == nil {
+		return nil
+	}
+	active, ok := unitActiveFor(executor, unitName)
+	if !ok || active < agentWedgeGrace {
+		return nil
+	}
+
+	logf(req, "warn",
+		"heat-container-agent has been active %s without ever writing %s: it is not polling Heat, so SoftwareDeployments would never be collected. Restarting it.",
+		active.Round(time.Second), heatConfigRuntimeMarker)
+	if !executor.Apply {
+		return []host.Change{{Action: host.ActionRestart, Path: unitName, Summary: "restart wedged heat-container-agent (not polling Heat)"}}
+	}
+	if err := executor.Systemctl(host.ActionRestart, unitName); err != nil {
+		// Best-effort: a failed restart must not fail the reconcile, because
+		// the agent is not needed for this run to converge the node.
+		logf(req, "warn", "could not restart wedged heat-container-agent: %s", err)
+		return nil
+	}
+	return []host.Change{{Action: host.ActionRestart, Path: unitName, Summary: "restarted wedged heat-container-agent (was not polling Heat)"}}
+}
+
+// unitActiveFor reports how long a unit has been active, using systemd's
+// monotonic timestamp so a wall-clock step (NTP settling after boot, which is
+// exactly when this runs) cannot produce a bogus duration.
+func unitActiveFor(executor *host.Executor, unit string) (time.Duration, bool) {
+	out, err := executor.RunCapture("systemctl", "show", unit,
+		"-p", "ActiveEnterTimestampMonotonic", "--value")
+	if err != nil {
+		return 0, false
+	}
+	enteredUsec, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil || enteredUsec <= 0 {
+		return 0, false
+	}
+	uptime, ok := readUptime()
+	if !ok {
+		return 0, false
+	}
+	active := uptime - time.Duration(enteredUsec)*time.Microsecond
+	if active < 0 {
+		return 0, false
+	}
+	return active, true
+}
+
+func readUptime() (time.Duration, bool) {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 // canonicalCABundle is the version-stable system trust bundle. update-ca-trust
