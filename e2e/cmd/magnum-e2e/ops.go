@@ -186,9 +186,19 @@ var scenarios = map[string]scenarioDef{
 	// under TCG on the FCoS tier), then rotate + verify SA trust across the grown
 	// control plane. verifyBundle asserts control-plane node count == master
 	// nodegroup count after the resize.
+	//
+	// The leading `upgrade` is load-bearing, not scenery. A Magnum resize is a
+	// params-only `existing=True` stack update, so Heat preserves the stored
+	// service-account keypair and a master added by a bare resize can never
+	// diverge. Growing the control plane AFTER a full-template update is the
+	// sequence that can: that update re-renders every parameter, so a master
+	// built next seeds from whatever keypair the stack now holds. If those ever
+	// disagree, tokens minted by one apiserver come back 401 from the others —
+	// the split verifySAConsistency exists to catch, and which resize-masters
+	// runs automatically (it is a disruptive mutation).
 	"multimaster-scale": {
 		masters: 1, workers: 1,
-		ops: "resize-masters=3,cloud-smoke,ca-rotate,verify-sa",
+		ops: "upgrade,resize-masters=3,cloud-smoke,ca-rotate,verify-sa",
 	},
 	"chained-single": {
 		masters: 1, workers: 1,

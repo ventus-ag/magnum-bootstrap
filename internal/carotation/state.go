@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -92,6 +93,72 @@ func BundleDir(rotationID string) string { return filepath.Join(StagingDir(rotat
 
 func statePath(rotationID string) string {
 	return filepath.Join(StagingDir(rotationID), "state.json")
+}
+
+// RetiredSAKeysPath records the service-account verification key IDs that a
+// finalized rotation deliberately dropped.
+//
+// The finalize barrier narrows service_account.key to the new key only: that
+// is how the dual-CA protocol withdraws trust from the old signing key, and
+// for a compromise-driven rotation it is the entire point. Verify-key
+// convergence in master-certificates otherwise treats any key a peer still
+// publishes as one to adopt, so a master that finalized while a peer lagged
+// would re-adopt the very key that was just retired. This registry is the
+// local record of intent that stops that.
+func RetiredSAKeysPath() string {
+	return filepath.Join(baseDir, "retired-sa-keys")
+}
+
+// LoadRetiredSAKeys returns the set of retired key IDs. A missing registry is
+// the normal state on a cluster that has never rotated.
+func LoadRetiredSAKeys() (map[string]bool, error) {
+	data, err := os.ReadFile(RetiredSAKeysPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read retired SA keys: %w", err)
+	}
+	retired := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if id := strings.TrimSpace(line); id != "" {
+			retired[id] = true
+		}
+	}
+	return retired, nil
+}
+
+// RecordRetiredSAKeys adds key IDs to the registry, preserving existing
+// entries. Retirement is permanent: a key withdrawn from trust must never come
+// back, so entries are only ever added.
+func RecordRetiredSAKeys(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	retired, err := LoadRetiredSAKeys()
+	if err != nil {
+		return err
+	}
+	added := false
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" && !retired[id] {
+			retired[id] = true
+			added = true
+		}
+	}
+	if !added {
+		return nil
+	}
+	sorted := make([]string, 0, len(retired))
+	for id := range retired {
+		sorted = append(sorted, id)
+	}
+	sort.Strings(sorted)
+	if err := os.MkdirAll(filepath.Dir(RetiredSAKeysPath()), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(RetiredSAKeysPath(),
+		[]byte(strings.Join(sorted, "\n")+"\n"), 0o644)
 }
 
 // LoadState reads the protocol state for a rotation. A missing file yields a

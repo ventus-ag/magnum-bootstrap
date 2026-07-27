@@ -29,7 +29,7 @@ type Resource struct {
 func (Module) PhaseID() string        { return "master-certificates" }
 func (Module) Dependencies() []string { return []string{"ca-rotation"} }
 
-func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
+func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
 	if cfg.Shared.TLSDisabled {
 		return moduleapi.Result{}, nil
 	}
@@ -344,6 +344,24 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, saPrivChanges...)
 
+	// Converge the service-account verify-key bundle with the rest of the
+	// control plane, so this master accepts tokens issued by every other
+	// master. Runs here, ahead of the recursive chown below, because an atomic
+	// rewrite of the bundle lands as root:root. Skipped during an active
+	// dual-CA rotation, which owns this file and stages its own new+old
+	// bundle. Its changes are kept separate from `changes` so they do not trip
+	// the blanket "certificate material changed" restart of etcd and the
+	// kubelet — only kube-apiserver reads this file.
+	var saBundleChanges []host.Change
+	if cfg.Operation() != config.OperationCARotate {
+		var saWarnings []string
+		saBundleChanges, saWarnings, err = convergeSAVerifyKeys(ctx, newSAKeyEnv(cfg, certDir, executor, req.Logger))
+		warnings = append(warnings, saWarnings...)
+		if err != nil {
+			return moduleapi.Result{}, err
+		}
+	}
+
 	// Create etcd and kube users/groups and set permissions.
 	// useradd/groupadd/usermod may fail if the user/group already exists — log
 	// the output for debugging but do not treat as fatal.
@@ -408,6 +426,13 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 			"kube-proxy",
 		} {
 			req.Restarts.Add(svc, "certificate material changed")
+		}
+	}
+
+	if len(saBundleChanges) > 0 {
+		changes = append(changes, saBundleChanges...)
+		if req.Restarts != nil {
+			req.Restarts.Add("kube-apiserver", "service-account verification keys converged with peer masters")
 		}
 	}
 

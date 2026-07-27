@@ -651,11 +651,43 @@ func (r *runner) writeFinalizeFiles() error {
 		if err != nil {
 			return fmt.Errorf("ca-rotation: read new SA verify key: %w", err)
 		}
+		// Narrowing to the new key is how this barrier withdraws trust from
+		// the old signing key. Record what is being dropped first, so
+		// verify-key convergence in master-certificates cannot re-adopt it
+		// from a peer that has not finalized yet. Best-effort: failing to
+		// record must not fail a rotation that is otherwise complete.
+		if err := recordRetiredSAKeys(certDir+"/service_account.key", newVerify); err != nil && r.req.Logger != nil {
+			r.req.Logger.Warnf("ca-rotation: could not record retired service-account keys: %v", err)
+		}
 		if err := r.writeLive(certDir+"/service_account.key", newVerify, 0o440); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// recordRetiredSAKeys registers every key present in the live verify bundle
+// but absent from the bundle replacing it.
+func recordRetiredSAKeys(livePath string, replacement []byte) error {
+	live, err := certutil.PublicKeyPEMFile(livePath)
+	if err != nil {
+		return err
+	}
+	keeping := map[string]bool{}
+	for _, key := range certutil.ParsePublicKeyPEMs(replacement) {
+		if id, err := certutil.PublicKeyID(key); err == nil {
+			keeping[id] = true
+		}
+	}
+	var retired []string
+	for _, key := range live {
+		id, err := certutil.PublicKeyID(key)
+		if err != nil || keeping[id] {
+			continue
+		}
+		retired = append(retired, id)
+	}
+	return coord.RecordRetiredSAKeys(retired)
 }
 
 // writeLiveCA writes ca.crt to the kube cert dir and, for masters, the etcd
