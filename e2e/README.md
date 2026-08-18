@@ -288,15 +288,15 @@ of `SCENARIO=all` (runs last, after the other scenarios) and can also be dispatc
 on its own:
 
 ```bash
-# Built-in ladder (zero-config on the ventus cloud): create at v1.20.12, then
-#   upgrade → cloud-smoke → autoscale through v1.23.17, v1.28.4, v1.30.10,
-#   v1.32.2, v1.33.10, v1.34.6, v1.35.3, v1.36.2 (8 multi-minor upgrades): nginx LB-serves
-#   + PVC-resize + autoscaler up>2/down each rung.
+# Built-in ladder (zero-config on the ventus cloud): create at v1.28.4, then
+#   upgrade → cloud-smoke → autoscale through v1.29.14, v1.30.10, v1.31.6,
+#   v1.32.2, v1.33.13, v1.34.9, v1.35.6, v1.36.2 (8 sequential-minor upgrades):
+#   nginx LB-serves + PVC-resize + autoscaler up>2/down each rung.
 SCENARIO=version-ladder BOOTSTRAP_BINARY=dist/bootstrap go run ./e2e/cmd/magnum-e2e
 
 # Custom ladder: CLUSTER_TEMPLATE is the create version, UPGRADE_LADDER the rungs.
 SCENARIO=version-ladder CLUSTER_TEMPLATE=v1.28.4 \
-  UPGRADE_LADDER=v1.30.10,v1.32.2,v1.34.6 BOOTSTRAP_BINARY=dist/bootstrap \
+  UPGRADE_LADDER=v1.30.10,v1.32.2,v1.34.9 BOOTSTRAP_BINARY=dist/bootstrap \
   go run ./e2e/cmd/magnum-e2e
 ```
 

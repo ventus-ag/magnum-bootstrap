@@ -31,10 +31,10 @@ on:
     inputs:
       kube_tag:
         description: Initial Kubernetes version
-        default: v1.30.5
+        default: v1.30.10
       kube_tag_upgrade:
         description: Upgrade target version
-        default: v1.31.4
+        default: v1.31.6
       scenarios:
         description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade, periodic)"
         default: create ca-rotate upgrade periodic
@@ -223,8 +223,8 @@ jobs:
       matrix:
         include:
           - name: pinned
-            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
-            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+            kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.10' }}
+            kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.6' }}
             scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
             workers: 0
             # Distinct slot offset so this leg's subnet/mcast/host-ports never
@@ -238,7 +238,7 @@ jobs:
           # NODE_LABELS/NODE_TAINTS lifecycle: single+multiple add, partial +
           # full delete, converged on the Node object.
           - name: latest
-            kube_tag: v1.31.4
+            kube_tag: v1.31.6
             kube_tag_upgrade: ${{ needs.resolve.outputs.latest }}
             scenarios: ${{ github.event.inputs.scenarios || 'create node-metadata ca-rotate upgrade periodic' }}
             workers: 1
@@ -371,8 +371,8 @@ jobs:
           # Last pre-composefs stable build family (mutable /usr symlink
           # semantics, older glibc) — the image generation prod still runs.
           FCOS_VERSION: ${{ github.event.inputs.fcos_version || '38.20231027.3.2' }}
-          KUBE_TAG: v1.30.5
-          KUBE_TAG_UPGRADE: v1.31.4
+          KUBE_TAG: v1.30.10
+          KUBE_TAG_UPGRADE: v1.31.6
           SCENARIOS: create ca-rotate upgrade periodic
           WORKDIR: ${{ runner.temp }}/fcos-e2e-oldimage
         run: |
@@ -465,8 +465,8 @@ jobs:
           # running cluster), asserting the etcd member count climbs each step;
           # ca-rotate then exercises the dual-CA barrier across the full batch.
           SCENARIOS: ${{ github.event.inputs.scenarios || 'scale-masters ca-rotate' }}
-          KUBE_TAG: ${{ github.event.inputs.kube_tag || 'v1.30.5' }}
-          KUBE_TAG_UPGRADE: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.4' }}
+          KUBE_TAG: ${{ github.event.inputs.kube_tag || 'v1.30.10' }}
+          KUBE_TAG_UPGRADE: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.6' }}
           # A stable per-run slot so this job's cluster network/ports never collide
           # with a concurrent single-master e2e on the same host.
           E2E_SLOT: "20"

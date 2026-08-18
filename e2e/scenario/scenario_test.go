@@ -16,7 +16,7 @@ func base(role Role, op Operation) Config {
 		Operation:    op,
 		NodeIP:       "10.0.0.10",
 		MasterIP:     "10.0.0.10",
-		KubeTag:      "v1.30.5",
+		KubeTag:      "v1.30.10",
 		AuthURL:      "http://127.0.0.1:9511/v3",
 		MagnumURL:    "http://127.0.0.1:9511/v1",
 		ClusterUUID:  "11111111-1111-1111-1111-111111111111",

@@ -686,15 +686,14 @@ outside the `scenarios` map but is still part of `allScenarios` — `scenarioRun
 `17 2 * * 0`, Sun 02:17 UTC, default branch; scheduled events carry no inputs so
 the env falls back to `SCENARIO=all`, build-from-source). Default
 ladder (built-in, zero-config on the ventus cloud, all templates version-pinned):
-`v1.20.12 → v1.23.17 → v1.28.4 → v1.30.10 → v1.32.2 → v1.33.10 → v1.34.6 →
-v1.35.3` (7 upgrades). Override with `UPGRADE_LADDER` (ordered comma list of
+`v1.28.4 → v1.29.14 → v1.30.10 → v1.31.6 → v1.32.2 → v1.33.13 → v1.34.9 →
+v1.35.6 → v1.36.2` (8 upgrades, every minor 1.28–1.36 at its current patch).
+Override with `UPGRADE_LADDER` (ordered comma list of
 template names) + `CLUSTER_TEMPLATE` (the create version). When `UPGRADE_LADDER`
-is empty the built-in ladder OWNS the create version too (`v1.20.12`), overriding
+is empty the built-in ladder OWNS the create version too (`v1.28.4`), overriding
 a generic `CLUSTER_TEMPLATE`, so the first hop is never a downgrade. The ladder
 cursor advances once per `upgrade` op (in `execOp`, not per `runMutation` retry,
-so a retried trigger re-fires the same rung). The jumps are deliberately
-multi-minor (e.g. 1.23→1.28) — non-standard for kubeadm, a stress test of the
-reconciler's binary-swap upgrade. `triggerUpgrade(ctx, target)` and the per-op
+so a retried trigger re-fires the same rung). `triggerUpgrade(ctx, target)` and the per-op
 `upgradeTarget()` selector live in `cluster.go`; `defaultVersionLadder`,
 `nextLadderTarget`, `ladderOps` in `ops.go`.
 

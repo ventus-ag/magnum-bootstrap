@@ -61,7 +61,7 @@ type Config struct {
 	// then bootstraps a one-node cluster from its own peer URL); set to the full member
 	// list to bootstrap a multi-master cluster all at once without v2 discovery.
 	MasterIP string // worker: KUBE_MASTER_IP (the API server address to join — the api_lb VIP in multi-master)
-	KubeTag  string // e.g. v1.30.5 (kubelet/kubectl URLs are derived from this)
+	KubeTag  string // e.g. v1.30.10 (kubelet/kubectl URLs are derived from this)
 
 	// CA-rotate trigger. Leave empty except for OpCARotate.
 	CARotationID string

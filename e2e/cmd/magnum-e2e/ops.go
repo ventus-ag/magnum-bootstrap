@@ -286,21 +286,21 @@ const ladderScenario = "version-ladder"
 // is CREATEd at rung[0] and upgraded through each subsequent rung, re-running the
 // cloud-controller smoke (LB serves traffic + Cinder PVC resize) at every step.
 // Each entry is a version-pinned Magnum cluster-template name (kube_tag baked in);
-// all nine exist on the ventus cloud (Upper-Austria-M1). The jumps are
-// deliberately multi-minor (e.g. 1.23→1.28) to stress aggressive upgrades.
+// all nine exist on the ventus cloud (Upper-Austria-M1): every minor from 1.28
+// through 1.36 at its current patch level.
 var defaultVersionLadder = []string{
-	"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10",
-	"v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3",
+	"v1.28.4", "v1.29.14", "v1.30.10", "v1.31.6",
+	"v1.32.2", "v1.33.13", "v1.34.9", "v1.35.6",
 	"v1.36.2",
 }
 
 // climbLadder is the per-upgrade target ladder shared by the lifecycle scenarios
 // whose chain has exactly 3 `upgrade` ops (smoke, multinode, chained-multinode).
 // Instead of re-upgrading to the same version 3×, each `upgrade` op climbs one
-// real minor: create v1.30.10 (CLUSTER_TEMPLATE) → 1.31.6 → 1.32.2 → 1.33.10. The
+// real minor: create v1.30.10 (CLUSTER_TEMPLATE) → 1.31.6 → 1.32.2 → 1.33.13. The
 // upgrade-after-ca-rotate race coverage is preserved (the later rungs still fire
 // right after a ca-rotate). All three rungs exist on the ventus cloud.
-var climbLadder = []string{"v1.31.6", "v1.32.2", "v1.33.10"}
+var climbLadder = []string{"v1.31.6", "v1.32.2", "v1.33.13"}
 
 // splitTrim splits a comma-separated list, trimming spaces and dropping empties.
 func splitTrim(s string) []string {

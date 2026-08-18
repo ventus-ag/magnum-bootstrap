@@ -38,7 +38,7 @@
 # ssh/scp, go.
 #
 # Env knobs (defaults):
-#   KUBE_TAG v1.30.5   KUBE_TAG_UPGRADE v1.31.4   FCOS_STREAM stable
+#   KUBE_TAG v1.30.10   KUBE_TAG_UPGRADE v1.31.6   FCOS_STREAM stable
 #   FCOS_VERSION (pin an older, pre-composefs build, e.g. 38.20231027.3.2 — old
 #                 FCoS + v1 containerd layout, the production node layout)
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade;
@@ -53,8 +53,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-KUBE_TAG="${KUBE_TAG:-v1.30.5}"
-KUBE_TAG_UPGRADE="${KUBE_TAG_UPGRADE:-v1.31.4}"
+KUBE_TAG="${KUBE_TAG:-v1.30.10}"
+KUBE_TAG_UPGRADE="${KUBE_TAG_UPGRADE:-v1.31.6}"
 FCOS_STREAM="${FCOS_STREAM:-stable}"
 VICTORIA_DIR="${VICTORIA_DIR:-}"
 SCENARIOS="${SCENARIOS:-create ca-rotate upgrade periodic}"

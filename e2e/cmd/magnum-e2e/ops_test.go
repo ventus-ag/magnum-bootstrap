@@ -14,13 +14,13 @@ import (
 // TestOpStepLabels checks ladder upgrade rows are labelled with their target
 // version, in ladder order, while non-upgrade ops keep their plain name.
 func TestOpStepLabels(t *testing.T) {
-	r := &runner{ladder: []string{"v1.23.17", "v1.28.4"}}
+	r := &runner{ladder: []string{"v1.28.4", "v1.29.14"}}
 	ops, err := parseOps("upgrade,cloud-smoke,autoscale,upgrade")
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := r.opStepLabels(ops)
-	want := []string{"upgrade→v1.23.17", "cloud-smoke", "autoscale", "upgrade→v1.28.4"}
+	want := []string{"upgrade→v1.28.4", "cloud-smoke", "autoscale", "upgrade→v1.29.14"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("label %d = %q, want %q", i, got[i], want[i])
@@ -307,7 +307,7 @@ func TestSplitTrim(t *testing.T) {
 		{"  ", nil},
 		{"a", []string{"a"}},
 		{" a , b ,, c ", []string{"a", "b", "c"}},
-		{"v1.23.17,v1.28.4", []string{"v1.23.17", "v1.28.4"}},
+		{"v1.28.4,v1.29.14", []string{"v1.28.4", "v1.29.14"}},
 	}
 	for _, c := range cases {
 		got := splitTrim(c.in)
@@ -327,7 +327,7 @@ func TestSplitTrim(t *testing.T) {
 // the rung at pos and pos+1, and a pos past the end errors (the op chain asked
 // for more upgrades than the ladder has rungs).
 func TestNextLadderTarget(t *testing.T) {
-	ladder := []string{"v1.23.17", "v1.28.4", "v1.30.10"}
+	ladder := []string{"v1.28.4", "v1.29.14", "v1.30.10"}
 	pos := 0
 	for i, want := range ladder {
 		got, next, err := nextLadderTarget(ladder, pos)
@@ -350,7 +350,7 @@ func TestNextLadderTarget(t *testing.T) {
 // TestLadderOps checks the generated version-ladder chain: an (upgrade,
 // cloud-smoke, autoscale) triple per rung, valid op names, in order.
 func TestLadderOps(t *testing.T) {
-	ladder := []string{"v1.23.17", "v1.28.4", "v1.30.10"}
+	ladder := []string{"v1.28.4", "v1.29.14", "v1.30.10"}
 	ops, err := parseOps(ladderOps(ladder))
 	if err != nil {
 		t.Fatalf("generated ladder ops do not parse: %v", err)
@@ -404,10 +404,10 @@ func TestSetFlags(t *testing.T) {
 	}
 }
 
-// TestDefaultVersionLadder pins the requested 1.20→1.36 walk: 9 version-pinned
+// TestDefaultVersionLadder pins the requested 1.28→1.36 walk: 9 version-pinned
 // rungs in order (rung[0] is the create template, the rest the upgrade ladder).
 func TestDefaultVersionLadder(t *testing.T) {
-	want := []string{"v1.20.12", "v1.23.17", "v1.28.4", "v1.30.10", "v1.32.2", "v1.33.10", "v1.34.6", "v1.35.3", "v1.36.2"}
+	want := []string{"v1.28.4", "v1.29.14", "v1.30.10", "v1.31.6", "v1.32.2", "v1.33.13", "v1.34.9", "v1.35.6", "v1.36.2"}
 	if len(defaultVersionLadder) != len(want) {
 		t.Fatalf("defaultVersionLadder has %d rungs, want %d", len(defaultVersionLadder), len(want))
 	}

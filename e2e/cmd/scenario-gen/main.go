@@ -40,7 +40,7 @@ func main() {
 		numMasters   = flag.Int("number-of-masters", 1, "master: NUMBER_OF_MASTERS")
 		nodeLabels   = flag.String("node-labels", "", "NODE_LABELS — per-nodegroup Kubernetes node labels (k1=v1;k2=v2)")
 		nodeTaints   = flag.String("node-taints", "", "NODE_TAINTS — per-nodegroup Kubernetes node taints (key=value:Effect;...)")
-		kubeTag      = flag.String("kube-tag", "v1.30.5", "Kubernetes version tag")
+		kubeTag      = flag.String("kube-tag", "v1.30.10", "Kubernetes version tag")
 		clusterUUID  = flag.String("cluster-uuid", "11111111-1111-1111-1111-111111111111", "Magnum cluster UUID")
 		authURL      = flag.String("auth-url", "http://127.0.0.1:9511/v3", "Keystone auth URL")
 		magnumURL    = flag.String("magnum-url", "http://127.0.0.1:9511/v1", "Magnum API URL")

@@ -12,8 +12,8 @@ func TestParseKubeVersion(t *testing.T) {
 		ok            bool
 	}{
 		{"v1.36.2", 1, 36, 2, true},
-		{"v1.33.10", 1, 33, 10, true},
-		{" v1.30.0 ", 1, 30, 0, true},
+		{"v1.33.13", 1, 33, 13, true},
+		{" v1.30.10 ", 1, 30, 10, true},
 		{"v1.29.14-u22", 0, 0, 0, false}, // Ubuntu suffix
 		{"1.36.2", 0, 0, 0, false},       // missing v
 		{"v1.36", 0, 0, 0, false},        // no patch
@@ -36,7 +36,7 @@ func TestCmpKubeVersion(t *testing.T) {
 	}{
 		{"v1.36.2", "v1.36.2", 0},
 		{"v1.36.2", "v1.35.9", 1},
-		{"v1.33.10", "v1.33.2", 1}, // numeric, not lexical (10 > 2)
+		{"v1.33.13", "v1.33.2", 1}, // numeric, not lexical (13 > 2)
 		{"v1.34.0", "v1.34.1", -1},
 		{"v2.0.0", "v1.99.99", 1},
 		{"bad", "v1.0.0", -1}, // unparseable sorts lowest
@@ -51,10 +51,10 @@ func TestCmpKubeVersion(t *testing.T) {
 
 func TestNewestFCoSTemplate(t *testing.T) {
 	all := []templateInfo{
-		{name: "v1.33.10"},
+		{name: "v1.33.13"},
 		{name: "v1.36.2"},
 		{name: "v1.29.14-u22", kubeTag: "v1.29.14"}, // Ubuntu — excluded
-		{name: "v1.35.3"},
+		{name: "v1.35.6"},
 		{name: "some-random-template"}, // no version — excluded
 	}
 	got, ok := newestFCoSTemplate(all)
@@ -71,7 +71,7 @@ func TestNewestFCoSTemplatePrefersKubeTag(t *testing.T) {
 	// A generically-named template whose kube_tag is newest must win, and its
 	// NAME (not the kube_tag) is what create uses.
 	all := []templateInfo{
-		{name: "v1.35.3"},
+		{name: "v1.35.6"},
 		{name: "k8s-base", kubeTag: "v1.37.0"},
 	}
 	got, ok := newestFCoSTemplate(all)
@@ -83,14 +83,14 @@ func TestNewestFCoSTemplatePrefersKubeTag(t *testing.T) {
 func TestResolveConformanceLegs(t *testing.T) {
 	all := []templateInfo{
 		{name: "v1.36.2"},
-		{name: "v1.35.3"},
-		{name: "v1.34.6"},
-		{name: "v1.33.10"},
+		{name: "v1.35.6"},
+		{name: "v1.34.9"},
+		{name: "v1.33.13"},
 		{name: "v1.29.14-u22"},
 	}
 	// Targets: two exactly match a pinned template, two are newer patches with no
 	// pinned template → must reuse the newest base (v1.36.2) + kube_tag override.
-	targets := []string{"v1.36.5", "v1.35.3", "v1.34.6", "v1.33.99"}
+	targets := []string{"v1.36.5", "v1.35.6", "v1.34.9", "v1.33.99"}
 	legs, err := resolveConformanceLegs(targets, all)
 	if err != nil {
 		t.Fatalf("resolveConformanceLegs: %v", err)
@@ -100,8 +100,8 @@ func TestResolveConformanceLegs(t *testing.T) {
 	}
 	want := []conformanceLeg{
 		{Version: "v1.36.5", Template: "v1.36.2", KubeTag: "v1.36.5", Slug: "v1-36-5"},    // new patch → override on newest base
-		{Version: "v1.35.3", Template: "v1.35.3", KubeTag: "", Slug: "v1-35-3"},           // pinned template exists
-		{Version: "v1.34.6", Template: "v1.34.6", KubeTag: "", Slug: "v1-34-6"},           // pinned template exists
+		{Version: "v1.35.6", Template: "v1.35.6", KubeTag: "", Slug: "v1-35-6"},           // pinned template exists
+		{Version: "v1.34.9", Template: "v1.34.9", KubeTag: "", Slug: "v1-34-9"},           // pinned template exists
 		{Version: "v1.33.99", Template: "v1.36.2", KubeTag: "v1.33.99", Slug: "v1-33-99"}, // new patch → override
 	}
 	for i := range want {
@@ -116,13 +116,13 @@ func TestResolveConformanceLegsMatchesByKubeTag(t *testing.T) {
 	// an exact match (no override needed).
 	all := []templateInfo{
 		{name: "base-newest", kubeTag: "v1.36.2"},
-		{name: "conformance-135", kubeTag: "v1.35.3"},
+		{name: "conformance-135", kubeTag: "v1.35.6"},
 	}
-	legs, err := resolveConformanceLegs([]string{"v1.35.3"}, all)
+	legs, err := resolveConformanceLegs([]string{"v1.35.6"}, all)
 	if err != nil {
 		t.Fatalf("resolveConformanceLegs: %v", err)
 	}
-	if legs[0] != (conformanceLeg{Version: "v1.35.3", Template: "conformance-135", KubeTag: "", Slug: "v1-35-3"}) {
+	if legs[0] != (conformanceLeg{Version: "v1.35.6", Template: "conformance-135", KubeTag: "", Slug: "v1-35-6"}) {
 		t.Fatalf("kube_tag match not used: %+v", legs[0])
 	}
 }
