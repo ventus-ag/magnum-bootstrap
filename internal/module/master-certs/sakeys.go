@@ -20,6 +20,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
 	"github.com/ventus-ag/magnum-bootstrap/internal/logging"
+	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
 // Service-account verify-key convergence.
@@ -80,6 +81,33 @@ type saKeyEnv struct {
 
 	listPeerIPs func(ctx context.Context) ([]string, error)
 	fetchJWKS   func(ctx context.Context, host string) ([]byte, error)
+}
+
+// rotationInFlight reports whether a CA rotation is actively moving cert
+// material right now, which is when master-certificates must keep its hands off
+// the leaf-chain heal and the verify-key bundle.
+//
+// Config.Operation() alone is not enough. It reports OperationCARotate for as
+// long as the completion marker is absent, and a rotation parked by the operator
+// hold label can stay unfinalized for weeks. In that parked state the node is
+// fully converged -- leaves are new and chain to the new CA inside the live
+// bundle, and every node holds the same old+new pair -- so both heals are safe
+// and switching them off for the duration of a hold would be a silent
+// regression.
+func rotationInFlight(cfg config.Config, req moduleapi.Request) bool {
+	if cfg.Operation() != config.OperationCARotate {
+		return false
+	}
+	parked, err := coord.RotationParked(cfg.Trigger.CARotationID)
+	if err != nil {
+		// Unreadable state: assume a live rotation and stay hands-off, the
+		// same conservative default as before this check existed.
+		if req.Logger != nil {
+			req.Logger.Infof("master-certificates: cannot read ca-rotation state (%v); treating the rotation as in flight", err)
+		}
+		return true
+	}
+	return !parked
 }
 
 // dropRetiredKeys filters out keys a previous rotation deliberately retired,

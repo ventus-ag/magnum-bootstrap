@@ -28,6 +28,27 @@ const (
 	LeaseName = "magnum-ca-rotation-restart"
 	// NodeAnnotation carries each node's reported "<phase>@<rotationId>".
 	NodeAnnotation = "magnum.openstack.org/ca-rotation"
+	// HoldLabel parks a rotation at the end of cutover for as long as any
+	// control-plane node carries it with the value HoldLabelValue. It keeps
+	// old+new trust live (dual CA bundle, old+new SA verify keys) instead of
+	// narrowing to new-only, so workloads pinned to the old CA or holding
+	// long-lived tokens keep working across the rotation.
+	//
+	//	kubectl label node <any-master> magnum.openstack.org/ca-rotation-hold=true
+	//	kubectl label node <any-master> magnum.openstack.org/ca-rotation-hold-
+	//
+	// It is read ONLY while a rotation is active, and deliberately not keyed to
+	// a specific node: master-0 can be replaced (auto-healer, resize), and a
+	// hold that silently disappeared with it would drop old trust unattended.
+	HoldLabel = "magnum.openstack.org/ca-rotation-hold"
+	// HoldLabelValue is the only value that holds. Anything else, including
+	// "false" and the empty string, releases.
+	HoldLabelValue = "true"
+	// controlPlaneRoleLabel identifies the nodes whose hold label counts.
+	controlPlaneRoleLabel = "node-role.kubernetes.io/control-plane"
+	// legacyControlPlaneRoleLabel is the pre-1.24 spelling, still present on
+	// clusters created by older Magnum templates.
+	legacyControlPlaneRoleLabel = "node-role.kubernetes.io/master"
 	// rbacRoleName names the Role/RoleBinding granting nodes ConfigMap reads.
 	rbacRoleName = "magnum-ca-rotation-reader"
 
@@ -156,6 +177,39 @@ func (c *Coordinator) currentNodeNames(ctx context.Context) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// RotationHoldActive reports whether any control-plane node carries the hold
+// label, and which one. Callers use it to park a rotation at the end of cutover
+// instead of finalizing.
+//
+// It FAILS CLOSED: when the node list cannot be read the rotation is treated as
+// held. Failing open would withdraw old trust against the operator's stated
+// intent on a transient API error, which is unrecoverable; failing closed only
+// postpones finalize to the next run, which costs nothing.
+func (c *Coordinator) RotationHoldActive(ctx context.Context) (bool, string, error) {
+	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return true, "", fmt.Errorf("read ca-rotation hold label: %w", err)
+	}
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if n.DeletionTimestamp != nil || !isControlPlane(n) {
+			continue
+		}
+		if n.Labels[HoldLabel] == HoldLabelValue {
+			return true, n.Name, nil
+		}
+	}
+	return false, "", nil
+}
+
+func isControlPlane(n *corev1.Node) bool {
+	if _, ok := n.Labels[controlPlaneRoleLabel]; ok {
+		return true
+	}
+	_, ok := n.Labels[legacyControlPlaneRoleLabel]
+	return ok
 }
 
 // readParticipants returns the snapshotted participant node names for

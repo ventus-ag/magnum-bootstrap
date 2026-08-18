@@ -75,8 +75,35 @@ type State struct {
 	// completion marker resumes on the hard path (independent, no cross-node
 	// wait) instead of falling back to the coordinated protocol once the certs
 	// look healthy again.
-	Hard      bool   `json:"hard,omitempty"`
+	Hard bool `json:"hard,omitempty"`
+	// Held marks a rotation deliberately parked at the end of cutover by the
+	// operator hold label, keeping old+new trust live instead of finalizing.
+	// Unlike every other state this is a STEADY state, not an in-flight one:
+	// the node is fully converged and simply waiting for the operator to
+	// release it. See RotationParked.
+	Held      bool   `json:"held,omitempty"`
 	UpdatedAt string `json:"updatedAt"`
+}
+
+// RotationParked reports whether this node is parked at the end of cutover for
+// rotationID, holding old+new trust because the operator hold label is set.
+//
+// This matters beyond the rotation module. While a rotation is unfinalized the
+// completion marker is absent, so Config.Operation() keeps returning
+// OperationCARotate — which gates off the leaf-chain auto-heal and the
+// service-account verify-key convergence in master-certificates. Those guards
+// exist to keep hands off cert material while a rotation is actually moving; a
+// parked rotation is not moving, and a hold can last weeks. Callers use this to
+// tell the two apart.
+func RotationParked(rotationID string) (bool, error) {
+	if rotationID == "" {
+		return false, nil
+	}
+	st, err := LoadState(rotationID)
+	if err != nil {
+		return false, err
+	}
+	return st.RotationID == rotationID && st.Held && st.Phase == PhaseCutover, nil
 }
 
 // StagingDir returns the per-rotation staging directory.

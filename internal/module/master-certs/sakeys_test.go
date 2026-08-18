@@ -17,7 +17,9 @@ import (
 
 	coord "github.com/ventus-ag/magnum-bootstrap/internal/carotation"
 	"github.com/ventus-ag/magnum-bootstrap/internal/certutil"
+	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
+	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
 // testKey is a generated RSA keypair with the shapes the code under test uses.
@@ -520,5 +522,45 @@ func TestRecordRetiredSAKeysAccumulates(t *testing.T) {
 	}
 	if len(loaded) != 2 || !loaded["aaa"] || !loaded["bbb"] {
 		t.Fatalf("unexpected registry contents: %v", loaded)
+	}
+}
+
+// A rotation that is actually moving cert material must keep master-certs
+// hands-off; a rotation parked by the operator hold label is a steady state and
+// must NOT, or a hold lasting weeks would silently disable the leaf-chain heal
+// and verify-key convergence for its whole duration.
+func TestRotationInFlightTreatsParkedRotationAsSettled(t *testing.T) {
+	defer coord.SetBaseDir(t.TempDir())()
+
+	cfg := config.Config{}
+	cfg.Trigger.CARotationID = "rot-1"
+
+	// No rotation at all.
+	settled := config.Config{}
+	settled.Trigger.CARotationID = "rot-1"
+	settled.Trigger.AppliedCARotationID = "rot-1"
+	if rotationInFlight(settled, moduleapi.Request{}) {
+		t.Error("a finalized rotation is not in flight")
+	}
+
+	// Triggered, no local state yet → genuinely in flight.
+	if !rotationInFlight(cfg, moduleapi.Request{}) {
+		t.Error("an unfinalized rotation with no parked state must read as in flight")
+	}
+
+	// Mid-protocol (cutover, not held) → still in flight.
+	if err := coord.SaveState(coord.State{RotationID: "rot-1", Phase: coord.PhaseCutover}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if !rotationInFlight(cfg, moduleapi.Request{}) {
+		t.Error("cutover without a hold must read as in flight")
+	}
+
+	// Parked by the hold label → settled, heals re-enable.
+	if err := coord.SaveState(coord.State{RotationID: "rot-1", Phase: coord.PhaseCutover, Held: true}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if rotationInFlight(cfg, moduleapi.Request{}) {
+		t.Error("a parked rotation must not block the cert heals")
 	}
 }

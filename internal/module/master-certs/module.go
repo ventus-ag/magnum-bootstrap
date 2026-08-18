@@ -105,7 +105,7 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	// NOT IsPureCARotation() — the latter stays true forever once CA_ROTATION_ID
 	// lingers in heat-params after a completed rotation, which would permanently
 	// disable this heal on every rotated cluster.
-	checkChain := cfg.Operation() != config.OperationCARotate
+	checkChain := !rotationInFlight(cfg, req)
 	if checkChain && !caNeedsRefresh {
 		for _, spec := range specs {
 			if certutil.LeafChainBroken(fmt.Sprintf("%s/%s.crt", certDir, spec.Name), caCertPath) {
@@ -353,7 +353,7 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 	// the blanket "certificate material changed" restart of etcd and the
 	// kubelet — only kube-apiserver reads this file.
 	var saBundleChanges []host.Change
-	if cfg.Operation() != config.OperationCARotate {
+	if !rotationInFlight(cfg, req) {
 		var saWarnings []string
 		saBundleChanges, saWarnings, err = convergeSAVerifyKeys(ctx, newSAKeyEnv(cfg, certDir, executor, req.Logger))
 		warnings = append(warnings, saWarnings...)

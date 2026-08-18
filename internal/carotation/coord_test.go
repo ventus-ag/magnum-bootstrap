@@ -2,6 +2,7 @@ package carotation
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func fakeCoord(objects ...runtime.Object) *Coordinator {
@@ -327,5 +329,112 @@ func TestReportStatusPatchesNodeAnnotation(t *testing.T) {
 	}
 	if got := n.Annotations[NodeAnnotation]; got != "cutover@rot-1" {
 		t.Fatalf("node annotation = %q; want cutover@rot-1", got)
+	}
+}
+
+// labelledNode builds a node with the given role and hold-label state.
+func labelledNode(name string, controlPlane bool, hold string) *corev1.Node {
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	n.Labels = map[string]string{}
+	if controlPlane {
+		n.Labels[controlPlaneRoleLabel] = ""
+	}
+	if hold != "" {
+		n.Labels[HoldLabel] = hold
+	}
+	return n
+}
+
+func TestRotationHoldActive(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name       string
+		nodes      []runtime.Object
+		wantHeld   bool
+		wantHolder string
+	}{
+		{
+			name:     "no labels anywhere",
+			nodes:    []runtime.Object{labelledNode("m0", true, ""), labelledNode("w0", false, "")},
+			wantHeld: false,
+		},
+		{
+			name:       "control-plane node holds",
+			nodes:      []runtime.Object{labelledNode("m0", true, "true"), labelledNode("w0", false, "")},
+			wantHeld:   true,
+			wantHolder: "m0",
+		},
+		{
+			name: "any control-plane node counts, not just the first",
+			nodes: []runtime.Object{
+				labelledNode("m0", true, ""),
+				labelledNode("m1", true, ""),
+				labelledNode("m2", true, "true"),
+			},
+			wantHeld:   true,
+			wantHolder: "m2",
+		},
+		{
+			// Trust withdrawal is a control-plane decision; a worker must not
+			// be able to pin the whole cluster's rotation.
+			name:     "worker label is ignored",
+			nodes:    []runtime.Object{labelledNode("m0", true, ""), labelledNode("w0", false, "true")},
+			wantHeld: false,
+		},
+		{
+			name:     "explicit false releases",
+			nodes:    []runtime.Object{labelledNode("m0", true, "false")},
+			wantHeld: false,
+		},
+		{
+			name:     "any other value releases",
+			nodes:    []runtime.Object{labelledNode("m0", true, "yes")},
+			wantHeld: false,
+		},
+		{
+			name: "legacy master role label still counts",
+			nodes: []runtime.Object{func() runtime.Object {
+				n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "old-master"}}
+				n.Labels = map[string]string{legacyControlPlaneRoleLabel: "", HoldLabel: "true"}
+				return n
+			}()},
+			wantHeld:   true,
+			wantHolder: "old-master",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			held, holder, err := fakeCoord(tc.nodes...).RotationHoldActive(ctx)
+			if err != nil {
+				t.Fatalf("RotationHoldActive: %v", err)
+			}
+			if held != tc.wantHeld {
+				t.Errorf("held = %v, want %v", held, tc.wantHeld)
+			}
+			if tc.wantHolder != "" && holder != tc.wantHolder {
+				t.Errorf("holder = %q, want %q", holder, tc.wantHolder)
+			}
+		})
+	}
+}
+
+// Failing open would withdraw old trust against the operator's stated intent on
+// a transient API error, and that cannot be undone. Failing closed only defers
+// finalize to the next run.
+func TestRotationHoldFailsClosed(t *testing.T) {
+	c := fakeCoord()
+	c.clientset.(*fake.Clientset).PrependReactor("list", "nodes",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("apiserver unreachable")
+		})
+
+	held, _, err := c.RotationHoldActive(context.Background())
+	if err == nil {
+		t.Fatal("expected an error to be reported")
+	}
+	if !held {
+		t.Error("an unreadable node list must be treated as held")
 	}
 }

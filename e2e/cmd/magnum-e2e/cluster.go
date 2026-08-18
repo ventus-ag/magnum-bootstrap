@@ -378,6 +378,9 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 		}
 		return nil
 
+	case "resize-flavor":
+		return r.resizeFlavorCycle(ctx)
+
 	case "nodepool-metadata":
 		return r.nodepoolMetadataCycle(ctx)
 
@@ -470,6 +473,18 @@ func (r *runner) preflight(ctx context.Context) error {
 			return fmt.Errorf("op chain has %d upgrade op(s) but the ladder has only %d rung(s): %s",
 				nUp, len(r.ladder), strings.Join(r.ladder, ","))
 		}
+	}
+	// A resize-flavor op needs a real Nova flavor — resolve it dry so a typo
+	// (or a missing RESIZE_FLAVOR) dies before any billed resource exists.
+	if opsContain(ops, "resize-flavor") {
+		if r.cfg.resizeFlavor == "" {
+			return fmt.Errorf("op chain contains resize-flavor but RESIZE_FLAVOR (-resize-flavor) is empty")
+		}
+		id, err := r.flavorIDByName(ctx, r.cfg.resizeFlavor)
+		if err != nil {
+			return fmt.Errorf("resize-flavor target: %w", err)
+		}
+		r.log("resize-flavor target %q resolved (id %s)", r.cfg.resizeFlavor, id)
 	}
 	return r.preflightKeypair(ctx)
 }

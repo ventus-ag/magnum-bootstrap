@@ -32,7 +32,7 @@ on:
         type: string
         default: all
       ops:
-        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
+        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3,resize-flavor"
         type: string
         default: ""
       keep_cluster:
@@ -92,7 +92,7 @@ on:
           - version-ladder
           - sonobuoy
       ops:
-        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3"
+        description: "Explicit op chain (overrides scenario), e.g. upgrade,ca-rotate,resize-workers=3,resize-flavor"
         type: string
         default: ""
       keep_cluster:
@@ -214,6 +214,9 @@ jobs:
       MASTER_COUNT_RESIZE: ${{ inputs.os_master_count_resize || '2' }}
       SKIP_UPGRADE: ${{ inputs.os_skip_upgrade && '1' || '' }}
       SKIP_RESIZE: ${{ inputs.os_skip_resize && '1' || '' }}
+      # Target flavor for the resize-flavor op (in-place Nova resize of the
+      # worker + master nodegroups). Repo var overrides the default.
+      RESIZE_FLAVOR: ${{ vars.RESIZE_FLAVOR || 'VC-8' }}
       SKIP_POST_ROTATE: ${{ inputs.os_skip_post_rotate && '1' || '' }}
     steps:
       # ── Build path (standalone dispatch only). No upstream `build` job to reuse,

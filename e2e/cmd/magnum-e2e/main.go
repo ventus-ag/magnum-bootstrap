@@ -75,6 +75,9 @@ type config struct {
 	// still uses the CLUSTER's driver/OS at create time, so this must be a
 	// same-OS template within ±1 minor of the cluster (Magnum rejects more).
 	nodepoolTemplate string
+	// resizeFlavor is the target flavor for the resize-flavor op (in-place
+	// Nova resize of the default worker + master nodegroups).
+	resizeFlavor string
 
 	// Node SSH for on-host diagnostics (reconciler log, heat-container-agent +
 	// kubernetes service journals) when an op fails. sshKeyPath is required only
@@ -161,6 +164,7 @@ func loadConfig() config {
 	flag.StringVar(&c.nodepoolName, "nodepool-name", envOr("NODEPOOL_NAME", "e2e-np"), "name of the extra worker nodepool (nodegroup) [NODEPOOL_NAME]")
 	flag.StringVar(&c.nodepoolFlavor, "nodepool-flavor", envOr("NODEPOOL_FLAVOR", ""), "flavor for the extra nodepool (a different node size); empty = template default [NODEPOOL_FLAVOR]")
 	flag.StringVar(&c.nodepoolTemplate, "nodepool-template", envOr("NODEPOOL_TEMPLATE", ""), "cluster template (name or UUID) attached to the extra nodepool as a cluster_template_id label; same-OS, within ±1 minor of the cluster [NODEPOOL_TEMPLATE]")
+	flag.StringVar(&c.resizeFlavor, "resize-flavor", envOr("RESIZE_FLAVOR", ""), "target flavor for the resize-flavor op (in-place Nova resize of worker + master nodegroups, e.g. VC-8); required when the op chain contains resize-flavor [RESIZE_FLAVOR]")
 	flag.StringVar(&c.sshKeyPath, "ssh-key", envOr("SSH_PRIVATE_KEY", ""), "path to a private key for node-log SSH on failure; needed only with a named KEYPAIR (ephemeral keypair captures its own key) [SSH_PRIVATE_KEY]")
 	flag.StringVar(&c.sshUser, "ssh-user", envOr("SSH_USER", "core"), "SSH login user for node-log collection (Fedora CoreOS = core) [SSH_USER]")
 	flag.IntVar(&c.autoscaleMin, "autoscale-min", envIntOr("AUTOSCALE_MIN", 2), "cluster-autoscaler worker floor for the autoscale op (scale-down target). Defaults to autoscale-max-1 so scale-down is a SINGLE node removal (one Magnum resize): a multi-node scale-down issues back-to-back resizes, and the reconciler's autoscaler-Helm re-apply on each resize reverts the fast-timer patch mid-walk, so the 2nd resize preempts the 1st's still-in-flight Heat update (\"Stack UPDATE cancelled\" -> UPDATE_FAILED) [AUTOSCALE_MIN]")

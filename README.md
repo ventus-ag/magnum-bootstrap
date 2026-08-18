@@ -135,6 +135,59 @@ The launcher exports these environment variables (all have defaults):
 | `MAGNUM_PULUMI_BACKEND_DIR` | `/var/lib/magnum/pulumi` |
 | `MAGNUM_PULUMI_BACKEND_URL` | `file:///var/lib/magnum/pulumi` |
 
+## Node Labels
+
+Labels the reconciler reads off Kubernetes nodes to change its behaviour.
+
+| Label | Values | Read when | Effect |
+|-------|--------|-----------|--------|
+| `magnum.openstack.org/ca-rotation-hold` | `true` holds; absent, `false` or anything else releases | only while a CA rotation is active, and only on control-plane nodes | Parks the rotation at the end of cutover, keeping **old+new** trust live instead of narrowing to new-only |
+
+### Holding a CA rotation
+
+A CA rotation normally runs `prepare → cutover → finalize` in one pass, and
+finalize drops the old CA and the old service-account signing key minutes after
+cutover. Workloads that need a longer overlap — pods holding a stale mounted CA,
+long-lived ServiceAccount tokens, external clients pinned to the old CA — can be
+given one by holding the rotation:
+
+```bash
+# before triggering the rotation (any control-plane node)
+kubectl label node <master> magnum.openstack.org/ca-rotation-hold=true
+
+# ... rotate as usual; the cluster parks after cutover and keeps old+new trust
+
+# when the stragglers have moved over, release it
+kubectl label node <master> magnum.openstack.org/ca-rotation-hold-
+```
+
+While parked, `ca.crt` holds the new+old CA bundle and `service_account.key`
+holds the new+old verification keys; signing has already switched to the new
+material. Nothing else about the cluster is in a half-applied state — every node
+has cleared the cutover barrier before the hold takes effect.
+
+Releasing the label needs no further action: `ca-rotation` runs on every
+reconcile, so the nightly `magnum-reconcile.timer` picks the change up and
+finalizes on its own. To finalize immediately, run `bootstrap run-once` (or
+`systemctl start magnum-reconcile.service`) on each node.
+
+Notes:
+
+- The label is checked on **any** control-plane node, not a specific one, so a
+  hold survives master-0 being replaced by the auto-healer or a resize.
+- A worker carrying the label has no effect — withdrawing trust is a
+  control-plane decision.
+- If the node list cannot be read, the rotation is treated as **held**. Failing
+  the other way would withdraw trust against your stated intent on a transient
+  API error, and that cannot be undone.
+- Rotating again while held accumulates trust, capped at **3 generations**
+  (current + 2 previous) for both the CA bundle and the SA verify keys. Evicted
+  service-account keys are recorded in
+  `/var/lib/magnum/ca-rotation/retired-sa-keys` so they are never re-adopted.
+- A hold **never expires and raises no warning**. It is honoured until you
+  remove the label — which also means a forgotten label leaves the old CA and
+  old signing key trusted indefinitely.
+
 ## Architecture
 
 ```

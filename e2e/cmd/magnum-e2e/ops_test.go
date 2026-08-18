@@ -196,7 +196,7 @@ func TestDefaultAllCoverage(t *testing.T) {
 	if multinode.masters != 3 || multinode.workers != 2 {
 		t.Fatalf("multinode shape = %dm/%dw, want 3m/2w", multinode.masters, multinode.workers)
 	}
-	assertOpsContain(t, "multinode", multinode.ops, "add-nodepool", "resize-workers", "resize-nodepool", "del-nodepool", "post-rotate")
+	assertOpsContain(t, "multinode", multinode.ops, "add-nodepool", "resize-workers", "resize-nodepool", "resize-flavor", "del-nodepool", "post-rotate")
 	assertMinOpCount(t, "multinode", multinode.ops, "upgrade", 3)
 	assertMinOpCount(t, "multinode", multinode.ops, "ca-rotate", 3)
 

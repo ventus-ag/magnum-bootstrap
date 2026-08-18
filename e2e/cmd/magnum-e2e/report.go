@@ -38,6 +38,7 @@ var opDescriptions = map[string]string{
 	"verify-sa":             "service-account key consistency across nodes",
 	"resize-workers":        "resize the worker nodegroup",
 	"resize-masters":        "resize the master nodegroup",
+	"resize-flavor":         "in-place Nova flavor resize of worker + master nodegroups",
 	"add-nodepool":          "create an extra worker nodepool",
 	"resize-nodepool":       "resize the extra worker nodepool",
 	"del-nodepool":          "delete the extra worker nodepool",

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // PublicKeyID must reproduce the `kid` kube-apiserver publishes at
@@ -165,5 +167,158 @@ func TestPublicKeyPEMFromPrivateKeyFile(t *testing.T) {
 
 	if _, err := PublicKeyPEMFromPrivateKeyFile(filepath.Join(dir, "absent")); err == nil {
 		t.Error("expected an error for a missing private key")
+	}
+}
+
+func testPubPEM(t *testing.T) ([]byte, string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	pemBytes, err := PublicKeyPEM(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	id, err := PublicKeyID(pemBytes)
+	if err != nil {
+		t.Fatalf("key id: %v", err)
+	}
+	return pemBytes, id
+}
+
+func TestCapPublicKeyBundleKeepsNewestFirst(t *testing.T) {
+	// Each rotation prepends its new key, so bundle order IS age order.
+	k1, id1 := testPubPEM(t)
+	k2, id2 := testPubPEM(t)
+	k3, id3 := testPubPEM(t)
+	k4, id4 := testPubPEM(t)
+
+	var bundle []byte
+	for _, k := range [][]byte{k1, k2, k3, k4} {
+		bundle = append(bundle, k...)
+	}
+
+	capped, dropped := CapPublicKeyBundle(bundle, 3)
+	if len(dropped) != 1 || dropped[0] != id4 {
+		t.Fatalf("expected the oldest key evicted, got %v", dropped)
+	}
+	got := ParsePublicKeyPEMs(capped)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 keys kept, got %d", len(got))
+	}
+	for i, want := range []string{id1, id2, id3} {
+		id, err := PublicKeyID(got[i])
+		if err != nil || id != want {
+			t.Errorf("position %d: got %v want %s", i, id, want)
+		}
+	}
+}
+
+func TestCapPublicKeyBundleDedupesAndIsIdempotent(t *testing.T) {
+	k1, _ := testPubPEM(t)
+	k2, _ := testPubPEM(t)
+
+	// The same key appearing twice must not consume two generations.
+	bundle := append(append(append([]byte{}, k1...), k2...), k1...)
+	capped, dropped := CapPublicKeyBundle(bundle, 3)
+	if len(dropped) != 0 {
+		t.Fatalf("duplicates are not evictions, got %v", dropped)
+	}
+	if n := len(ParsePublicKeyPEMs(capped)); n != 2 {
+		t.Fatalf("expected 2 distinct keys, got %d", n)
+	}
+
+	again, dropped := CapPublicKeyBundle(capped, 3)
+	if len(dropped) != 0 || string(again) != string(capped) {
+		t.Error("capping an already-capped bundle must be a no-op")
+	}
+}
+
+// Emptying service_account.key would invalidate every ServiceAccount token in
+// the cluster, so an unparseable bundle is left exactly as it is.
+func TestCapBundlesRefuseToEmptyUnparseableInput(t *testing.T) {
+	junk := []byte("NEW-SA\nOLD-SA\n")
+
+	capped, dropped := CapPublicKeyBundle(junk, 1)
+	if string(capped) != string(junk) || dropped != nil {
+		t.Errorf("public key bundle mangled: %q %v", capped, dropped)
+	}
+
+	certCapped, certDropped := CapCertBundle(junk, 1)
+	if string(certCapped) != string(junk) || certDropped != 0 {
+		t.Errorf("cert bundle mangled: %q %d", certCapped, certDropped)
+	}
+}
+
+func TestCapPublicKeyBundleUnlimited(t *testing.T) {
+	k1, _ := testPubPEM(t)
+	k2, _ := testPubPEM(t)
+	bundle := append(append([]byte{}, k1...), k2...)
+
+	_, dropped := CapPublicKeyBundle(bundle, 0)
+	if len(dropped) != 0 {
+		t.Errorf("max<=0 means unlimited, got %v", dropped)
+	}
+}
+
+func TestCapCertBundleKeepsNewestFirst(t *testing.T) {
+	mk := func(cn string) []byte {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("generate: %v", err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatalf("create cert: %v", err)
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+
+	var bundle []byte
+	for _, cn := range []string{"newest", "middle", "older", "oldest"} {
+		bundle = append(bundle, mk(cn)...)
+	}
+
+	capped, dropped := CapCertBundle(bundle, 3)
+	if dropped != 1 {
+		t.Fatalf("expected 1 cert dropped, got %d", dropped)
+	}
+	certs, err := loadCACerts2(capped)
+	if err != nil {
+		t.Fatalf("parse capped: %v", err)
+	}
+	if len(certs) != 3 {
+		t.Fatalf("expected 3 certs, got %d", len(certs))
+	}
+	if certs[0].Subject.CommonName != "newest" || certs[2].Subject.CommonName != "older" {
+		t.Errorf("wrong certs kept: %s..%s", certs[0].Subject.CommonName, certs[2].Subject.CommonName)
+	}
+}
+
+// loadCACerts2 is a local parser so the test does not depend on unexported
+// helpers changing shape.
+func loadCACerts2(bundle []byte) ([]*x509.Certificate, error) {
+	var out []*x509.Certificate
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return out, nil
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 }

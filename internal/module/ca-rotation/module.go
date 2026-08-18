@@ -292,7 +292,7 @@ func (r *runner) writeHardFiles() error {
 		if err != nil {
 			return err
 		}
-		if err := r.writeLive(certDir+"/service_account.key", verify, 0o440); err != nil {
+		if err := r.writeLive(certDir+"/service_account.key", r.capSAVerify(verify), 0o440); err != nil {
 			return err
 		}
 		if r.cfg.Shared.CAKey != "" {
@@ -397,6 +397,22 @@ func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, 
 
 	// Stage 1: prepare → barrier → Stage 2: cutover → barrier → Stage 3: finalize.
 	for _, step := range []coord.Phase{coord.PhasePrepare, coord.PhaseCutover, coord.PhaseFinalize} {
+		// The operator can park the rotation at the end of cutover, keeping
+		// old+new trust live instead of narrowing to new-only. Checked only
+		// here, so it costs nothing outside an active rotation, and only for
+		// the finalize step, so prepare and cutover always complete: parking
+		// mid-protocol would leave the cluster genuinely half-rotated, whereas
+		// parking after cutover is a converged, cluster-consistent state that
+		// every node has already barriered into.
+		if step == coord.PhaseFinalize && !completed.AtLeast(step) {
+			held, holder, herr := c.RotationHoldActive(ctx)
+			if herr != nil {
+				logf(req, "ca-rotation: could not read the %s label (%v); holding old+new trust this run rather than withdrawing it on a transient error", coord.HoldLabel, herr)
+			}
+			if held {
+				return r.park(rotationID, role, nodeName, holder)
+			}
+		}
 		if !completed.AtLeast(step) {
 			if err := r.runPhase(ctx, step, c); err != nil {
 				return moduleapi.Result{}, err
@@ -459,6 +475,42 @@ type runner struct {
 
 func (r *runner) outputs() map[string]string {
 	return map[string]string{"caRotationId": r.rotationID, "role": r.role.String()}
+}
+
+// park records the rotation as deliberately held at the end of cutover and
+// returns success without finalizing.
+//
+// Three things make the hold resumable, and all three matter:
+//   - the completion marker is NOT written, so Run() does not short-circuit on
+//     the next reconcile and the nightly run-periodic re-evaluates the label
+//   - the staging directory is NOT removed, since finalize later reads
+//     new/ca.crt and new/service_account.key from it
+//   - local state records cutover as completed, so the resumed run skips
+//     prepare and cutover and lands straight on the finalize decision
+//
+// It returns success immediately rather than waiting, so the Heat-triggered
+// run-once exits cleanly instead of burning its timeout.
+//
+// The hold is deliberately silent: no warning is raised, however long it lasts.
+// The single log line below is ordinary phase logging -- without it a parked
+// rotation would be undiagnosable.
+func (r *runner) park(rotationID string, role config.Role, nodeName, holder string) (moduleapi.Result, error) {
+	via := holder
+	if via == "" {
+		via = "unreadable node list"
+	}
+	logf(r.req, "ca-rotation: rotationId=%s parked after cutover by %s=%s on %s — keeping old+new trust (CA bundle + service-account verify keys); remove the label to finalize",
+		rotationID, coord.HoldLabel, coord.HoldLabelValue, via)
+
+	if err := coord.SaveState(coord.State{
+		RotationID: rotationID, Role: role.String(), Instance: nodeName,
+		Phase: coord.PhaseCutover, CAMode: coord.CAModeBundle, LeafMode: coord.LeafModeNew,
+		SAVerifyMode: coord.CAModeBundle, SASignMode: coord.LeafModeNew, Held: true,
+	}); err != nil {
+		return moduleapi.Result{}, fmt.Errorf("ca-rotation: persist held state: %w", err)
+	}
+
+	return moduleapi.Result{Changes: r.changes, Warnings: r.warnings, Outputs: r.outputs()}, nil
 }
 
 // ensureStaged makes sure the old snapshot, new material and CA bundle exist in
@@ -578,6 +630,39 @@ func (r *runner) stateFor(phase coord.Phase) coord.State {
 
 // --- phase file writes -----------------------------------------------------
 
+// maxTrustGenerations bounds how many CA certificates and service-account
+// verification keys a node trusts at once: the current generation plus two
+// previous ones.
+//
+// Without a bound the bundles grow without limit while a rotation is held:
+// snapshotOldMaterial copies the LIVE bundle into old/, and every bundle is
+// built as concat(new, old), so a second held rotation yields three entries, a
+// third yields four. Each rotation prepends its new material, so position zero
+// is always the newest and keeping the first N is keeping the newest N -- which
+// is the only ordering available for service-account keys, since public keys
+// carry no timestamps.
+const maxTrustGenerations = 3
+
+// capSAVerify bounds the service-account verify bundle and records every
+// evicted key as retired, so the verify-key convergence in master-certificates
+// cannot re-adopt it from a peer that still publishes it. Best-effort recording
+// matches the finalize path: a disk hiccup must not fail an otherwise healthy
+// rotation.
+func (r *runner) capSAVerify(verify []byte) []byte {
+	capped, dropped := certutil.CapPublicKeyBundle(verify, maxTrustGenerations)
+	if len(dropped) == 0 || len(capped) == 0 {
+		// Nothing to evict, or nothing we could make sense of. Either way the
+		// bundle stays exactly as built: shipping a shorter service_account.key
+		// than intended invalidates live tokens.
+		return verify
+	}
+	logf(r.req, "ca-rotation: trust generation cap (%d) evicted %d service-account verification key(s)", maxTrustGenerations, len(dropped))
+	if err := coord.RecordRetiredSAKeys(dropped); err != nil && r.req.Logger != nil {
+		r.req.Logger.Warnf("ca-rotation: could not record evicted service-account keys as retired: %v", err)
+	}
+	return capped
+}
+
 func (r *runner) writePrepareFiles() error {
 	bundle, err := os.ReadFile(filepath.Join(coord.BundleDir(r.rotationID), "ca.crt"))
 	if err != nil {
@@ -595,7 +680,7 @@ func (r *runner) writePrepareFiles() error {
 		if err != nil {
 			return err
 		}
-		if err := r.writeLive(certDir+"/service_account.key", verify, 0o440); err != nil {
+		if err := r.writeLive(certDir+"/service_account.key", r.capSAVerify(verify), 0o440); err != nil {
 			return err
 		}
 		// New CA signing key for the controller-manager (cert_manager_api).
@@ -981,6 +1066,12 @@ func buildBundle(rotationID string) error {
 	)
 	if err != nil {
 		return err
+	}
+	// Bound the trust chain: a held rotation stacks generations, since the old
+	// snapshot is the live bundle from the previous round.
+	capped, dropped := certutil.CapCertBundle(bundle, maxTrustGenerations)
+	if dropped > 0 {
+		bundle = capped
 	}
 	return os.WriteFile(filepath.Join(bundleDir, "ca.crt"), bundle, 0o444)
 }

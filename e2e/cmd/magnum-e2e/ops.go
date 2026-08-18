@@ -34,8 +34,12 @@ var knownOps = map[string]bool{
 	"resize-workers":  true,
 	"resize-masters":  true,
 	"resize-nodepool": true,
-	"add-nodepool":    true,
-	"del-nodepool":    true,
+	// resize-flavor: in-place Nova flavor resize of the default worker + master
+	// nodegroups via nodegroup PATCH /flavor_id; target from RESIZE_FLAVOR
+	// (see resize_flavor.go).
+	"resize-flavor": true,
+	"add-nodepool":  true,
+	"del-nodepool":  true,
 	// nodepool-metadata: patch node_labels/node_taints on the active nodepool
 	// (single + multiple add, partial + full delete) and verify Node objects +
 	// taint scheduling semantics after every stage (see nodepool_metadata.go).
@@ -166,7 +170,7 @@ var scenarios = map[string]scenarioDef{
 	},
 	"multinode": {
 		masters: 3, workers: 2,
-		ops: "add-nodepool=2,nodepool-metadata,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
+		ops: "add-nodepool=2,nodepool-metadata,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,resize-flavor,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
 		// 3-master coverage: the 3 `upgrade` ops climb 1.31→1.32→1.33 (see
 		// climbLadder) so multimaster upgrades exercise real minor bumps.
 		upgradeLadder: climbLadder,

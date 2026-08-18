@@ -230,6 +230,95 @@ func b64uBigInt(value string) (*big.Int, error) {
 	return new(big.Int).SetBytes(raw), nil
 }
 
+// CapPublicKeyBundle keeps at most max distinct public keys from a PEM bundle,
+// preserving order, and returns the key IDs it dropped.
+//
+// Ordering is the whole trick: every rotation PREPENDS its new key, so position
+// zero is always the newest and "keep the first max" is exactly "keep the newest
+// max". Public keys carry no timestamps, so there is nothing else to sort by.
+//
+// max <= 0 means unlimited.
+//
+// If nothing in the input parses as a public key the ORIGINAL bundle is
+// returned untouched. Emptying service_account.key would invalidate every
+// ServiceAccount token in the cluster, so an unrecognised bundle is always left
+// alone rather than replaced with a shorter one we are more confident about.
+func CapPublicKeyBundle(bundle []byte, max int) ([]byte, []string) {
+	keys := ParsePublicKeyPEMs(bundle)
+	if len(keys) == 0 {
+		return bundle, nil
+	}
+
+	var kept []byte
+	var dropped []string
+	seen := map[string]bool{}
+	count := 0
+	for _, key := range keys {
+		id, err := PublicKeyID(key)
+		if err != nil || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if max > 0 && count >= max {
+			dropped = append(dropped, id)
+			continue
+		}
+		kept = append(kept, key...)
+		count++
+	}
+	return kept, dropped
+}
+
+// CapCertBundle keeps at most max distinct certificates from a PEM bundle,
+// preserving order, and reports how many it dropped. Same newest-first ordering
+// contract as CapPublicKeyBundle, and the same refusal to replace a bundle it
+// could not parse: no certificates recognised means the input is returned
+// untouched.
+func CapCertBundle(bundle []byte, max int) ([]byte, int) {
+	var kept []byte
+	parsed := 0
+	seen := map[string]bool{}
+	dropped := 0
+	count := 0
+
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		parsed++
+		fingerprint := string(sha256Sum(cert.Raw))
+		if seen[fingerprint] {
+			continue
+		}
+		seen[fingerprint] = true
+		if max > 0 && count >= max {
+			dropped++
+			continue
+		}
+		kept = append(kept, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})...)
+		count++
+	}
+	if parsed == 0 {
+		return bundle, 0
+	}
+	return kept, dropped
+}
+
+func sha256Sum(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
 // PublicKeyPEMFile reads a PEM bundle from disk and returns its normalised
 // public key blocks. A missing file yields no keys and no error — an absent
 // bundle is a legitimate starting state.

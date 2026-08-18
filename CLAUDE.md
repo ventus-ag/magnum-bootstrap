@@ -610,8 +610,16 @@ The driver is an **op-engine**, not a fixed pipeline. `e2e/cmd/magnum-e2e`
 creates a cluster of a configured shape, then runs an ordered op chain
 (`internal` to the driver, file `e2e/cmd/magnum-e2e/ops.go`): `upgrade`,
 `ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
-`resize-nodepool=N`, `del-nodepool`, `nodepool-metadata`, `post-rotate`,
-`cloud-smoke`, `verify-sa`, `autoscale`.
+`resize-nodepool=N`, `del-nodepool`, `nodepool-metadata`, `resize-flavor`,
+`post-rotate`, `cloud-smoke`, `verify-sa`, `autoscale`.
+`resize-flavor` (resize_flavor.go, target from `RESIZE_FLAVOR`, e.g. VC-8)
+drives the fork's in-place Nova flavor resize — nodegroup PATCH `/flavor_id` →
+params-only Heat update → serial (batch-1) Nova resize of each member — first
+on the default worker nodegroup, then the masters (proves etcd survives the
+serial member reboots); extra nodepools are untouched. Verification joins each
+k8s Node to its Nova server via `spec.providerID` and asserts the server's
+actual flavor, then runs a full bundle. Preflight resolves `RESIZE_FLAVOR` in
+Nova so a typo fails before a cluster is billed.
 `nodepool-metadata` (nodepool_metadata.go, needs an active nodepool) drives the
 per-nodegroup node_labels/node_taints lifecycle through four Magnum labels
 PATCHes — add-single, add-multiple, delete-single (subset must survive),
@@ -627,8 +635,8 @@ presets (`SCENARIO=all`): `smoke` (1m/1w Fedora: addon toggles, upgrade,
 prove the taint → PATCH them away → verify removal → delete the pool], worker
 resize, repeated CA-rotate/upgrade wedge, post-rotate add), `multinode` (3m/2w
 Fedora + extra worker nodepool: `nodepool-metadata` 4-stage add/delete cycle,
-nodepool/worker resize up/down, repeated wedge, post-rotate add),
-`ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
+nodepool/worker resize up/down, `resize-flavor`, repeated wedge, post-rotate
+add), `ubuntu-upgrade`, `ubuntu-nodepool`, and `version-ladder`.
 `smoke` runs on **every push/PR** (per-PR e2e-openstack matrix), so nodepool
 label/taint create+remove is exercised on a real cluster each MR;
 `nodepool-metadata`'s deeper 4-stage cycle runs in `multinode` (nightly `all`
