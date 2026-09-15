@@ -51,12 +51,18 @@ func (r *runner) resizeFlavorCycle(ctx context.Context) error {
 
 // patchNodeGroupFlavor PATCHes the nodegroup's flavor_id via a raw JSON-patch
 // (same transport as patchNodepoolMetadata — the typed nodegroups.Update only
-// accepts a 202, and Magnum builds may answer 200). "add" upserts per RFC 6902,
-// so it also covers a nodegroup whose flavor_id is still null. Flavor is the
+// accepts a 202, and Magnum builds may answer 200). Magnum does not follow RFC
+// 6902 upsert semantics here: apply_jsonpatch rejects "add" on an attribute
+// that is already set ("has existed, please use 'replace' operation instead"),
+// so the op is chosen from the nodegroup's current flavor_id. Flavor is the
 // only op in the request: the fork rejects combining it with a node_count
 // change.
 func (r *runner) patchNodeGroupFlavor(ctx context.Context, ng *nodegroups.NodeGroup, target string) error {
-	ops := []map[string]any{{"op": "add", "path": "/flavor_id", "value": target}}
+	op := "replace"
+	if ng.FlavorID == "" {
+		op = "add"
+	}
+	ops := []map[string]any{{"op": op, "path": "/flavor_id", "value": target}}
 	url := r.magnum.ServiceURL("clusters", r.cfg.clusterName, "nodegroups", ng.UUID)
 	if _, err := r.magnum.Patch(ctx, url, ops, nil, &gophercloud.RequestOpts{OkCodes: []int{200, 202}}); err != nil {
 		return fmt.Errorf("patch nodegroup %q flavor -> %s: %w", ng.Name, target, err)
