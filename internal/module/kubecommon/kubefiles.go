@@ -90,7 +90,7 @@ func EnsureKubeFiles(executor *host.Executor, files map[string]string) ([]host.C
 	}
 	manifestPath := filepath.Join(kubeFilesDir, kubeFilesManifest)
 	previous, _ := os.ReadFile(manifestPath)
-	for _, name := range strings.Fields(string(previous)) {
+	for name := range strings.FieldsSeq(string(previous)) {
 		if _, keep := files[name]; keep || !kubeFileName.MatchString(name) {
 			continue
 		}
@@ -127,6 +127,39 @@ func RegisterKubeFiles(ctx *pulumi.Context, name, encoded string, opts ...pulumi
 		}
 	}
 	return nil
+}
+
+// UnitOptions pairs a systemd unit with the extra options it runs with.
+type UnitOptions struct {
+	Unit    string
+	Options string
+}
+
+// RestartUnits returns the units to restart for changes. A change limited to
+// kube files restarts only the units whose options reference that directory,
+// so shipping a file nothing uses yet does not bounce kubelet on every node.
+func RestartUnits(changes []host.Change, units []UnitOptions) []string {
+	kubeFileChanged := false
+	for _, c := range changes {
+		if !strings.HasPrefix(c.Path, kubeFilesDir+"/") {
+			return unitNames(units, func(UnitOptions) bool { return true })
+		}
+		kubeFileChanged = true
+	}
+	if !kubeFileChanged {
+		return nil
+	}
+	return unitNames(units, func(u UnitOptions) bool { return strings.Contains(u.Options, kubeFilesDir+"/") })
+}
+
+func unitNames(units []UnitOptions, keep func(UnitOptions) bool) []string {
+	var names []string
+	for _, u := range units {
+		if keep(u) {
+			names = append(names, u.Unit)
+		}
+	}
+	return names
 }
 
 // outputPathFlags name files a component writes, so they need not exist.

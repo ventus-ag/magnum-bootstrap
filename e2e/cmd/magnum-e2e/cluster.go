@@ -1086,7 +1086,10 @@ func (r *runner) runMutationNoBundle(ctx context.Context, name string, trigger f
 	if err := r.waitTransition(ctx, before); err != nil {
 		return fmt.Errorf("wait for update to start: %w", err)
 	}
-	return r.waitStatus(ctx, "UPDATE_COMPLETE")
+	if err := r.waitStatus(ctx, "UPDATE_COMPLETE"); err != nil {
+		return err
+	}
+	return r.waitHeatSettled(ctx)
 }
 
 // listClusters prints every Magnum cluster in the project with its status —

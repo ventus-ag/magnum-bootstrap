@@ -109,10 +109,45 @@ func TestCheckOptionFilesCountsProvisionedPaths(t *testing.T) {
 	}
 }
 
+func TestRestartUnits(t *testing.T) {
+	units := []UnitOptions{
+		{Unit: "kube-apiserver", Options: "--audit-policy-file=/etc/kubernetes/files/policy"},
+		{Unit: "kubelet", Options: "--max-pods=50"},
+		{Unit: "kube-proxy"},
+	}
+	kubeFile := host.Change{Action: host.ActionCreate, Path: "/etc/kubernetes/files/policy"}
+	other := host.Change{Action: host.ActionReplace, Path: "/etc/kubernetes/apiserver"}
+	for _, tc := range []struct {
+		name    string
+		changes []host.Change
+		want    []string
+	}{
+		{"none", nil, nil},
+		{"kube file only", []host.Change{kubeFile}, []string{"kube-apiserver"}},
+		{"config change", []host.Change{kubeFile, other}, []string{"kube-apiserver", "kubelet", "kube-proxy"}},
+		{"no path", []host.Change{{Action: host.ActionUpdate}}, []string{"kube-apiserver", "kubelet", "kube-proxy"}},
+	} {
+		if got := RestartUnits(tc.changes, units); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: RestartUnits = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func BenchmarkMissingFileFlags(b *testing.B) {
 	opts := "--oidc-issuer-url=https://keycloak.example/realms/apps --oidc-username-claim=email --oidc-client-id=headlamp --oidc-ca-file=/etc/kubernetes/files/oidc_ca --audit-log-path=/var/log/a.log"
 	exists := func(string) bool { return true }
 	for b.Loop() {
 		MissingFileFlags(opts, exists)
+	}
+}
+
+func BenchmarkRestartUnits(b *testing.B) {
+	units := []UnitOptions{
+		{Unit: "kube-apiserver", Options: "--oidc-issuer-url=https://kc --oidc-ca-file=/etc/kubernetes/files/oidc_ca"},
+		{Unit: "kube-controller-manager"}, {Unit: "kube-scheduler"}, {Unit: "kubelet"}, {Unit: "kube-proxy"},
+	}
+	changes := []host.Change{{Path: "/etc/kubernetes/files/oidc_ca"}, {Path: "/etc/kubernetes/files/.magnum-managed"}}
+	for b.Loop() {
+		RestartUnits(changes, units)
 	}
 }

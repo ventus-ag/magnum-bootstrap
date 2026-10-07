@@ -75,8 +75,11 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	changes = append(changes, cs...)
 
 	// Signal service restarts for any changes detected.
-	if len(changes) > 0 && req.Restarts != nil {
-		for _, svc := range []string{"kubelet", "kube-proxy"} {
+	if req.Restarts != nil {
+		for _, svc := range kubecommon.RestartUnits(changes, []kubecommon.UnitOptions{
+			{Unit: "kubelet", Options: cfg.Shared.KubeletOptions},
+			{Unit: "kube-proxy", Options: cfg.Shared.KubeProxyOptions},
+		}) {
 			req.Restarts.Add(svc, "kube-worker-config changed")
 		}
 	}
