@@ -64,7 +64,44 @@ func (r *runner) patchClusterLabels(ctx context.Context, set map[string]string, 
 	if _, err := clusters.Update(ctx, r.magnum, r.cfg.clusterName, labelPatchOpts(set, unset)).Extract(); err != nil {
 		return fmt.Errorf("patch cluster labels set=%v unset=%v: %w", set, unset, err)
 	}
-	return nil
+	return r.waitLabelsSaved(ctx, set, unset)
+}
+
+const labelsSavedTimeout = 3 * time.Minute
+
+// waitLabelsSaved waits until the cluster record carries the patch. The API
+// never saves a PATCH: the conductor saves the labels, with UPDATE_IN_PROGRESS,
+// only after it has sent every stack update. Status and updated_at (also bumped
+// by Magnum's health polling) can still show the previous op meanwhile.
+func (r *runner) waitLabelsSaved(ctx context.Context, set map[string]string, unset []string) error {
+	deadline := time.Now().Add(labelsSavedTimeout)
+	for {
+		if c, err := r.getCluster(ctx); err == nil && labelsApplied(c.Labels, set, unset) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("label patch not saved by the Magnum conductor within %s", labelsSavedTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func labelsApplied(labels, set map[string]string, unset []string) bool {
+	for k, v := range set {
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	for _, k := range unset {
+		if _, ok := labels[k]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *runner) setComponentArgs(ctx context.Context) error {

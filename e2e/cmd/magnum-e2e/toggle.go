@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gophercloud/gophercloud/v2/openstack/containerinfra/v1/clusters"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -95,15 +94,7 @@ func (r *runner) toggleAddon(ctx context.Context, a addonToggle, enable bool) er
 // sees the `labels` field change → labels_changed → the fork's reconfigure_cluster
 // re-extracts ALL labels and re-fires the master reconciler run-once.
 func (r *runner) patchClusterLabel(ctx context.Context, key, val string) error {
-	opts := []clusters.UpdateOpts{{
-		Op:    clusters.AddOp,
-		Path:  "/labels/" + key,
-		Value: val,
-	}}
-	if _, err := clusters.Update(ctx, r.magnum, r.cfg.clusterName, opts).Extract(); err != nil {
-		return fmt.Errorf("patch cluster label %s=%s: %w", key, val, err)
-	}
-	return nil
+	return r.patchClusterLabels(ctx, map[string]string{key: val}, nil)
 }
 
 // waitDeploymentReady polls until the named Deployment has at least one available

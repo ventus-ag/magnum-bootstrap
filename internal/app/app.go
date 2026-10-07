@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -312,6 +313,19 @@ func printLastResult(stdout, stderr io.Writer) int {
 	return 0
 }
 
+const nodeCACertPath = "/etc/kubernetes/certs/ca.crt"
+
+// newNode reports a node the reconciler has never run on and that holds no
+// cluster CA. A legacy node being adopted has a CA, so it still rotates.
+func newNode(stateFile, caCertPath string) bool {
+	return !exists(stateFile) && !exists(caCertPath)
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return !errors.Is(err, os.ErrNotExist)
+}
+
 func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer) int {
 	if f.timeout > 0 {
 		var cancel context.CancelFunc
@@ -373,6 +387,19 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	// (id changed) leaves marker != CARotationID, so Operation() stays ca-rotate.
 	if marker := carotation.ReadMarker(); marker != "" && marker == cfg.Trigger.CARotationID {
 		cfg.Trigger.AppliedCARotationID = marker
+	}
+	// CA_ROTATION_ID stays in heat-params after a rotation and every parent
+	// update carries it to new members. A node that has never reconciled and
+	// holds no cluster CA gets its certificates from the current CA, so it has
+	// nothing to rotate; the marker keeps a retried first run on create too.
+	if cfg.Operation() == config.OperationCARotate && newNode(runtimePaths.StateFile, nodeCACertPath) {
+		if mode != "preview" {
+			if err := carotation.WriteMarker(cfg.Trigger.CARotationID); err != nil {
+				logger.Warnf("ca-rotation: record rotation %s as applied on a new node: %v", cfg.Trigger.CARotationID, err)
+			}
+		}
+		cfg.Trigger.AppliedCARotationID = cfg.Trigger.CARotationID
+		logger.Infof("ca-rotation: new node, rotation %s predates it; reconciling as create", cfg.Trigger.CARotationID)
 	}
 
 	reconcilePlan := plan.Build(cfg)

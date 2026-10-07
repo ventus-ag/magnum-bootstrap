@@ -101,3 +101,23 @@ func TestStaleE2ECluster(t *testing.T) {
 		}
 	}
 }
+
+func TestLabelsApplied(t *testing.T) {
+	live := map[string]string{"kubeapi_options": "--v=2", "auto_healing_controller": "magnum-auto-healer"}
+	for _, tc := range []struct {
+		name  string
+		set   map[string]string
+		unset []string
+		want  bool
+	}{
+		{"set present", map[string]string{"kubeapi_options": "--v=2"}, nil, true},
+		{"set stale value", map[string]string{"kubeapi_options": "--v=3"}, nil, false},
+		{"set missing", map[string]string{"kube_file_x": "a"}, nil, false},
+		{"unset gone", nil, []string{"kube_file_x"}, true},
+		{"unset still there", nil, []string{"kubeapi_options"}, false},
+	} {
+		if got := labelsApplied(live, tc.set, tc.unset); got != tc.want {
+			t.Errorf("%s: labelsApplied = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
