@@ -23,6 +23,11 @@ const SigningCACertPath = "/etc/kubernetes/certs/ca-signing.crt"
 // signingCACertPath is the write target; a var so tests can redirect it.
 var signingCACertPath = SigningCACertPath
 
+// master-certificates chowns the cert dir recursively to kube:kube_etcd; a
+// root-owned file there makes every later run re-chown it and restart the
+// control plane.
+var signingCAOwner, signingCAGroup = "kube", "kube_etcd"
+
 // EnsureSigningCA derives SigningCACertPath from the live trust bundle and the
 // CA private key. It is a no-op when either input is absent (a worker, or
 // cert_manager_api disabled — the signing flags are not set there either).
@@ -55,7 +60,11 @@ func EnsureSigningCA(executor *host.Executor, caBundlePath, caKeyPath string) ([
 	if err != nil {
 		return nil, warning, err
 	}
-	return result.Changes, warning, nil
+	owned, err := (hostresource.OwnershipSpec{Path: signingCACertPath, Owner: signingCAOwner, Group: signingCAGroup}).Apply(executor)
+	if err != nil {
+		return nil, warning, err
+	}
+	return append(result.Changes, owned.Changes...), warning, nil
 }
 
 func firstCertPEM(bundle []byte) []byte {

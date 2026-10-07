@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -56,9 +57,46 @@ func countCerts(pemData []byte) int {
 
 func withSigningPath(t *testing.T, dir string) {
 	t.Helper()
-	restore := signingCACertPath
+	restore, owner, group := signingCACertPath, signingCAOwner, signingCAGroup
 	signingCACertPath = filepath.Join(dir, "ca-signing.crt")
-	t.Cleanup(func() { signingCACertPath = restore })
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := user.LookupGroupId(u.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingCAOwner, signingCAGroup = u.Username, g.Name
+	t.Cleanup(func() { signingCACertPath, signingCAOwner, signingCAGroup = restore, owner, group })
+}
+
+func TestEnsureSigningCAOwnsTheFileLikeTheCertDir(t *testing.T) {
+	dir := t.TempDir()
+	withSigningPath(t, dir)
+	cert, key := caPair(t)
+	bundlePath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if err := os.WriteFile(bundlePath, cert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EnsureSigningCA(host.NewExecutor(true, nil), bundlePath, keyPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// A file not owned as master-certificates owns the dir must be re-owned
+	// here, or the next run's recursive chown restarts the control plane.
+	signingCAOwner, signingCAGroup = "no-such-user-e2e", "no-such-group-e2e"
+	changes, _, err := EnsureSigningCA(host.NewExecutor(false, nil), bundlePath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || !strings.Contains(changes[0].Summary, "set ownership") {
+		t.Fatalf("want one ownership change, got %+v", changes)
+	}
 }
 
 func TestEnsureSigningCAPicksTheKeysCertificateFromABundle(t *testing.T) {
