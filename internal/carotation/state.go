@@ -106,6 +106,83 @@ func RotationParked(rotationID string) (bool, error) {
 	return st.RotationID == rotationID && st.Held && st.Phase == PhaseCutover, nil
 }
 
+// InProgressRotation returns the state of a rotation this node started but never
+// finished, or a zero State when there is none.
+//
+// It exists because the rotation token lives in heat-params, and ANY unrelated
+// cluster stack update re-renders heat-params without it (a flavour change, a
+// node_count change, an upgrade). The node would then simply stop rotating:
+// prepare stays installed, the cluster's desired phase never advances, and every
+// peer still waiting at the barrier burns its Heat timeout. Local state is the
+// only record that survives that, so it — not heat-params — decides whether a
+// rotation is still owed.
+//
+// A rotation whose ID is already recorded as applied (`applied`) is ignored: that
+// is the ordinary post-completion window before the staging directory is cleaned.
+// Parked rotations (Held) are returned too, so a hold released after a stack
+// update still finalizes.
+func InProgressRotation(applied string) (State, error) {
+	entries, err := os.ReadDir(baseDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return State{}, nil
+	}
+	if err != nil {
+		return State{}, fmt.Errorf("ca-rotation: scan staging: %w", err)
+	}
+	var newest State
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		if id == applied {
+			continue
+		}
+		st, err := LoadState(id)
+		if err != nil || st.RotationID != id {
+			continue
+		}
+		if st.Phase == PhaseDone || !st.Phase.Valid() || st.Phase == "" {
+			continue
+		}
+		if newest.RotationID == "" || st.UpdatedAt > newest.UpdatedAt {
+			newest = st
+		}
+	}
+	return newest, nil
+}
+
+// StagedRotationIDs lists every rotation with a staging directory on this node,
+// newest-mtime first. Used to spot a rotation that was interrupted BEFORE its
+// first phase was recorded, which local state alone cannot show.
+func StagedRotationIDs() []string {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil
+	}
+	type staged struct {
+		id string
+		at time.Time
+	}
+	var dirs []staged
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		dirs = append(dirs, staged{id: entry.Name(), at: info.ModTime()})
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].at.After(dirs[j].at) })
+	ids := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		ids = append(ids, d.id)
+	}
+	return ids
+}
+
 // StagingDir returns the per-rotation staging directory.
 func StagingDir(rotationID string) string {
 	return filepath.Join(baseDir, rotationID)

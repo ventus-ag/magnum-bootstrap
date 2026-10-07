@@ -32,6 +32,11 @@ type runner struct {
 	// also asserts the nodepool is schedulable.
 	nodepoolActive bool
 
+	// componentArgs: set-component-args applied label-driven apiserver args +
+	// a kube_file; every verify bundle re-asserts them until cleared, so a
+	// later parent-stack update that reverts them fails at that op.
+	componentArgs bool
+
 	// ladder is the ordered upgrade-template walk (version-ladder scenario); each
 	// `upgrade` op advances ladderPos by one rung. Empty = a single fixed upgrade
 	// template (cfg.upgradeTemplate).
@@ -275,6 +280,10 @@ func (r *runner) run(ctx context.Context) error {
 	if opsContain(ops, "enable-metrics-server") {
 		r.setCreateLabel("metrics_server_enabled", "false")
 	}
+	if opsContain(ops, "toggle-settings") {
+		r.setCreateLabel("kube_dashboard_enabled", "false")
+		r.setCreateLabel("auto_healing_enabled", "false")
+	}
 
 	if err := r.preflight(ctx); err != nil {
 		return err
@@ -407,6 +416,27 @@ func (r *runner) execOp(ctx context.Context, o op) error {
 
 	case "enable-metrics-server":
 		return r.toggleAddon(ctx, metricsServerToggle, true)
+
+	case "set-component-args":
+		return r.setComponentArgs(ctx)
+
+	case "clear-component-args":
+		return r.clearComponentArgs(ctx)
+
+	case "patch-node-count":
+		target := o.argOr(r.cfg.nodeCountResize)
+		return r.runMutation(ctx, fmt.Sprintf("patch-node-count=%d", target), true, func() error {
+			return r.patchNodeCount(ctx, target)
+		})
+
+	case "scheduler-scoring":
+		return r.schedulerScoringCycle(ctx)
+
+	case "toggle-settings":
+		return r.toggleSettingsCycle(ctx)
+
+	case "toggle-os-autoupgrade":
+		return r.osAutoUpgradeCycle(ctx)
 	}
 	return fmt.Errorf("unhandled op %q", o.name)
 }

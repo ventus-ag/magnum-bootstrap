@@ -366,6 +366,7 @@ func scenarioRunner(r *runner, scn string) *runner {
 	r2.ladder = resolveLadder(c)
 	r2.ladderPos = 0
 	r2.nodepoolActive = false
+	r2.componentArgs = false
 	r2.steps = nil
 	r2.runFailed = false
 	r2.runErr = nil

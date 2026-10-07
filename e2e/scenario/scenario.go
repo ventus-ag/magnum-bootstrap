@@ -19,6 +19,8 @@
 package scenario
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -101,6 +103,15 @@ type Config struct {
 	// default for clusters without the feature).
 	NodeLabels string
 	NodeTaints string
+
+	// Label-driven component config (kubeapi_options, kubescheduler_options,
+	// kube_scheduler_scoring_strategy, kube_file_<name>, cinder default class).
+	// KubeFiles is {name: content}; the renderer packs it like the driver.
+	KubeAPIOptions               string
+	KubeSchedulerOptions         string
+	KubeSchedulerScoringStrategy string
+	KubeFiles                    map[string]string
+	CinderCSIDefaultStorageClass string
 
 	// RunTimeoutSeconds -> RECONCILER_RUN_TIMEOUT_SECONDS (default 4800). The
 	// launcher sources heat-params, so this is the Heat-driven reconcile budget
@@ -286,7 +297,8 @@ func (c Config) pairs() []KV {
 
 	// Component option passthroughs (empty -> reconciler defaults).
 	put("KUBELET_OPTIONS", "")
-	put("KUBEAPI_OPTIONS", "")
+	put("KUBEAPI_OPTIONS", c.KubeAPIOptions)
+	put("KUBE_FILES", packKubeFiles(c.KubeFiles))
 	put("KUBECONTROLLER_OPTIONS", "")
 	put("KUBEPROXY_OPTIONS", "")
 	put("ADMISSION_CONTROL_LIST", "")
@@ -320,6 +332,9 @@ func (c Config) pairs() []KV {
 		put("KUBE_IMAGE_DIGEST", "")
 		put("MIN_NODE_COUNT", "")
 		put("MAX_NODE_COUNT", "")
+		put("KUBESCHEDULER_OPTIONS", c.KubeSchedulerOptions)
+		put("KUBE_SCHEDULER_SCORING_STRATEGY", c.KubeSchedulerScoringStrategy)
+		put("CINDER_CSI_DEFAULT_STORAGE_CLASS", c.CinderCSIDefaultStorageClass)
 	case RoleWorker:
 		put("KUBE_MASTER_IP", c.MasterIP)
 		put("ETCD_SERVER_IP", c.MasterIP)
@@ -363,4 +378,17 @@ func kubeMinorAtLeast(kubeTag string, minor int) bool {
 		return false
 	}
 	return got >= minor
+}
+
+// packKubeFiles encodes KUBE_FILES exactly as the driver's kube_files_param:
+// base64 of a JSON {name: content} object, "" when there are none.
+func packKubeFiles(files map[string]string) string {
+	if len(files) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(files)
+	if err != nil {
+		panic(err) // map[string]string always marshals
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }

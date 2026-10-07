@@ -75,6 +75,14 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, cs...)
 
+	var warnings []string
+	if _, warning := schedulerScoringStrategy(cfg); warning != "" {
+		warnings = append(warnings, "kube-master-config: "+warning)
+		if req.Logger != nil {
+			req.Logger.Warnf("kube-master-config: %s", warning)
+		}
+	}
+
 	// Signal service restarts for any changes detected.
 	if len(changes) > 0 && req.Restarts != nil {
 		for _, svc := range []string{"kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet", "kube-proxy"} {
@@ -83,7 +91,8 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 
 	return moduleapi.Result{
-		Changes: changes,
+		Changes:  changes,
+		Warnings: warnings,
 		Outputs: map[string]string{
 			"role":    "master",
 			"kubeTag": cfg.Shared.KubeTag,
@@ -260,6 +269,8 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 	_ = os.Remove("/etc/kubernetes/apiserver")
 	_ = os.Remove("/etc/kubernetes/controller-manager")
 	_ = os.Remove("/etc/kubernetes/scheduler")
+	_ = os.Remove(schedulerConfigPath)
+	_ = os.RemoveAll(kubecommon.KubeFilesDir)
 	_ = os.Remove("/etc/kubernetes/proxy")
 	_ = os.RemoveAll("/opt/cni/bin")
 

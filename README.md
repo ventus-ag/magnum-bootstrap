@@ -188,6 +188,28 @@ Notes:
   remove the label — which also means a forgotten label leaves the old CA and
   old signing key trusted indefinitely.
 
+## Cluster Labels: Component Configuration
+
+Magnum cluster labels (`openstack coe cluster update <c> --labels ...`, or the
+UI settings switches) re-run the reconciler on the nodes whose input changed —
+no master roll. The values survive every later resize, node_count change,
+flavor/metadata update and CA rotation.
+
+| Label | Effect |
+|-------|--------|
+| `kubeapi_options`, `kubecontroller_options`, `kubescheduler_options`, `kubelet_options`, `kubeproxy_options` | Extra component args. Removing the label clears them. |
+| `kube_file_<name>` | Any content, written to `/etc/kubernetes/files/<name>` (mode 0600) on every node; reference it from the options, e.g. `kubeapi_options=--oidc-ca-file=/etc/kubernetes/files/oidc_ca` + `kube_file_oidc_ca=<PEM>`. `<name>`: `[A-Za-z0-9_-]{1,64}`; 64 KiB total. |
+| `kube_scheduler_scoring_strategy` | `MostAllocated` (bin-packing: also disables NodeResourcesBalancedAllocation scoring and weights NodeResourcesFit 5) or `LeastAllocated`; empty = scheduler default. |
+| `cinder_csi_default_storage_class` | Which Cinder StorageClass is default: `auto` (default — only if no other class is default), `delete`, `retain`, `none`. |
+
+An option that names a file missing on the node (`--*-file`, `--*-path`,
+`--*-config`, `--config`, `--kubeconfig`) fails the reconcile before anything is
+written, so the running args stay. Cinder's `csi-cinder-sc-delete` /
+`csi-cinder-sc-retain` StorageClasses are never deleted by the reconciler
+(Helm `resource-policy: keep` + every recovery uninstall restores them).
+Switching `cinder_csi_enabled` / `cloud_provider_enabled` off is not applied
+while Cinder PersistentVolumes / LoadBalancer Services still depend on them.
+
 ## Architecture
 
 ```

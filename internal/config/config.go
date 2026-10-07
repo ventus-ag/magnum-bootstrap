@@ -168,6 +168,13 @@ type SharedConfig struct {
 	KubeAPIOptions        string `json:"kubeApiOptions"`
 	KubeControllerOptions string `json:"kubeControllerOptions"`
 	KubeProxyOptions      string `json:"kubeProxyOptions"`
+	KubeSchedulerOptions  string `json:"kubeSchedulerOptions"`
+	// KubeSchedulerScoringStrategy is the NodeResourcesFit scoring strategy
+	// ("" = scheduler default, LeastAllocated, MostAllocated).
+	KubeSchedulerScoringStrategy string `json:"kubeSchedulerScoringStrategy"`
+	// KubeFiles is the base64 JSON {name: content} the driver builds from the
+	// kube_file_<name> labels; written under kubecommon.KubeFilesDir.
+	KubeFiles string `json:"kubeFiles,omitempty"`
 
 	// Node roles
 	LeadNodeRoleName string `json:"leadNodeRoleName"`
@@ -205,8 +212,11 @@ type SharedConfig struct {
 	// Volume / CSI
 	VolumeDriver     string `json:"volumeDriver"`
 	CinderCSIEnabled bool   `json:"cinderCsiEnabled"`
-	ManilaCSIEnabled bool   `json:"manilaCSIEnabled"`
-	ManilaShareType  string `json:"manilaShareType"`
+	// CinderCSIDefaultStorageClass selects which chart StorageClass carries the
+	// default annotation: "" / auto, delete, retain, none.
+	CinderCSIDefaultStorageClass string `json:"cinderCsiDefaultStorageClass"`
+	ManilaCSIEnabled             bool   `json:"manilaCSIEnabled"`
+	ManilaShareType              string `json:"manilaShareType"`
 
 	// NVIDIA GPU Operator (master-0 only, requires GPU nodes)
 	GPUOperatorEnabled bool `json:"gpuOperatorEnabled"`

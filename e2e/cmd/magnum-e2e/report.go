@@ -44,6 +44,12 @@ var opDescriptions = map[string]string{
 	"del-nodepool":          "delete the extra worker nodepool",
 	"disable-autoscaler":    "disable cluster-autoscaler and prune its Helm release",
 	"enable-metrics-server": "enable metrics-server and wait for it to become Ready",
+	"set-component-args":    "kubeapi_options + kube_file label applied on every apiserver (held until cleared)",
+	"clear-component-args":  "remove the component-args labels; args and file gone",
+	"patch-node-count":      "cluster node_count PATCH (parent-stack update path)",
+	"scheduler-scoring":     "kube_scheduler_scoring_strategy=MostAllocated bin-packs pods",
+	"toggle-settings":       "UI settings switches on/off incl. Cinder/OCCM in-use guards",
+	"toggle-os-autoupgrade": "os_autoupgrade_enabled reaches every node (masters + workers)",
 }
 
 func opDescription(o op) string {

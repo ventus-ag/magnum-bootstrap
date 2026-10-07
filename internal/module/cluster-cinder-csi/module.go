@@ -41,16 +41,35 @@ func (Module) PhaseID() string        { return "cluster-cinder-csi" }
 func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
-	if !cfg.IsFirstMaster() || !enabled {
+	if !cfg.IsFirstMaster() {
 		return clusterhelm.SkipResult()
 	}
+	executor := host.NewExecutor(req.Apply, req.Logger)
+	var warning string
+	if !cinderEnabled(cfg) {
+		var keep bool
+		if keep, warning = keepWhileInUse(executor); !keep {
+			return clusterhelm.SkipResult()
+		}
+	} else {
+		live, _ := liveStorageClasses(executor)
+		_, warning = defaultStorageClass(cfg.Shared.CinderCSIDefaultStorageClass, live)
+	}
 	if req.Apply {
-		executor := host.NewExecutor(req.Apply, req.Logger)
 		clusterhelm.AdoptHelmRelease(executor, "cinder-csi", "kube-system")
 		clusterhelm.CleanupFailedRelease(executor, "cinder-csi", "kube-system")
 	}
-	return moduleapi.Result{}, nil
+	if warning == "" {
+		return moduleapi.Result{}, nil
+	}
+	if req.Logger != nil {
+		req.Logger.Warnf("cluster-cinder-csi: %s", warning)
+	}
+	return moduleapi.Result{Warnings: []string{"cluster-cinder-csi: " + warning}}, nil
+}
+
+func cinderEnabled(cfg config.Config) bool {
+	return cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
 }
 
 // cinderChartNewStyle returns true for chart versions >= 2.33.0 which use
@@ -69,10 +88,18 @@ func cinderChartNewStyle(chartVersion string) bool {
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
-	enabled := cfg.Shared.VolumeDriver == "cinder" && cfg.Shared.CinderCSIEnabled
-	if !cfg.IsFirstMaster() || !enabled {
+	if !cfg.IsFirstMaster() {
 		return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:CinderCSI", name, opts...)
 	}
+	// Read-only probes; Run reports the matching warnings.
+	probe := host.NewExecutor(false, nil)
+	if !cinderEnabled(cfg) {
+		if keep, _ := keepWhileInUse(probe); !keep {
+			return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:CinderCSI", name, opts...)
+		}
+	}
+	live, _ := liveStorageClasses(probe)
+	defaultClass, _ := defaultStorageClass(cfg.Shared.CinderCSIDefaultStorageClass, live)
 
 	res := &Resource{}
 	if err := ctx.RegisterComponentResource("magnum:cluster:CinderCSI", name, res, opts...); err != nil {
@@ -220,17 +247,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 						"\nca-file=" + cacertMount,
 				},
 			},
-			"storageClass": map[string]interface{}{
-				"enabled": true,
-				"delete": map[string]interface{}{
-					"isDefault":            true,
-					"allowVolumeExpansion": true,
-				},
-				"retain": map[string]interface{}{
-					"isDefault":            false,
-					"allowVolumeExpansion": true,
-				},
-			},
+			"storageClass":      storageClassValues(defaultClass),
 			"clusterID":         cfg.Shared.ClusterUUID,
 			"priorityClassName": "",
 		},

@@ -18,6 +18,23 @@ func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change
 	var changes []host.Change
 	certDir := "/etc/kubernetes/certs"
 
+	// Validate before writing anything; see the master's writeKubeConfigs.
+	kubeFiles, err := kubecommon.DecodeKubeFiles(cfg.Shared.KubeFiles)
+	if err != nil {
+		return nil, err
+	}
+	if err := kubecommon.CheckOptionFiles(kubecommon.KubeFilePaths(kubeFiles), map[string]string{
+		"kubelet_options":   cfg.Shared.KubeletOptions,
+		"kubeproxy_options": cfg.Shared.KubeProxyOptions,
+	}); err != nil {
+		return nil, err
+	}
+	fileChanges, err := kubecommon.EnsureKubeFiles(executor, kubeFiles)
+	if err != nil {
+		return nil, err
+	}
+	changes = append(changes, fileChanges...)
+
 	kubeMasterURI := masterURI(cfg)
 
 	// Etcd server IP: fall back to master IP if not set.
@@ -151,8 +168,10 @@ KUBE_MASTER="--master=%s"
 			return err
 		}
 	}
-	_, err := hostsdk.RegisterLineSpec(ctx, name+"-environment", hostresource.LineSpec{Path: "/etc/environment", Line: fmt.Sprintf("KUBERNETES_MASTER=%s", kubeMasterURI), Mode: 0o644}, opts...)
-	return err
+	if _, err := hostsdk.RegisterLineSpec(ctx, name+"-environment", hostresource.LineSpec{Path: "/etc/environment", Line: fmt.Sprintf("KUBERNETES_MASTER=%s", kubeMasterURI), Mode: 0o644}, opts...); err != nil {
+		return err
+	}
+	return kubecommon.RegisterKubeFiles(ctx, name, cfg.Shared.KubeFiles, opts...)
 }
 
 func applyWorkerFileResource(executor *host.Executor, spec hostresource.FileSpec) (hostresource.ApplyResult, error) {

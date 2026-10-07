@@ -229,6 +229,7 @@ func (Module) Destroy(_ context.Context, _ config.Config, req moduleapi.Request)
 	_ = os.Remove("/etc/kubernetes/kubelet.env")
 	_ = os.Remove("/etc/kubernetes/config")
 	_ = os.Remove("/etc/kubernetes/proxy")
+	_ = os.RemoveAll(kubecommon.KubeFilesDir)
 	_ = os.RemoveAll("/opt/cni/bin")
 
 	return nil

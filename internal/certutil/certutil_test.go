@@ -432,3 +432,65 @@ func TestLeafNotSignedByCurrentCA(t *testing.T) {
 		t.Fatalf("ca.key matching no bundle CA must yield false (cannot identify current CA)")
 	}
 }
+
+func TestCertMatchingKeyPEM(t *testing.T) {
+	// A dual-CA bundle: only one of its certificates pairs with the signing key,
+	// and kube-controller-manager needs exactly that one, alone.
+	oldCA, oldKey := testCAPair(t)
+	newCA, newKey := testCAPair(t)
+	bundle := append(append([]byte{}, newCA...), oldCA...)
+
+	got, ok := CertMatchingKeyPEM(bundle, oldKey)
+	if !ok || string(got) != string(oldCA) {
+		t.Fatalf("bundle+old key must select the old certificate (ok=%v)", ok)
+	}
+	if got, ok := CertMatchingKeyPEM(bundle, newKey); !ok || string(got) != string(newCA) {
+		t.Fatalf("bundle+new key must select the new certificate (ok=%v)", ok)
+	}
+	if !KeyPEMMatchesCertPEM(oldKey, mustSelect(t, bundle, oldKey)) {
+		t.Fatal("selected certificate must pair with the key it was selected by")
+	}
+
+	_, strayKey := testCAPair(t)
+	if _, ok := CertMatchingKeyPEM(oldCA, strayKey); ok {
+		t.Fatal("a key absent from the bundle must not select anything")
+	}
+	if _, ok := CertMatchingKeyPEM(bundle, []byte("not a key")); ok {
+		t.Fatal("an unparseable key must not select anything")
+	}
+}
+
+func TestBundleContainsCertPEM(t *testing.T) {
+	oldCA, _ := testCAPair(t)
+	newCA, _ := testCAPair(t)
+	strayCA, _ := testCAPair(t)
+	bundle := append(append([]byte{}, newCA...), oldCA...)
+
+	if !BundleContainsCertPEM(bundle, newCA) || !BundleContainsCertPEM(bundle, oldCA) {
+		t.Fatal("both bundle members must be found")
+	}
+	if BundleContainsCertPEM(bundle, strayCA) {
+		t.Fatal("a certificate absent from the bundle must not be found")
+	}
+	if BundleContainsCertPEM(bundle, []byte("not a cert")) {
+		t.Fatal("unparseable input must not match")
+	}
+}
+
+func mustSelect(t *testing.T, bundle, key []byte) []byte {
+	t.Helper()
+	got, ok := CertMatchingKeyPEM(bundle, key)
+	if !ok {
+		t.Fatal("expected a matching certificate")
+	}
+	return got
+}
+
+// testCAPair returns a self-signed CA as (certPEM, keyPEM).
+func testCAPair(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	ca := newCA(t)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(ca.key)})
+	return certPEM, keyPEM
+}

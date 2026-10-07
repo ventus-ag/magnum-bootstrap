@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	helmv3 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
@@ -91,18 +92,22 @@ func MarkManaged(releaseName, namespace string) {
 	_ = os.WriteFile(managedMarkerPath(namespace, releaseName), []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
 }
 
+// maxImportAttempts bounds how many runs retry a Pulumi import before the
+// release is reinstalled under Pulumi.
+const maxImportAttempts = 3
+
 // AdoptHelmRelease prepares a legacy Helm release for Pulumi adoption.
 //
-// On first migration run:
-//   - If the release exists in Helm but not yet managed by Pulumi, writes an
-//     import marker. Register() will use pulumi.Import() to adopt it in-place.
+// First run: the release exists in Helm but not in Pulumi → write an import
+// marker recording its Helm revision; Register() then uses pulumi.Import().
 //
-// On second run (if import failed):
-//   - Import marker still present, release still exists → uninstalls the release
-//     (fallback) so Pulumi can create a fresh managed release.
+// A later run that still finds the marker (the marker is cleared only after a
+// fully successful run, so ANY unrelated failure leaves it):
+//   - revision moved → Pulumi imported and upgraded it → mark adopted;
+//   - otherwise retry the import, and only after maxImportAttempts reinstall
+//     it (UninstallRelease keeps its StorageClasses).
 //
-// On subsequent runs:
-//   - Adopted marker exists → no-op.
+// Adopted marker present → no-op.
 func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 	MarkManaged(releaseName, namespace)
 
@@ -117,9 +122,8 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 		return
 	}
 
-	// Check if the release exists in Helm.
-	_, err := executor.RunCapture("helm", "status", releaseName, "-n", namespace)
-	if err != nil {
+	revision, exists := helmRevision(executor, releaseName, namespace)
+	if !exists {
 		// Release doesn't exist yet. Leave only the managed marker so a later
 		// successful create can promote it to adopted state.
 		if executor != nil && executor.Logger != nil {
@@ -129,14 +133,30 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 		return
 	}
 
-	// Release exists. Check if a previous import attempt failed.
-	if _, err := os.Stat(importing); err == nil {
-		// Import marker exists from a previous run → import already failed once.
-		// Fallback: uninstall the release so Pulumi can create a fresh one.
-		if executor != nil && executor.Logger != nil {
-			executor.Logger.Warnf("helm migration: release %s/%s still has pending import marker, uninstalling legacy release for fresh create", namespace, releaseName)
+	if data, err := os.ReadFile(importing); err == nil {
+		marker := parseImportMarker(string(data))
+		switch {
+		case marker.revision > 0 && revision > marker.revision:
+			if executor != nil && executor.Logger != nil {
+				executor.Logger.Infof("helm migration: release %s/%s moved to revision %d since the import was armed (revision %d): Pulumi manages it, marking adopted", namespace, releaseName, revision, marker.revision)
+			}
+			MarkAdopted(releaseName, namespace)
+			return
+		case marker.attempts < maxImportAttempts:
+			if marker.revision <= 0 {
+				marker.revision = revision
+			}
+			marker.attempts++
+			if executor != nil && executor.Logger != nil {
+				executor.Logger.Warnf("helm migration: release %s/%s import still pending, retrying (attempt %d/%d)", namespace, releaseName, marker.attempts, maxImportAttempts)
+			}
+			_ = os.WriteFile(importing, []byte(formatImportMarker(namespace, releaseName, marker)), 0o644)
+			return
 		}
-		_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
+		if executor != nil && executor.Logger != nil {
+			executor.Logger.Warnf("helm migration: release %s/%s could not be imported after %d attempts, reinstalling it under Pulumi", namespace, releaseName, maxImportAttempts)
+		}
+		_ = UninstallRelease(executor, releaseName, namespace)
 		_ = os.WriteFile(adopted, []byte("adopted"), 0o644)
 		_ = os.Remove(importing)
 		return
@@ -144,9 +164,47 @@ func AdoptHelmRelease(executor *host.Executor, releaseName, namespace string) {
 
 	// First attempt: write import marker. Register() will try pulumi.Import().
 	if executor != nil && executor.Logger != nil {
-		executor.Logger.Infof("helm migration: release %s/%s exists in Helm, preparing Pulumi import", namespace, releaseName)
+		executor.Logger.Infof("helm migration: release %s/%s exists in Helm (revision %d), preparing Pulumi import", namespace, releaseName, revision)
 	}
-	_ = os.WriteFile(importing, []byte(fmt.Sprintf("%s/%s", namespace, releaseName)), 0o644)
+	_ = os.WriteFile(importing, []byte(formatImportMarker(namespace, releaseName, importMarker{revision: revision, attempts: 1})), 0o644)
+}
+
+type importMarker struct {
+	revision int
+	attempts int
+}
+
+// Import markers read "ns/name@revision#attempts"; older binaries wrote
+// "ns/name", which parses as an unknown revision after one attempt.
+func formatImportMarker(namespace, releaseName string, m importMarker) string {
+	return fmt.Sprintf("%s/%s@%d#%d", namespace, releaseName, m.revision, m.attempts)
+}
+
+func parseImportMarker(value string) importMarker {
+	m := importMarker{attempts: 1}
+	_, rest, ok := strings.Cut(strings.TrimSpace(value), "@")
+	if !ok {
+		return m
+	}
+	rev, attempts, _ := strings.Cut(rest, "#")
+	m.revision, _ = strconv.Atoi(rev)
+	if n, err := strconv.Atoi(attempts); err == nil && n > 0 {
+		m.attempts = n
+	}
+	return m
+}
+
+// helmRevision returns the release's current revision and whether it exists.
+func helmRevision(executor *host.Executor, releaseName, namespace string) (int, bool) {
+	out, err := executor.RunCapture("helm", "status", releaseName, "-n", namespace, "-o", "json")
+	if err != nil {
+		return 0, false
+	}
+	var status struct {
+		Version int `json:"version"`
+	}
+	_ = json.Unmarshal([]byte(out), &status)
+	return status.Version, true
 }
 
 // CleanupFailedRelease checks if a Helm release is in "failed" or
@@ -160,7 +218,7 @@ func CleanupFailedRelease(executor *host.Executor, releaseName, namespace string
 	}
 	// Quick check for failed/pending states without full JSON parsing.
 	if strings.Contains(out, `"status":"failed"`) || strings.Contains(out, `"status":"pending-install"`) {
-		_ = executor.Run("helm", "uninstall", releaseName, "-n", namespace)
+		_ = UninstallRelease(executor, releaseName, namespace)
 	}
 }
 
@@ -214,7 +272,8 @@ func PendingImportReleases() []HelmReleasePair {
 }
 
 func parseHelmReleasePair(value string) (HelmReleasePair, bool) {
-	namespace, name, ok := strings.Cut(strings.TrimSpace(value), "/")
+	value, _, _ = strings.Cut(strings.TrimSpace(value), "@")
+	namespace, name, ok := strings.Cut(value, "/")
 	if !ok || namespace == "" || name == "" {
 		return HelmReleasePair{}, false
 	}
@@ -231,7 +290,7 @@ func CleanupPendingImportReleases(executor *host.Executor) []HelmReleasePair {
 		if executor != nil && executor.Logger != nil {
 			executor.Logger.Warnf("helm adoption fallback: uninstalling legacy release %s/%s after import conflict", rel.Namespace, rel.Name)
 		}
-		_ = executor.Run("helm", "uninstall", rel.Name, "-n", rel.Namespace)
+		_ = UninstallRelease(executor, rel.Name, rel.Namespace)
 		MarkAdopted(rel.Name, rel.Namespace)
 		cleaned = append(cleaned, rel)
 	}
@@ -542,9 +601,7 @@ func ManagedReleaseByName(name string) (HelmReleasePair, bool) {
 // release with a fresh install.
 func ResetDesyncedRelease(executor *host.Executor, name, namespace string) {
 	ClearForceUpdate(name, namespace)
-	if executor != nil {
-		_ = executor.Run("helm", "uninstall", name, "-n", namespace)
-	}
+	_ = UninstallRelease(executor, name, namespace)
 }
 
 // helmRemovedAPIRe confirms a Helm upgrade that failed because the DEPLOYED
@@ -602,7 +659,7 @@ func ResetRemovedAPIRelease(executor *host.Executor, name, namespace string) {
 	if executor == nil {
 		return
 	}
-	if err := executor.Run("helm", "uninstall", name, "-n", namespace, "--no-hooks"); err != nil {
+	if err := UninstallRelease(executor, name, namespace, "--no-hooks"); err != nil {
 		// Helm release storage is a Secret labelled owner=helm,name=<release>.
 		_ = executor.Run("kubectl", "delete", "secret", "-n", namespace,
 			"-l", "owner=helm,name="+name, "--ignore-not-found=true")
@@ -831,6 +888,13 @@ func DeleteHelmOwnershipConflicts(executor *host.Executor, conflicts []HelmOwner
 	}
 	var deleted []HelmOwnershipConflict
 	for _, conflict := range conflicts {
+		if strings.EqualFold(conflict.ResourceKind, "StorageClass") {
+			// PVCs and GitOps reference it by name; never ours to delete.
+			if executor.Logger != nil {
+				executor.Logger.Warnf("helm ownership fallback: not deleting StorageClass %s for release %s/%s", conflict.ResourceName, conflict.ReleaseNamespace, conflict.ReleaseName)
+			}
+			continue
+		}
 		resourceRef := strings.ToLower(conflict.ResourceKind) + "/" + conflict.ResourceName
 		deleteArgs := []string{"delete"}
 		if conflict.ResourceNamespace != "" {

@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       scenario:
-        description: "Scenario: all (curated default sweep) | smoke | multinode | chained-single | chained-multinode | ubuntu-upgrade | ubuntu-nodepool | component-toggle | version-ladder"
+        description: "Scenario: all (curated default sweep) | smoke | multinode | chained-single | chained-multinode | ubuntu-upgrade | ubuntu-nodepool | component-toggle | component-config | version-ladder"
         type: string
         default: all
       ops:
@@ -89,6 +89,7 @@ on:
           - ubuntu-upgrade
           - ubuntu-nodepool
           - component-toggle
+          - component-config
           - version-ladder
           - sonobuoy
       ops:

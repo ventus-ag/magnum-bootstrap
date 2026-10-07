@@ -438,3 +438,85 @@ func TestRotationHoldFailsClosed(t *testing.T) {
 		t.Error("an unreadable node list must be treated as held")
 	}
 }
+
+func TestBarrierWorkerFailsFastOnAbandonedRotation(t *testing.T) {
+	// The master stamped a heartbeat and then stopped driving the rotation (its
+	// heat-params lost the token). A worker cannot list nodes, so the stale
+	// heartbeat is its only signal — it must give up in AbandonTimeout instead of
+	// waiting out the whole Heat budget.
+	c := fakeCoord(node("m0", ""), node("w0", "prepare@rot-1"))
+	ctx := context.Background()
+	if err := c.EnsureRotation(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	cm, _ := c.clientset.CoreV1().ConfigMaps(CoordNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	cm.Data[keyHeartbeat] = stale
+	if _, err := c.clientset.CoreV1().ConfigMaps(CoordNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err := c.Barrier(ctx, "rot-1", PhasePrepare, false,
+		BarrierOptions{Poll: time.Millisecond, Timeout: time.Hour, AbandonTimeout: time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "abandoned") {
+		t.Fatalf("worker should fail fast on an abandoned rotation, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("worker ignored the abandon timeout (waited %v)", elapsed)
+	}
+}
+
+func TestBarrierWorkerWaitsWhileCoordinatorHeartbeats(t *testing.T) {
+	// A fresh heartbeat means a master is still driving: the worker must keep
+	// waiting (and here, give up only at the context deadline).
+	c := fakeCoord(node("m0", ""), node("w0", "prepare@rot-1"))
+	ctx := context.Background()
+	if err := c.EnsureRotation(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Heartbeat(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	err := c.Barrier(waitCtx, "rot-1", PhasePrepare, false,
+		BarrierOptions{Poll: time.Millisecond, Timeout: time.Hour, AbandonTimeout: time.Minute})
+	if err == nil || strings.Contains(err.Error(), "abandoned") {
+		t.Fatalf("a live heartbeat must not read as abandoned, got: %v", err)
+	}
+}
+
+func TestRotationOwner(t *testing.T) {
+	c := fakeCoord()
+	ctx := context.Background()
+	if owner, err := c.RotationOwner(ctx); err != nil || owner != "" {
+		t.Fatalf("no ConfigMap must read as no owner, got %q %v", owner, err)
+	}
+	if err := c.EnsureRotation(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	if owner, err := c.RotationOwner(ctx); err != nil || owner != "rot-1" {
+		t.Fatalf("RotationOwner = %q %v; want rot-1", owner, err)
+	}
+}
+
+func TestHeartbeatIgnoresOtherRotation(t *testing.T) {
+	c := fakeCoord()
+	ctx := context.Background()
+	if err := c.EnsureRotation(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Heartbeat(ctx, "rot-2"); err != nil {
+		t.Fatalf("Heartbeat for a superseded rotation: %v", err)
+	}
+	if _, beat, _ := c.ReadProgress(ctx, "rot-1"); !beat.IsZero() {
+		t.Fatalf("a foreign rotation stamped the heartbeat: %v", beat)
+	}
+	if err := c.Heartbeat(ctx, "rot-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, beat, _ := c.ReadProgress(ctx, "rot-1"); beat.IsZero() {
+		t.Fatal("Heartbeat did not record a time for the active rotation")
+	}
+}

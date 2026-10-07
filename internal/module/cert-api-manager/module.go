@@ -11,6 +11,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	"github.com/ventus-ag/magnum-bootstrap/internal/hostresource"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 	"github.com/ventus-ag/magnum-bootstrap/provider/hostsdk"
 )
@@ -99,9 +100,26 @@ func (Module) Run(_ context.Context, cfg config.Config, req moduleapi.Request) (
 	}
 	changes = append(changes, ownResult.Changes...)
 
+	// kube-controller-manager signs CSRs with ca.key and must be handed the ONE
+	// certificate that pairs with it — ca.crt may be a dual-CA trust bundle mid
+	// rotation, which the signing controller refuses outright.
+	signingChanges, warning, err := kubecommon.EnsureSigningCA(executor, caCertPath, caKeyPath)
+	if err != nil {
+		return moduleapi.Result{}, err
+	}
+	changes = append(changes, signingChanges...)
+	var warnings []string
+	if warning != "" {
+		warnings = append(warnings, "cert-api-manager: "+warning)
+		if req.Logger != nil {
+			req.Logger.Warnf("cert-api-manager: %s", warning)
+		}
+	}
+
 	return moduleapi.Result{
-		Changes: changes,
-		Outputs: map[string]string{"certManagerApi": "true"},
+		Changes:  changes,
+		Warnings: warnings,
+		Outputs:  map[string]string{"certManagerApi": "true"},
 	}, nil
 }
 

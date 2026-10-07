@@ -43,7 +43,8 @@
 #                 FCoS + v1 containerd layout, the production node layout)
 #   VICTORIA_DIR (required)   SCENARIOS (default: create ca-rotate upgrade;
 #                             also: scale-masters [1->MASTERS, needs MASTERS>=2],
-#                             node-metadata [worker label/taint lifecycle, needs WORKERS>=1])
+#                             node-metadata [worker label/taint lifecycle, needs WORKERS>=1],
+#                             component-args [label-driven apiserver/scheduler config + kube files])
 #   WORKERS 0          MASTERS 1            MASTER_LB_ENABLED true
 #   MASTER_MEM_MB 2048 MASTER_CPUS 1        WORKER_MEM_MB 2048   WORKER_CPUS 1
 #   LB_MEM_MB 768      LB_CPUS 1
@@ -656,6 +657,10 @@ scenario_extra_flags() {
   if [ "$role" = master ]; then
     _out+=(-number-of-masters "${MASTERS:-1}")
     if lb_enabled; then _out+=(-api-ip "$API_VIP" -etcd-lb-vip "$ETCD_VIP"); fi
+    # Label-driven component config for the component-args scenario.
+    [ -n "${MASTER_KUBEAPI_OPTIONS:-}" ] && _out+=(-kubeapi-options "$MASTER_KUBEAPI_OPTIONS")
+    [ -n "${MASTER_SCHEDULER_SCORING:-}" ] && _out+=(-scheduler-scoring "$MASTER_SCHEDULER_SCORING")
+    local f; for f in ${MASTER_KUBE_FILES:-}; do _out+=(-kube-file "$f"); done
   fi
   if [ "$role" = worker ]; then
     # Per-stage node metadata for the node-metadata scenario (empty = absent
@@ -663,6 +668,7 @@ scenario_extra_flags() {
     [ -n "${WORKER_NODE_LABELS:-}" ] && _out+=(-node-labels "$WORKER_NODE_LABELS")
     [ -n "${WORKER_NODE_TAINTS:-}" ] && _out+=(-node-taints "$WORKER_NODE_TAINTS")
   fi
+  return 0
 }
 
 # render_and_push <node-key> <role> <op> <tag> <rot> <node-ip> [master-ip]
@@ -842,6 +848,39 @@ scenario_node_metadata() {
   unset WORKER_NODE_LABELS WORKER_NODE_TAINTS
   apply_worker 0 create "$KUBE_TAG"
   gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-node-metadata $node - - 'e2e-team;e2e-env;node-role.kubernetes.io/e2e-tier' 'e2e-dedicated;e2e-phase'"
+}
+
+# scenario_component_args — label-driven component config on master-0: extra
+# kube-apiserver args that reference a file shipped as a kube_file_<name> label,
+# the MostAllocated scheduler config, the missing-file guard (a bad path must be
+# refused while the running args stay), then removal of all of it.
+scenario_component_args() {
+  log "=== SCENARIO: component-args (kubeapi_options + kube_file + scheduler scoring) ==="
+  local mp; mp="$(ssh_port master)"
+  printf 'apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: None\n' > "$WORKDIR/e2e_audit_policy"
+  local probe="--default-not-ready-toleration-seconds=301 --default-unreachable-toleration-seconds=301"
+
+  # Plain assignments, not `VAR=x fn` prefixes (see scenario_node_metadata).
+  log "--- stage set ---"
+  MASTER_KUBEAPI_OPTIONS="$probe --audit-policy-file=/etc/kubernetes/files/e2e_audit_policy --audit-log-path=-"
+  MASTER_KUBE_FILES="e2e_audit_policy=$WORKDIR/e2e_audit_policy"
+  MASTER_SCHEDULER_SCORING="MostAllocated"
+  apply_master create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-component-args set"
+  if [ "$TRIGGER" != agent ]; then  # see scenario_create
+    gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-noop $GUEST_E2E_DIR/heat-params.create component-args"
+  fi
+
+  log "--- stage missing-file guard ---"
+  MASTER_KUBEAPI_OPTIONS="$probe --oidc-issuer-url=https://kc.e2e.invalid --oidc-client-id=e2e --oidc-ca-file=/etc/kubernetes/files/absent_ca"
+  local hp; hp="$(render_and_push master master create "$KUBE_TAG" "" "$(master_nodeip 0)")"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh apply-expect-fail $hp component-args-guard 'do not exist on this node'"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-component-args set"
+
+  log "--- stage clear ---"
+  unset MASTER_KUBEAPI_OPTIONS MASTER_KUBE_FILES MASTER_SCHEDULER_SCORING
+  apply_master create "$KUBE_TAG"
+  gssh "$mp" "$GUEST_E2E_DIR/guest-run.sh assert-component-args clear"
 }
 
 # scenario_ca_rotate — drive one CA rotation and assert it did real work, not
@@ -1072,6 +1111,7 @@ main() {
       upgrade)       scenario_upgrade;        record_scenario "$s" PASS "kubelet ${KUBE_TAG} -> ${KUBE_TAG_UPGRADE}" ;;
       periodic)      scenario_periodic;       record_scenario "$s" PASS "drift healed by run-periodic, steady state zero-change" ;;
       node-metadata) scenario_node_metadata;  record_scenario "$s" PASS "worker0 labels/taints add+delete (single+multiple) converged" ;;
+      component-args) scenario_component_args; record_scenario "$s" PASS "kubeapi_options + kube_file + MostAllocated applied, missing-file guarded, cleared" ;;
       *) die "unknown scenario: $s" ;;
     esac
   done

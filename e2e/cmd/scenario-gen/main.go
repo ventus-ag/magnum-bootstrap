@@ -40,6 +40,10 @@ func main() {
 		numMasters   = flag.Int("number-of-masters", 1, "master: NUMBER_OF_MASTERS")
 		nodeLabels   = flag.String("node-labels", "", "NODE_LABELS — per-nodegroup Kubernetes node labels (k1=v1;k2=v2)")
 		nodeTaints   = flag.String("node-taints", "", "NODE_TAINTS — per-nodegroup Kubernetes node taints (key=value:Effect;...)")
+		apiOpts      = flag.String("kubeapi-options", "", "KUBEAPI_OPTIONS — extra kube-apiserver args")
+		schedOpts    = flag.String("kubescheduler-options", "", "master: KUBESCHEDULER_OPTIONS — extra kube-scheduler args")
+		schedScoring = flag.String("scheduler-scoring", "", "master: KUBE_SCHEDULER_SCORING_STRATEGY (LeastAllocated|MostAllocated)")
+		cinderSC     = flag.String("cinder-default-sc", "", "master: CINDER_CSI_DEFAULT_STORAGE_CLASS (auto|delete|retain|none)")
 		kubeTag      = flag.String("kube-tag", "v1.30.10", "Kubernetes version tag")
 		clusterUUID  = flag.String("cluster-uuid", "11111111-1111-1111-1111-111111111111", "Magnum cluster UUID")
 		authURL      = flag.String("auth-url", "http://127.0.0.1:9511/v3", "Keystone auth URL")
@@ -68,6 +72,19 @@ func main() {
 		deployStk  = flag.String("deploy-stack-id", "e2e-stack", "deployment mode: deploy_stack_id")
 		deploySrv  = flag.String("deploy-server-id", "e2e-server", "deployment mode: deploy_server_id")
 	)
+	kubeFiles := map[string]string{}
+	flag.Func("kube-file", "NAME=PATH — ship PATH as kube_file_NAME (KUBE_FILES); repeatable", func(v string) error {
+		name, path, ok := strings.Cut(v, "=")
+		if !ok || name == "" {
+			return fmt.Errorf("want NAME=PATH, got %q", v)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		kubeFiles[name] = string(content)
+		return nil
+	})
 	flag.Parse()
 
 	if *nodeIP == "" {
@@ -88,31 +105,36 @@ func main() {
 	}
 
 	cfg := scenario.Config{
-		ClusterName:               *clusterName,
-		Role:                      scenario.Role(*role),
-		NodeIndex:                 *nodeIndex,
-		Operation:                 scenario.Operation(*op),
-		NodeIP:                    *nodeIP,
-		MasterIP:                  mIP,
-		APIIP:                     *apiIP,
-		EtcdLBVIP:                 *etcdLBVIP,
-		InitialCluster:            *etcdInitial,
-		NumberOfMasters:           *numMasters,
-		NodeLabels:                *nodeLabels,
-		NodeTaints:                *nodeTaints,
-		KubeTag:                   *kubeTag,
-		CARotationID:              *caRotationID,
-		AuthURL:                   *authURL,
-		MagnumURL:                 *magnumURL,
-		ClusterUUID:               *clusterUUID,
-		CAKey:                     string(caKey),
-		SAKey:                     saPub,
-		SAPrivateKey:              saPriv,
-		CloudProvider:             *cloud,
-		UsePodman:                 *usePodman,
-		ReconcilerVersion:         *recVersion,
-		ReconcilerBinaryURL:       *recURL,
-		ReconcilerBinaryURLSHA256: *recSHA,
+		ClusterName:                  *clusterName,
+		Role:                         scenario.Role(*role),
+		NodeIndex:                    *nodeIndex,
+		Operation:                    scenario.Operation(*op),
+		NodeIP:                       *nodeIP,
+		MasterIP:                     mIP,
+		APIIP:                        *apiIP,
+		EtcdLBVIP:                    *etcdLBVIP,
+		InitialCluster:               *etcdInitial,
+		NumberOfMasters:              *numMasters,
+		NodeLabels:                   *nodeLabels,
+		NodeTaints:                   *nodeTaints,
+		KubeAPIOptions:               *apiOpts,
+		KubeSchedulerOptions:         *schedOpts,
+		KubeSchedulerScoringStrategy: *schedScoring,
+		KubeFiles:                    kubeFiles,
+		CinderCSIDefaultStorageClass: *cinderSC,
+		KubeTag:                      *kubeTag,
+		CARotationID:                 *caRotationID,
+		AuthURL:                      *authURL,
+		MagnumURL:                    *magnumURL,
+		ClusterUUID:                  *clusterUUID,
+		CAKey:                        string(caKey),
+		SAKey:                        saPub,
+		SAPrivateKey:                 saPriv,
+		CloudProvider:                *cloud,
+		UsePodman:                    *usePodman,
+		ReconcilerVersion:            *recVersion,
+		ReconcilerBinaryURL:          *recURL,
+		ReconcilerBinaryURLSHA256:    *recSHA,
 	}
 
 	var content string

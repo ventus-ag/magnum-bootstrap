@@ -479,6 +479,65 @@ func LeafPEMSignedByCAFile(leafPEM []byte, caPath string) bool {
 	return false
 }
 
+// CertMatchingKeyPEM returns the single PEM-encoded certificate inside bundlePEM
+// whose public half belongs to keyPEM.
+//
+// kube-controller-manager's CSR signing controller refuses a bundle outright
+// ("expected 1 certificate, found 2"), so the file handed to
+// --cluster-signing-cert-file must hold exactly one certificate — and it must be
+// the partner of --cluster-signing-key-file or the controller crashloops on a
+// key mismatch instead. During a dual-CA rotation the live ca.crt is a bundle,
+// which is precisely when picking the right single certificate matters.
+//
+// The second return value is false when nothing in the bundle pairs with the
+// key; callers then keep whatever is installed rather than writing a pair that
+// cannot sign.
+func CertMatchingKeyPEM(bundlePEM, keyPEM []byte) ([]byte, bool) {
+	key, err := loadPrivateKeyPEM(keyPEM)
+	if err != nil {
+		return nil, false
+	}
+	pub := publicKey(key)
+	rest := bundlePEM
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return nil, false
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		if publicKeysMatch(cert.PublicKey, pub) {
+			return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}), true
+		}
+	}
+}
+
+// BundleContainsCertPEM reports whether the first certificate in certPEM is
+// present, byte for byte, in bundlePEM.
+func BundleContainsCertPEM(bundlePEM, certPEM []byte) bool {
+	want, _ := pem.Decode(certPEM)
+	if want == nil || want.Type != "CERTIFICATE" {
+		return false
+	}
+	rest := bundlePEM
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return false
+		}
+		if block.Type == "CERTIFICATE" && bytes.Equal(block.Bytes, want.Bytes) {
+			return true
+		}
+	}
+}
+
 // CAFromKubeconfig extracts the embedded cluster CA (certificate-authority-data)
 // from a kubeconfig file. Used to discover a hand-rotated CA that an operator
 // installed into the live kubeconfigs without updating the certs directory.

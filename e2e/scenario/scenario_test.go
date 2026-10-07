@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 )
 
 func base(role Role, op Operation) Config {
@@ -122,5 +123,23 @@ func TestCloudProviderToggle(t *testing.T) {
 	}
 	if on.Shared.VolumeDriver != "cinder" {
 		t.Errorf("CloudProvider=true should set VOLUME_DRIVER=cinder, got %q", on.Shared.VolumeDriver)
+	}
+}
+
+func TestComponentConfigRoundTrip(t *testing.T) {
+	c := base(RoleMaster, OpCreate)
+	c.KubeAPIOptions = "--audit-policy-file=/etc/kubernetes/files/policy --audit-log-path=-"
+	c.KubeSchedulerOptions = "--v=4"
+	c.KubeSchedulerScoringStrategy = "MostAllocated"
+	c.CinderCSIDefaultStorageClass = "retain"
+	c.KubeFiles = map[string]string{"policy": "apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: None\n"}
+	cfg := loadVia(t, c)
+	if cfg.Shared.KubeAPIOptions != c.KubeAPIOptions || cfg.Shared.KubeSchedulerOptions != "--v=4" ||
+		cfg.Shared.KubeSchedulerScoringStrategy != "MostAllocated" || cfg.Shared.CinderCSIDefaultStorageClass != "retain" {
+		t.Fatalf("component config did not round-trip: %+v", cfg.Shared)
+	}
+	files, err := kubecommon.DecodeKubeFiles(cfg.Shared.KubeFiles)
+	if err != nil || files["policy"] != c.KubeFiles["policy"] {
+		t.Fatalf("KUBE_FILES did not round-trip: %v %v", files, err)
 	}
 }

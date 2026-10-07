@@ -577,7 +577,9 @@ ssh ubuntu@185.226.43.12 '
 ```
 
 Key env knobs: `SCENARIOS` (`create ca-rotate upgrade`; also `periodic`,
-`scale-masters` [needs MASTERS>=2], `node-metadata` [needs WORKERS>=1 —
+`scale-masters` [needs MASTERS>=2], `component-args` [kubeapi_options +
+kube file + MostAllocated applied, missing-file guard refuses, cleared],
+`node-metadata` [needs WORKERS>=1 —
 worker0 NODE_LABELS/NODE_TAINTS lifecycle: add-single, add-multiple,
 delete-single, delete-all, each re-rendering heat-params → run-once →
 `guest-run.sh assert-node-metadata` on the Node object]), `MASTERS` (>=2 →
@@ -611,7 +613,14 @@ creates a cluster of a configured shape, then runs an ordered op chain
 (`internal` to the driver, file `e2e/cmd/magnum-e2e/ops.go`): `upgrade`,
 `ca-rotate`, `resize-workers=N`, `resize-masters=N`, `add-nodepool=N`,
 `resize-nodepool=N`, `del-nodepool`, `nodepool-metadata`, `resize-flavor`,
-`post-rotate`, `cloud-smoke`, `verify-sa`, `autoscale`.
+`post-rotate`, `cloud-smoke`, `verify-sa`, `autoscale`,
+`set-component-args` / `clear-component-args` (kubeapi_options + a `kube_file_*`
+label; while set, every verify bundle re-asserts them on every apiserver via the
+DefaultTolerationSeconds probe, so any later op that reverts them fails),
+`patch-node-count=N` (cluster node_count PATCH → parent-stack update),
+`scheduler-scoring` (MostAllocated packs probe pods on one worker),
+`toggle-settings` (UI switches incl. the Cinder/OCCM in-use guards and
+StorageClass survival), `toggle-os-autoupgrade` (zincati on every node, SSH).
 `resize-flavor` (resize_flavor.go, target from `RESIZE_FLAVOR`, e.g. VC-8)
 drives the fork's in-place Nova flavor resize — nodegroup PATCH `/flavor_id` →
 params-only Heat update → serial (batch-1) Nova resize of each member — first

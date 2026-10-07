@@ -9,6 +9,8 @@
 #   assert-ready                  assert the single-node cluster is Ready + core pods up
 #   assert-noop <heat-params> <name>  re-run and assert zero host changes (idempotency)
 #   assert-periodic-heal          inject drift, heal via run-periodic, assert zero-change steady state
+#   apply-expect-fail <heat-params> <name> <pattern>  reconcile must be refused with <pattern>
+#   assert-component-args set|clear  label-driven apiserver args, kube file, scheduler config
 #
 # Files expected under /opt/e2e (scp'd by the host harness):
 #   bootstrap      the freshly built reconciler binary under test
@@ -251,6 +253,66 @@ cmd_apply() {
     tail -80 /var/log/magnum-reconcile.log 2>/dev/null >&2 || true
     return 1
   fi
+}
+
+# cmd_apply_expect_fail <heat-params> <name> <pattern> — the reconcile must FAIL
+# with <pattern> logged: a guard that refuses bad input before touching anything.
+cmd_apply_expect_fail() {
+  local hp="$1" name="$2" pattern="$3"
+  log "scenario '${name}': applying heat-params, expecting a refusal"
+  install -m 600 "$hp" /etc/sysconfig/heat-params
+  run_reconcile || true
+  local status; status="$(result_status)"
+  if [ "$status" = "succeeded" ]; then
+    err "scenario '${name}': expected a refusal, got succeeded"
+    return 1
+  fi
+  if ! grep -q -- "$pattern" "$RESULT_FILE" /var/log/magnum-reconcile.log 2>/dev/null; then
+    err "scenario '${name}': failure does not mention '${pattern}'"
+    tail -40 /var/log/magnum-reconcile.log >&2 || true
+    return 1
+  fi
+  log "scenario '${name}': refused as expected (status=${status})"
+}
+
+# cmd_assert_component_args set|clear — the files AND the running processes
+# carry (or no longer carry) the label-driven config.
+cmd_assert_component_args() {
+  local mode="$1" want=300
+  [ "$mode" = set ] && want=301
+  local env=/etc/kubernetes/apiserver kfile=/etc/kubernetes/files/e2e_audit_policy
+  local sched=/etc/kubernetes/scheduler scfg=/etc/kubernetes/scheduler-config.yaml
+  if [ "$mode" = set ]; then
+    grep -q -- '--default-not-ready-toleration-seconds=301' "$env" || { err "$env lacks the kubeapi_options"; cat "$env" >&2; return 1; }
+    grep -qx 'kind: Policy' "$kfile" || { err "$kfile missing or wrong"; return 1; }
+    [ "$(stat -c %a "$kfile")" = 600 ] || { err "$kfile mode $(stat -c %a "$kfile"), want 600"; return 1; }
+    grep -q -- "--config=$scfg" "$sched" || { err "scheduler not started with --config"; cat "$sched" >&2; return 1; }
+    grep -q 'type: MostAllocated' "$scfg" || { err "$scfg lacks MostAllocated"; cat "$scfg" >&2; return 1; }
+  else
+    if grep -q -- 'toleration-seconds=301' "$env"; then err "kubeapi_options still in $env"; return 1; fi
+    [ ! -e "$kfile" ] || { err "$kfile not removed with its label"; return 1; }
+    if grep -q -- '--config=' "$sched"; then err "scheduler still on --config"; cat "$sched" >&2; return 1; fi
+    [ ! -e "$scfg" ] || { err "$scfg not removed"; return 1; }
+  fi
+  # DefaultTolerationSeconds admission proves the RUNNING apiserver's args.
+  local got=""
+  for _ in $(seq 1 "$(scaled 30)"); do
+    got="$(kc run e2e-toleration-probe --image=registry.k8s.io/pause:3.9 --restart=Never --dry-run=server \
+      -o jsonpath='{.spec.tolerations[?(@.key=="node.kubernetes.io/not-ready")].tolerationSeconds}' 2>/dev/null || true)"
+    [ "$got" = "$want" ] && break
+    sleep 2
+  done
+  [ "$got" = "$want" ] || { err "pod default tolerationSeconds=${got:-<none>}, want $want"; return 1; }
+  # A scheduler that cannot load its --config never renews its leader lease.
+  local renew age=999
+  for _ in $(seq 1 "$(scaled 30)"); do
+    renew="$(kc -n kube-system get lease kube-scheduler -o jsonpath='{.spec.renewTime}' 2>/dev/null || true)"
+    [ -n "$renew" ] && age=$(( $(date -u +%s) - $(date -u -d "$renew" +%s) ))
+    [ "$age" -lt 60 ] && break
+    sleep 2
+  done
+  [ "$age" -lt 60 ] || { err "kube-scheduler lease not renewed (last: ${renew:-never})"; return 1; }
+  log "component-args ${mode}: files, apiserver (tolerationSeconds=$want) and scheduler lease OK"
 }
 
 cmd_assert_ready() {
@@ -609,6 +671,8 @@ main() {
     assert-node-metadata) cmd_assert_node_metadata "$@" ;;
     assert-noop)      cmd_assert_noop "$@" ;;
     assert-periodic-heal) cmd_assert_periodic_heal ;;
+    apply-expect-fail) cmd_apply_expect_fail "$@" ;;
+    assert-component-args) cmd_assert_component_args "$@" ;;
     cert-hashes)      cmd_cert_hashes ;;
     dump-state)       cmd_dump_state ;;
     kubelet-version)  cmd_kubelet_version "$@" ;;

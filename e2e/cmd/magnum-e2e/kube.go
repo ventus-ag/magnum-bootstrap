@@ -746,6 +746,11 @@ func (r *runner) verifyBundleInner(ctx context.Context, name string, disruptive 
 			return fmt.Errorf("verify %s: %w", name, err)
 		}
 	}
+	if r.componentArgs {
+		if err := r.verifyComponentArgs(ctx, true); err != nil {
+			return fmt.Errorf("verify %s: %w", name, err)
+		}
+	}
 	return nil
 }
 

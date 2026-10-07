@@ -6,6 +6,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/ventus-ag/magnum-bootstrap/internal/config"
+	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	clusterhelm "github.com/ventus-ag/magnum-bootstrap/internal/module/cluster-helm"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
@@ -55,13 +56,37 @@ func (Module) PhaseID() string        { return "cluster-occm" }
 func (Module) Dependencies() []string { return []string{"cluster-cleanup-deprecated"} }
 
 func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request) (moduleapi.Result, error) {
-	return clusterhelm.RunNoop(ctx, cfg, req, cfg.Shared.CloudProviderEnabled, "openstack-ccm", "kube-system")
+	enabled := cfg.Shared.CloudProviderEnabled
+	var warning string
+	if !enabled && cfg.IsFirstMaster() {
+		enabled, warning = keepWhileInUse(host.NewExecutor(false, req.Logger))
+	}
+	result, err := clusterhelm.RunNoop(ctx, cfg, req, enabled, "openstack-ccm", "kube-system")
+	if warning != "" {
+		if req.Logger != nil {
+			req.Logger.Warnf("cluster-occm: %s", warning)
+		}
+		result.Warnings = append(result.Warnings, "cluster-occm: "+warning)
+	}
+	return result, err
+}
+
+// keepWhileInUse: see clusterhelm.KeepWhileInUse.
+func keepWhileInUse(executor *host.Executor) (bool, string) {
+	return clusterhelm.KeepWhileInUse(executor, "openstack-ccm", "kube-system", "cloud_provider_enabled",
+		"LoadBalancer Service(s)", "get", "service", "--all-namespaces", "-o",
+		`jsonpath={range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}`)
 }
 
 func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatParamsComponent, opts ...pulumi.ResourceOption) (pulumi.Resource, error) {
 	cfg := heat.Cfg
-	if !cfg.IsFirstMaster() || !cfg.Shared.CloudProviderEnabled {
+	if !cfg.IsFirstMaster() {
 		return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:OCCM", name, opts...)
+	}
+	if !cfg.Shared.CloudProviderEnabled {
+		if keep, _ := keepWhileInUse(host.NewExecutor(false, nil)); !keep {
+			return clusterhelm.RegisterSkipped(ctx, "magnum:cluster:OCCM", name, opts...)
+		}
 	}
 
 	res := &Resource{}

@@ -125,3 +125,37 @@ KUBE_MASTER_IP=10.0.0.5
 		t.Fatalf("worker config not populated: %+v", cfg.Worker)
 	}
 }
+
+func TestLoadComponentConfigKeys(t *testing.T) {
+	path := t.TempDir() + "/heat-params"
+	if err := writeTestFile(path, `NODEGROUP_ROLE=master
+INSTANCE_NAME=c1-master-0
+KUBE_TAG=v1.33.1
+KUBESCHEDULER_OPTIONS="--v=4"
+KUBE_SCHEDULER_SCORING_STRATEGY="MostAllocated"
+KUBE_FILES="eyJvaWRjX2NhIjoieCJ9"
+CINDER_CSI_DEFAULT_STORAGE_CLASS="retain"
+`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, got := range map[string]string{
+		"KubeSchedulerOptions":         cfg.Shared.KubeSchedulerOptions,
+		"KubeSchedulerScoringStrategy": cfg.Shared.KubeSchedulerScoringStrategy,
+		"KubeFiles":                    cfg.Shared.KubeFiles,
+		"CinderCSIDefaultStorageClass": cfg.Shared.CinderCSIDefaultStorageClass,
+	} {
+		want := map[string]string{
+			"KubeSchedulerOptions":         "--v=4",
+			"KubeSchedulerScoringStrategy": "MostAllocated",
+			"KubeFiles":                    "eyJvaWRjX2NhIjoieCJ9",
+			"CinderCSIDefaultStorageClass": "retain",
+		}[name]
+		if got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+}

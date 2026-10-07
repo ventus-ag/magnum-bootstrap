@@ -1,6 +1,7 @@
 package carotation
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
@@ -20,6 +21,7 @@ import (
 	"github.com/ventus-ag/magnum-bootstrap/internal/host"
 	magnumapi "github.com/ventus-ag/magnum-bootstrap/internal/magnum"
 	adminkubeconfig "github.com/ventus-ag/magnum-bootstrap/internal/module/admin-kubeconfig"
+	"github.com/ventus-ag/magnum-bootstrap/internal/module/kubecommon"
 	"github.com/ventus-ag/magnum-bootstrap/internal/moduleapi"
 )
 
@@ -64,12 +66,26 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		return moduleapi.Result{}, err
 	}
 
+	// The token only lives in heat-params, and any unrelated cluster stack update
+	// re-renders heat-params without it (flavour change, node_count, upgrade).
+	// Losing it mid-rotation used to abandon the protocol silently: this node
+	// stopped, the desired phase never advanced, and every peer waiting at the
+	// barrier burned its Heat timeout. Local state outlives heat-params, so it is
+	// what decides whether a rotation is still owed.
+	resumed := false
+	if rotationID == "" && !cfg.Shared.TLSDisabled {
+		if id, why := resumableRotationID(lastAppliedRotationID); id != "" {
+			rotationID, resumed = id, true
+			logf(req, "ca-rotation: resuming rotationId=%s (%s) — heat-params no longer carries the token; an unrelated cluster stack update cleared it", id, why)
+		}
+	}
+
 	// Skip conditions: no rotation, TLS disabled, mixed operation, or already
 	// finalized (marker matches).
 	if rotationID == "" || cfg.Shared.TLSDisabled {
 		return moduleapi.Result{}, nil
 	}
-	if !cfg.IsPureCARotation() {
+	if !resumed && !cfg.IsPureCARotation() {
 		logf(req, "skipping ca rotation rotationId=%s operation=%s (not a pure CA rotation)", rotationID, cfg.Operation())
 		return moduleapi.Result{}, nil
 	}
@@ -136,7 +152,47 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		return runHardRotate(cfg, req, rotationID)
 	}
 
-	return runProtocol(ctx, cfg, req, rotationID)
+	return runProtocol(ctx, cfg, req, rotationID, resumed)
+}
+
+// resumableRotationID returns the rotation this node still owes, and why it is
+// considered unfinished, or "" when there is none.
+//
+// Two signals, in order of strength:
+//  1. persisted state with a phase below `done` — the node completed at least one
+//     phase and was interrupted afterwards;
+//  2. staged material whose CA bundle is what the node is currently serving —
+//     prepare landed but the run died before the phase was recorded, which is
+//     exactly what an interrupting stack update produces on the node that was
+//     driving the rotation.
+//
+// Both ignore the ID already recorded as applied, so the window between finalize
+// and staging cleanup never re-triggers. Signal 1 additionally requires the live
+// CA to still trust that rotation's new CA: finalize only removes its own staging
+// dir, so an abandoned rotation later superseded by a completed one keeps an
+// unfinished state forever and must not be revived.
+func resumableRotationID(applied string) (string, string) {
+	live, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
+	if err != nil {
+		return "", ""
+	}
+	if st, err := coord.InProgressRotation(applied); err == nil && st.RotationID != "" {
+		newCA, err := os.ReadFile(filepath.Join(coord.NewDir(st.RotationID), "ca.crt"))
+		if err == nil && certutil.BundleContainsCertPEM(live, newCA) {
+			return st.RotationID, "local state records phase " + string(st.Phase)
+		}
+	}
+	for _, id := range coord.StagedRotationIDs() {
+		if id == applied {
+			continue
+		}
+		bundle, err := os.ReadFile(filepath.Join(coord.BundleDir(id), "ca.crt"))
+		if err != nil || len(bundle) == 0 || !bytes.Equal(bundle, live) {
+			continue
+		}
+		return id, "the live CA is this rotation's staged dual-CA bundle"
+	}
+	return "", ""
 }
 
 // hardRotateInProgress reports whether a hard rotation was started for
@@ -301,7 +357,7 @@ func (r *runner) writeHardFiles() error {
 			}
 		}
 	}
-	return nil
+	return r.syncSigningCA()
 }
 
 // restartAndWaitBestEffort daemon-reloads and restarts the rotation services,
@@ -326,7 +382,7 @@ func (r *runner) restartAndWaitBestEffort() {
 
 // runProtocol drives the dual-CA prepare/cutover/finalize protocol with
 // Kubernetes-API coordination, resuming from persisted state when present.
-func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, rotationID string) (moduleapi.Result, error) {
+func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, rotationID string, resumed bool) (moduleapi.Result, error) {
 	role := cfg.Role()
 	isMaster := role == config.RoleMaster
 	nodeName := cfg.Shared.InstanceName
@@ -363,6 +419,21 @@ func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, 
 	}
 	r.coord = c
 
+	// A resumed rotation must still be the one the cluster is coordinating: a
+	// master would otherwise reset the ConfigMap to it (EnsureRotation), and a
+	// worker would wait out its whole budget on a barrier nobody drives.
+	if resumed {
+		owner, err := resumeOwner(ctx, c)
+		if err != nil {
+			return moduleapi.Result{}, fmt.Errorf("ca-rotation: verify cluster coordination before resuming rotationId=%s: %w", rotationID, err)
+		}
+		if owner != rotationID {
+			warning := fmt.Sprintf("ca-rotation: not resuming rotationId=%s: cluster coordination is on rotationId=%q; staged material left in %s", rotationID, owner, coord.StagingDir(rotationID))
+			logf(req, "%s", warning)
+			return moduleapi.Result{Warnings: []string{warning}}, nil
+		}
+	}
+
 	// Masters own coordination setup: fail fast (before mutating anything) if
 	// the API is unreachable.
 	if isMaster {
@@ -382,6 +453,11 @@ func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, 
 		if err := c.EnsureRotation(ctx, rotationID); err != nil {
 			return moduleapi.Result{}, fmt.Errorf("ca-rotation: ensure rotation state: %w", err)
 		}
+		// Publish liveness for the whole run, phase work included: workers read
+		// this to tell a slow rotation from an abandoned one, and the longest
+		// silences are the control-plane restarts inside a phase, not the waits.
+		stopBeat := startHeartbeat(ctx, c, rotationID)
+		defer stopBeat()
 	}
 
 	if err := r.ensureStaged(); err != nil {
@@ -456,6 +532,57 @@ func runProtocol(ctx context.Context, cfg config.Config, req moduleapi.Request, 
 	_ = os.RemoveAll(coord.StagingDir(rotationID))
 
 	return moduleapi.Result{Changes: r.changes, Warnings: r.warnings, Outputs: r.outputs()}, nil
+}
+
+// The resume ownership read rides out a peer master's apiserver restart, which
+// is likely: the interrupting update re-runs every node at once.
+var (
+	resumeOwnerWait = 5 * time.Minute
+	resumeOwnerPoll = 5 * time.Second
+)
+
+func resumeOwner(ctx context.Context, c *coord.Coordinator) (string, error) {
+	deadline := time.Now().Add(resumeOwnerWait)
+	for {
+		owner, err := c.RotationOwner(ctx)
+		if err == nil || time.Now().After(deadline) {
+			return owner, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(resumeOwnerPoll):
+		}
+	}
+}
+
+// heartbeatInterval is short relative to BarrierOptions.AbandonTimeout so that a
+// control-plane restart, or a couple of failed patches while the API is coming
+// back, never reads as an abandoned rotation.
+const heartbeatInterval = 30 * time.Second
+
+// startHeartbeat publishes coordinator liveness until the returned stop is
+// called. Errors are ignored: the heartbeat is a hint for peers, never a reason
+// to fail a rotation that is otherwise progressing.
+func startHeartbeat(ctx context.Context, c *coord.Coordinator, rotationID string) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			beatCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			_ = c.Heartbeat(beatCtx, rotationID)
+			cancel()
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 // runner carries shared state across the protocol phases.
@@ -684,11 +811,50 @@ func (r *runner) writePrepareFiles() error {
 			return err
 		}
 		// New CA signing key for the controller-manager (cert_manager_api).
-		if r.cfg.Shared.CAKey != "" {
-			if err := r.writeLive(certDir+"/ca.key", []byte(r.cfg.Shared.CAKey+"\n"), 0o400); err != nil {
-				return err
-			}
+		// Vetted against the staged NEW CA rather than written blindly: a
+		// rotation that gets resumed after an unrelated cluster update carries
+		// that update's CA_KEY, which is the OLD key (only the rotation itself
+		// pushes the new one to a node). Writing it here would split the
+		// signing pair and leave kube-controller-manager unable to sign CSRs.
+		if err := r.writeRotatedCAKey(); err != nil {
+			return err
 		}
+	}
+	return r.syncSigningCA()
+}
+
+// writeRotatedCAKey installs the CA private key from heat-params only when it
+// pairs with the new CA this rotation is installing.
+func (r *runner) writeRotatedCAKey() error {
+	if r.cfg.Shared.CAKey == "" {
+		return nil
+	}
+	newCA, err := os.ReadFile(filepath.Join(coord.NewDir(r.rotationID), "ca.crt"))
+	if err != nil {
+		return fmt.Errorf("ca-rotation: read new CA: %w", err)
+	}
+	if !certutil.KeyPEMMatchesCertPEM([]byte(r.cfg.Shared.CAKey+"\n"), newCA) {
+		logf(r.req, "ca-rotation: not writing ca.key from heat-params (CA_KEY does not pair with the rotation's new CA); keeping the installed key")
+		return nil
+	}
+	return r.writeLive(certDir+"/ca.key", []byte(r.cfg.Shared.CAKey+"\n"), 0o400)
+}
+
+// syncSigningCA keeps the single-certificate signing anchor in step with the
+// trust bundle and the CA key. Every phase moves one or both, and the services
+// are restarted at the end of the same phase — so it must be refreshed here and
+// not left to the cert-api-manager phase later in the run.
+func (r *runner) syncSigningCA() error {
+	if !r.isMaster || !r.cfg.Shared.CertManagerAPI {
+		return nil
+	}
+	changes, warning, err := kubecommon.EnsureSigningCA(r.executor, certDir+"/ca.crt", certDir+"/ca.key")
+	if err != nil {
+		return err
+	}
+	r.changes = append(r.changes, changes...)
+	if warning != "" {
+		r.warnings = append(r.warnings, "ca-rotation: "+warning)
 	}
 	return nil
 }
@@ -720,7 +886,7 @@ func (r *runner) writeCutoverFiles() error {
 			return err
 		}
 	}
-	return nil
+	return r.syncSigningCA()
 }
 
 func (r *runner) writeFinalizeFiles() error {
@@ -748,7 +914,7 @@ func (r *runner) writeFinalizeFiles() error {
 			return err
 		}
 	}
-	return nil
+	return r.syncSigningCA()
 }
 
 // recordRetiredSAKeys registers every key present in the live verify bundle

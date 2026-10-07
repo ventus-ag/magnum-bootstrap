@@ -97,6 +97,10 @@ func Load(path string) (Config, error) {
 			KubeAPIOptions:        raw["KUBEAPI_OPTIONS"],
 			KubeControllerOptions: raw["KUBECONTROLLER_OPTIONS"],
 			KubeProxyOptions:      raw["KUBEPROXY_OPTIONS"],
+			KubeSchedulerOptions:  raw["KUBESCHEDULER_OPTIONS"],
+
+			KubeSchedulerScoringStrategy: raw["KUBE_SCHEDULER_SCORING_STRATEGY"],
+			KubeFiles:                    raw["KUBE_FILES"],
 
 			LeadNodeRoleName: raw["LEAD_NODE_ROLE_NAME"],
 			KubeImageDigest:  raw["KUBE_IMAGE_DIGEST"],
@@ -119,8 +123,10 @@ func Load(path string) (Config, error) {
 
 			VolumeDriver:     raw["VOLUME_DRIVER"],
 			CinderCSIEnabled: parseBool(raw["CINDER_CSI_ENABLED"]),
-			ManilaCSIEnabled: parseBool(raw["MANILA_CSI_ENABLED"]),
-			ManilaShareType:  raw["MANILA_SHARE_TYPE"],
+
+			CinderCSIDefaultStorageClass: raw["CINDER_CSI_DEFAULT_STORAGE_CLASS"],
+			ManilaCSIEnabled:             parseBool(raw["MANILA_CSI_ENABLED"]),
+			ManilaShareType:              raw["MANILA_SHARE_TYPE"],
 
 			GPUOperatorEnabled:   parseBool(raw["GPU_OPERATOR_ENABLED"]),
 			OSAutoUpgradeEnabled: parseBool(raw["OS_AUTOUPGRADE_ENABLED"]),

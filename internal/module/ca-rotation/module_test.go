@@ -382,3 +382,101 @@ func TestModuleRunSkipsWhenRotationAlreadyAppliedFromState(t *testing.T) {
 		t.Fatalf("expected no changes for already applied ca rotation, got %d", len(res.Changes))
 	}
 }
+
+// stageRotation records rotationID at phase with newCA staged as its new CA.
+func stageRotation(t *testing.T, rotationID string, phase coord.Phase, newCA *testCA) {
+	t.Helper()
+	if err := coord.SaveState(coord.State{RotationID: rotationID, Phase: phase}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(coord.NewDir(rotationID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeCertPEM(t, filepath.Join(coord.NewDir(rotationID), "ca.crt"), newCA.certDER)
+}
+
+func writeLiveCA(t *testing.T, dir string, cas ...*testCA) {
+	t.Helper()
+	ders := make([][]byte, 0, len(cas))
+	for _, ca := range cas {
+		ders = append(ders, ca.certDER)
+	}
+	writeCertPEM(t, filepath.Join(dir, "ca.crt"), ders...)
+}
+
+func TestResumableRotationIDFromState(t *testing.T) {
+	defer coord.SetBaseDir(t.TempDir())()
+	dir := t.TempDir()
+	restore := certDir
+	certDir = dir
+	defer func() { certDir = restore }()
+
+	old, next := newTestCA(t), newTestCA(t)
+	stageRotation(t, "rot-1", coord.PhasePrepare, next)
+	writeLiveCA(t, dir, next, old)
+
+	id, why := resumableRotationID("")
+	if id != "rot-1" || why == "" {
+		t.Fatalf("resumableRotationID = %q (%q); want rot-1 with a reason", id, why)
+	}
+	if id, _ := resumableRotationID("rot-1"); id != "" {
+		t.Fatalf("an applied rotation must not resume, got %q", id)
+	}
+}
+
+func TestResumableRotationIDIgnoresSupersededRotation(t *testing.T) {
+	// rot-1 was abandoned at prepare, then rot-2 completed. rot-1's state still
+	// reads unfinished, but the live CA no longer trusts its new CA: reviving it
+	// would reset the cluster's coordination and re-install a stale bundle.
+	defer coord.SetBaseDir(t.TempDir())()
+	dir := t.TempDir()
+	restore := certDir
+	certDir = dir
+	defer func() { certDir = restore }()
+
+	abandoned, current := newTestCA(t), newTestCA(t)
+	stageRotation(t, "rot-1", coord.PhasePrepare, abandoned)
+	writeLiveCA(t, dir, current)
+
+	if id, why := resumableRotationID("rot-2"); id != "" {
+		t.Fatalf("a superseded rotation must not resume, got %q (%q)", id, why)
+	}
+}
+
+func TestResumableRotationIDFromStagedBundle(t *testing.T) {
+	// The node that was DRIVING the rotation is the one an interrupting stack
+	// update kills first, often before any phase is recorded. Its only trace is
+	// that the live CA is the staged dual-CA bundle — which must still resume.
+	defer coord.SetBaseDir(t.TempDir())()
+	dir := t.TempDir()
+	restore := certDir
+	certDir = dir
+	defer func() { certDir = restore }()
+
+	ca := newTestCA(t)
+	next := newTestCA(t)
+	bundle := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: next.certDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.certDER})...)
+
+	if err := os.MkdirAll(coord.BundleDir("rot-9"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(coord.BundleDir("rot-9"), "ca.crt"), bundle, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	// Live CA is still the old single cert: prepare never landed here.
+	writeCertPEM(t, filepath.Join(dir, "ca.crt"), ca.certDER)
+	if id, _ := resumableRotationID(""); id != "" {
+		t.Fatalf("a staged-but-not-installed rotation must not resume, got %q", id)
+	}
+
+	// Live CA is the staged bundle: prepare landed, the run died after it.
+	_ = os.Remove(filepath.Join(dir, "ca.crt"))
+	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), bundle, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if id, why := resumableRotationID(""); id != "rot-9" || why == "" {
+		t.Fatalf("resumableRotationID = %q (%q); want rot-9", id, why)
+	}
+}

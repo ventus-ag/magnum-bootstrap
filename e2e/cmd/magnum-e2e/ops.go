@@ -56,6 +56,13 @@ var knownOps = map[string]bool{
 	// reconciler installed/uninstalled it (see toggle.go).
 	"disable-autoscaler":    true,
 	"enable-metrics-server": true,
+	// label-driven component config (see component_config.go)
+	"set-component-args":    true,
+	"clear-component-args":  true,
+	"patch-node-count":      true,
+	"scheduler-scoring":     true,
+	"toggle-settings":       true,
+	"toggle-os-autoupgrade": true,
 }
 
 // parseOps parses a comma-separated op list. Each token is "name" or "name=N".
@@ -163,14 +170,14 @@ const (
 var scenarios = map[string]scenarioDef{
 	"smoke": {
 		masters: 1, workers: 1,
-		ops: "disable-autoscaler,enable-metrics-server,upgrade,cloud-smoke,nodepool-metadata-smoke,resize-workers=2,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate",
+		ops: "disable-autoscaler,enable-metrics-server,set-component-args,upgrade,cloud-smoke,nodepool-metadata-smoke,patch-node-count=3,resize-workers=2,scheduler-scoring,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,clear-component-args",
 		// The 3 `upgrade` ops climb a real version ladder (see climbLadder) instead
 		// of re-upgrading to 1.31 three times — one rung per `upgrade` op.
 		upgradeLadder: climbLadder,
 	},
 	"multinode": {
 		masters: 3, workers: 2,
-		ops: "add-nodepool=2,nodepool-metadata,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,resize-flavor,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool",
+		ops: "set-component-args,toggle-settings,toggle-os-autoupgrade,add-nodepool=2,nodepool-metadata,resize-workers=3,resize-nodepool=3,resize-workers=2,resize-nodepool=1,scheduler-scoring,resize-flavor,upgrade,ca-rotate,ca-rotate,upgrade,upgrade,ca-rotate,post-rotate,del-nodepool,clear-component-args",
 		// 3-master coverage: the 3 `upgrade` ops climb 1.31→1.32→1.33 (see
 		// climbLadder) so multimaster upgrades exercise real minor bumps.
 		upgradeLadder: climbLadder,
@@ -262,6 +269,16 @@ var scenarios = map[string]scenarioDef{
 	"component-toggle": {
 		masters: 1, workers: 1,
 		ops: "disable-autoscaler,enable-metrics-server",
+	},
+	// component-config — the label-driven configuration surface on its own:
+	// kubeapi_options + a kube_file_<name> label applied and then held across
+	// every parent-stack update path (node_count PATCH, resize, upgrade — each
+	// re-asserts via the verify bundle), MostAllocated bin-packing, every UI
+	// settings switch incl. the in-use guards, and OS auto-upgrade reaching
+	// workers.
+	"component-config": {
+		masters: 1, workers: 2,
+		ops: "set-component-args,patch-node-count=3,resize-workers=2,scheduler-scoring,toggle-settings,toggle-os-autoupgrade,upgrade,clear-component-args",
 	},
 }
 

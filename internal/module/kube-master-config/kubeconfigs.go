@@ -22,10 +22,43 @@ func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change
 		apiPort = 6443
 	}
 
+	// Validate before writing anything: a component option pointing at a
+	// missing file would crashloop the component, so keep the current args.
+	kubeFiles, err := kubecommon.DecodeKubeFiles(cfg.Shared.KubeFiles)
+	if err != nil {
+		return nil, err
+	}
+	provisioned := kubecommon.KubeFilePaths(kubeFiles)
+	schedulerConfig := buildSchedulerConfig(cfg)
+	if schedulerConfig != "" {
+		provisioned[schedulerConfigPath] = true
+	}
+	if err := kubecommon.CheckOptionFiles(provisioned, map[string]string{
+		"kubeapi_options":        cfg.Shared.KubeAPIOptions,
+		"kubecontroller_options": cfg.Shared.KubeControllerOptions,
+		"kubescheduler_options":  cfg.Shared.KubeSchedulerOptions,
+		"kubelet_options":        cfg.Shared.KubeletOptions,
+		"kubeproxy_options":      cfg.Shared.KubeProxyOptions,
+	}); err != nil {
+		return nil, err
+	}
+	fileChanges, err := kubecommon.EnsureKubeFiles(executor, kubeFiles)
+	if err != nil {
+		return nil, err
+	}
+	changes = append(changes, fileChanges...)
+	change, err := applyFileResource(executor, hostresource.FileSpec{Path: schedulerConfigPath, Content: []byte(schedulerConfig), Mode: 0o644, Absent: schedulerConfig == ""})
+	if err != nil {
+		return nil, err
+	}
+	if change.Changed {
+		changes = append(changes, change.Changes...)
+	}
+
 	// Proxy kubeconfig.
 	proxyKC := kubecommon.BuildKubeconfig("kube-proxy", certDir+"/proxy.crt", certDir+"/proxy.key",
 		certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))
-	change, err := applyFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/proxy-kubeconfig.yaml", Content: []byte(proxyKC), Mode: 0o640})
+	change, err = applyFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/proxy-kubeconfig.yaml", Content: []byte(proxyKC), Mode: 0o640})
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +80,7 @@ func writeKubeConfigs(cfg config.Config, executor *host.Executor) ([]host.Change
 	// Scheduler kubeconfig.
 	schedulerKC := kubecommon.BuildKubeconfig("scheduler", certDir+"/scheduler.crt", certDir+"/scheduler.key",
 		certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))
-	change, err = applyFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/scheduler-kubeconfig.yaml", Content: []byte(schedulerKC), Mode: 0o640})
+	change, err = applyFileResource(executor, hostresource.FileSpec{Path: schedulerKubeconfigPath, Content: []byte(schedulerKC), Mode: 0o640})
 	if err != nil {
 		return nil, err
 	}
@@ -107,9 +140,8 @@ KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
 	}
 
 	// Scheduler env.
-	schedulerArgs := "--leader-elect=true --kubeconfig=/etc/kubernetes/scheduler-kubeconfig.yaml"
 	change, err = applyFileResource(executor, hostresource.FileSpec{Path: "/etc/kubernetes/scheduler",
-		Content: []byte(fmt.Sprintf("KUBE_SCHEDULER_ARGS=\"%s\"\n", schedulerArgs)), Mode: 0o644})
+		Content: []byte(fmt.Sprintf("KUBE_SCHEDULER_ARGS=\"%s\"\n", buildSchedulerArgs(cfg))), Mode: 0o644})
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +190,7 @@ func registerKubeConfigResources(ctx *pulumi.Context, name string, cfg config.Co
 	}{
 		{name: "proxy-kubeconfig", spec: hostresource.FileSpec{Path: "/etc/kubernetes/proxy-kubeconfig.yaml", Content: []byte(kubecommon.BuildKubeconfig("kube-proxy", certDir+"/proxy.crt", certDir+"/proxy.key", certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))), Mode: 0o640}},
 		{name: "controller-kubeconfig", spec: hostresource.FileSpec{Path: "/etc/kubernetes/controller-kubeconfig.yaml", Content: []byte(kubecommon.BuildKubeconfig("controller", certDir+"/controller.crt", certDir+"/controller.key", certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))), Mode: 0o640}},
-		{name: "scheduler-kubeconfig", spec: hostresource.FileSpec{Path: "/etc/kubernetes/scheduler-kubeconfig.yaml", Content: []byte(kubecommon.BuildKubeconfig("scheduler", certDir+"/scheduler.crt", certDir+"/scheduler.key", certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))), Mode: 0o640}},
+		{name: "scheduler-kubeconfig", spec: hostresource.FileSpec{Path: schedulerKubeconfigPath, Content: []byte(kubecommon.BuildKubeconfig("scheduler", certDir+"/scheduler.crt", certDir+"/scheduler.key", certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))), Mode: 0o640}},
 		{name: "kubelet-kubeconfig", spec: hostresource.FileSpec{Path: "/etc/kubernetes/kubelet.conf", Content: []byte(kubecommon.BuildKubeconfig(fmt.Sprintf("system:node:%s", cfg.Shared.InstanceName), certDir+"/kubelet.crt", certDir+"/kubelet.key", certDir+"/ca.crt", fmt.Sprintf("https://127.0.0.1:%d", apiPort))), Mode: 0o640}},
 		{name: "apiserver-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/apiserver", Content: []byte(fmt.Sprintf(`KUBE_API_ADDRESS="--bind-address=0.0.0.0 --secure-port=%d"
 KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=%s"
@@ -166,7 +198,8 @@ KUBE_API_ARGS="%s"
 KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
 `, apiPort, cfg.Shared.PortalNetworkCIDR, buildAPIServerArgs(cfg))), Mode: 0o644}},
 		{name: "controller-manager-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/controller-manager", Content: []byte(fmt.Sprintf("KUBE_CONTROLLER_MANAGER_ARGS=\"%s\"\n", buildControllerManagerArgs(cfg))), Mode: 0o644}},
-		{name: "scheduler-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/scheduler", Content: []byte("KUBE_SCHEDULER_ARGS=\"--leader-elect=true --kubeconfig=/etc/kubernetes/scheduler-kubeconfig.yaml\"\n"), Mode: 0o644}},
+		{name: "scheduler-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/scheduler", Content: []byte(fmt.Sprintf("KUBE_SCHEDULER_ARGS=\"%s\"\n", buildSchedulerArgs(cfg))), Mode: 0o644}},
+		{name: "scheduler-config", spec: hostresource.FileSpec{Path: schedulerConfigPath, Content: []byte(buildSchedulerConfig(cfg)), Mode: 0o644, Absent: buildSchedulerConfig(cfg) == ""}},
 		{name: "proxy-env", spec: hostresource.FileSpec{Path: "/etc/kubernetes/proxy", Content: []byte(fmt.Sprintf("KUBE_PROXY_ARGS=\"%s\"\n", strings.TrimSpace(fmt.Sprintf("--kubeconfig=/etc/kubernetes/proxy-kubeconfig.yaml --cluster-cidr=%s --hostname-override=%s %s", cfg.Shared.PodsNetworkCIDR, cfg.Shared.InstanceName, cfg.Shared.KubeProxyOptions)))), Mode: 0o644}},
 		{name: "base-config", spec: hostresource.FileSpec{Path: "/etc/kubernetes/config", Content: []byte("KUBE_LOG_LEVEL=\"--v=2\"\n"), Mode: 0o644}},
 	}
@@ -181,7 +214,7 @@ KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
 			return err
 		}
 	}
-	return nil
+	return kubecommon.RegisterKubeFiles(ctx, name, cfg.Shared.KubeFiles, opts...)
 }
 
 func applyFileResource(executor *host.Executor, spec hostresource.FileSpec) (hostresource.ApplyResult, error) {
@@ -272,7 +305,9 @@ func buildControllerManagerArgs(cfg config.Config) string {
 		args = append(args, "--cloud-provider=external")
 	}
 	if cfg.Shared.CertManagerAPI {
-		args = append(args, fmt.Sprintf("--cluster-signing-cert-file=%s/ca.crt", certDir))
+		// NOT ca.crt: that is the trust bundle, and the CSR signing controller
+		// accepts exactly one certificate. See kubecommon.SigningCACertPath.
+		args = append(args, fmt.Sprintf("--cluster-signing-cert-file=%s", kubecommon.SigningCACertPath))
 		args = append(args, fmt.Sprintf("--cluster-signing-key-file=%s/ca.key", certDir))
 	}
 	if cfg.Shared.KubeControllerOptions != "" {

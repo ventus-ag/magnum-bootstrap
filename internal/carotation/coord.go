@@ -54,6 +54,13 @@ const (
 
 	keyRotationID   = "rotationId"
 	keyDesiredPhase = "desiredPhase"
+	// keyHeartbeat carries the last time a master actively drove this rotation.
+	// Workers cannot list nodes (the node authorizer only grants them their own),
+	// so the ConfigMap is their sole window onto the cluster — and a stalled
+	// rotation looks exactly like a slow one from there. The heartbeat is what
+	// separates them: it stops the moment no master is running the protocol any
+	// more, which is what an interrupting stack update produces.
+	keyHeartbeat = "coordinatorHeartbeat"
 	// keyParticipants holds the space-separated names of the nodes that exist
 	// when a rotation begins. Only these nodes must report at each barrier:
 	// nodes created later are minted by Magnum with the NEW CA and run `create`
@@ -268,21 +275,64 @@ func (c *Coordinator) EnsureNodeReadRBAC(ctx context.Context) error {
 // ReadDesiredPhase returns the cluster's desired phase for rotationID. A missing
 // or stale ConfigMap reads as PhasePrepare (the implicit starting phase).
 func (c *Coordinator) ReadDesiredPhase(ctx context.Context, rotationID string) (Phase, error) {
+	phase, _, err := c.ReadProgress(ctx, rotationID)
+	return phase, err
+}
+
+// RotationOwner returns the rotation ID the coordination ConfigMap is scoped
+// to, or "" when there is no ConfigMap.
+func (c *Coordinator) RotationOwner(ctx context.Context) (string, error) {
 	cm, err := c.clientset.CoreV1().ConfigMaps(CoordNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return PhasePrepare, nil
+		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	return cm.Data[keyRotationID], nil
+}
+
+// ReadProgress returns the desired phase for rotationID together with the last
+// coordinator heartbeat. A zero time means no master has ever recorded one — an
+// older coordinator, or a rotation that predates heartbeating — and callers must
+// treat that as "unknown", never as "abandoned".
+func (c *Coordinator) ReadProgress(ctx context.Context, rotationID string) (Phase, time.Time, error) {
+	cm, err := c.clientset.CoreV1().ConfigMaps(CoordNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return PhasePrepare, time.Time{}, nil
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	if cm.Data[keyRotationID] != rotationID {
-		return PhasePrepare, nil
+		return PhasePrepare, time.Time{}, nil
 	}
 	phase := Phase(cm.Data[keyDesiredPhase])
 	if !phase.Valid() {
-		return PhasePrepare, nil
+		phase = PhasePrepare
 	}
-	return phase, nil
+	beat, err := time.Parse(time.RFC3339, cm.Data[keyHeartbeat])
+	if err != nil {
+		beat = time.Time{}
+	}
+	return phase, beat, nil
+}
+
+// Heartbeat records that a master is actively driving rotationID. It is a no-op
+// when the ConfigMap belongs to a different rotation, so a late run can never
+// revive a superseded one.
+func (c *Coordinator) Heartbeat(ctx context.Context, rotationID string) error {
+	cms := c.clientset.CoreV1().ConfigMaps(CoordNamespace)
+	cm, err := cms.Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if cm.Data[keyRotationID] != rotationID {
+		return nil
+	}
+	patch := fmt.Sprintf(`{"data":{%q:%q}}`, keyHeartbeat, time.Now().UTC().Format(time.RFC3339))
+	_, err = cms.Patch(ctx, ConfigMapName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	return err
 }
 
 // AdvanceDesiredPhase moves the cluster desired phase forward to `to`. It is
@@ -432,7 +482,14 @@ type BarrierOptions struct {
 	// restart. This turns a genuinely stuck peer (never reaches the phase) into
 	// a fast, actionable failure instead of consuming the whole Heat run budget.
 	StallTimeout time.Duration
-	Logf         func(format string, args ...any)
+	// AbandonTimeout fails a waiter fast when no master has heartbeated for this
+	// long. It is the worker-side counterpart of StallTimeout: a worker cannot
+	// see the pending set, only that nothing is moving, and "nothing is moving"
+	// is indistinguishable from "the rotation was abandoned" without the
+	// heartbeat. Enforced only once a heartbeat has actually been observed, so a
+	// cluster whose masters predate heartbeating keeps the old behaviour.
+	AbandonTimeout time.Duration
+	Logf           func(format string, args ...any)
 }
 
 func (o BarrierOptions) withDefaults() BarrierOptions {
@@ -444,6 +501,12 @@ func (o BarrierOptions) withDefaults() BarrierOptions {
 	}
 	if o.StallTimeout <= 0 {
 		o.StallTimeout = 20 * time.Minute
+	}
+	if o.AbandonTimeout <= 0 {
+		// Must outlast a single-master control-plane restart (up to 7.5min API
+		// health wait, during which the heartbeat cannot be written) plus
+		// heartbeat interval and clock skew.
+		o.AbandonTimeout = 15 * time.Minute
 	}
 	if o.Logf == nil {
 		o.Logf = func(string, ...any) {}
@@ -472,9 +535,13 @@ func (c *Coordinator) Barrier(ctx context.Context, rotationID string, completed 
 		lastPendingList []string
 	)
 	for {
-		desired, err := c.ReadDesiredPhase(ctx, rotationID)
+		desired, beat, err := c.ReadProgress(ctx, rotationID)
 		if err == nil && desired.AtLeast(next) {
 			return nil
+		}
+		if err == nil && !isMaster && !beat.IsZero() && time.Since(beat) >= opts.AbandonTimeout {
+			return fmt.Errorf("ca-rotation: no master has driven rotationId=%s for %s (last coordinator heartbeat %s, desired phase still %s) — the rotation looks abandoned; re-trigger it once the cluster stack is idle",
+				rotationID, time.Since(beat).Round(time.Second), beat.UTC().Format(time.RFC3339), desired)
 		}
 		if err == nil && isMaster {
 			ok, pending, listErr := c.AllNodesReached(ctx, rotationID, completed)

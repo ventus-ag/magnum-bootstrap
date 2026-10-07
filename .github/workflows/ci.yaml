@@ -36,7 +36,7 @@ on:
         description: Upgrade target version
         default: v1.31.6
       scenarios:
-        description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade, periodic)"
+        description: "Space-separated scenarios (create, scale-masters, ca-rotate, upgrade, periodic, node-metadata, component-args)"
         default: create ca-rotate upgrade periodic
       magnum_ref:
         description: Branch/ref of the forked driver repo (ventus-ag/magnum)
@@ -87,6 +87,7 @@ on:
           - ubuntu-upgrade
           - ubuntu-nodepool
           - component-toggle
+          - component-config
           - version-ladder
           - sonobuoy
   schedule:
@@ -225,7 +226,9 @@ jobs:
           - name: pinned
             kube_tag: ${{ github.event.inputs.kube_tag || 'v1.30.10' }}
             kube_tag_upgrade: ${{ github.event.inputs.kube_tag_upgrade || 'v1.31.6' }}
-            scenarios: ${{ github.event.inputs.scenarios || 'create ca-rotate upgrade periodic' }}
+            # component-args: label-driven apiserver/scheduler config + kube
+            # files, the missing-file guard, and removal (master-only).
+            scenarios: ${{ github.event.inputs.scenarios || 'create component-args ca-rotate upgrade periodic' }}
             workers: 0
             # Distinct slot offset so this leg's subnet/mcast/host-ports never
             # collide with the concurrently-scheduled `latest` leg on a host
