@@ -82,3 +82,22 @@ func TestLeaseFresh(t *testing.T) {
 		t.Fatal("leaseFresh misclassified")
 	}
 }
+
+func TestStaleE2ECluster(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-14 * time.Hour)
+	for _, tc := range []struct {
+		c    clusters.Cluster
+		want bool
+	}{
+		{clusters.Cluster{Name: "recon-e2e-version-ladder-1", CreatedAt: old, Status: "UPDATE_COMPLETE"}, true},
+		{clusters.Cluster{Name: "recon-e2e-smoke-2", CreatedAt: now.Add(-2 * time.Hour)}, false}, // live job
+		{clusters.Cluster{Name: "customer-prod", CreatedAt: old}, false},                         // not ours
+		{clusters.Cluster{Name: "recon-e2e-kept", CreatedAt: old, Labels: map[string]string{keepLabel: "true"}}, false},
+		{clusters.Cluster{Name: "recon-e2e-going", CreatedAt: old, Status: "DELETE_IN_PROGRESS"}, false},
+	} {
+		if got := staleE2ECluster(tc.c, now); got != tc.want {
+			t.Errorf("staleE2ECluster(%s) = %v, want %v", tc.c.Name, got, tc.want)
+		}
+	}
+}

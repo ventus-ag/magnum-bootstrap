@@ -590,6 +590,9 @@ func (r *runner) buildLabels() map[string]string {
 	if r.cfg.reconcilerURL != "" {
 		labels["reconciler_binary_url"] = r.cfg.reconcilerURL
 	}
+	if r.cfg.keepCluster {
+		labels[keepLabel] = "true"
+	}
 	for kv := range strings.SplitSeq(r.cfg.extraLabels, ",") {
 		kv = strings.TrimSpace(kv)
 		if kv == "" {

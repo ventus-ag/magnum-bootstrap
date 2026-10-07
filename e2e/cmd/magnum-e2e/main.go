@@ -96,6 +96,7 @@ type config struct {
 var (
 	flagPreflight     = flag.Bool("preflight", false, "authenticate + verify template/keypair reachability, then exit")
 	flagTeardown      = flag.Bool("teardown", false, "delete the named cluster and exit (no lifecycle run)")
+	flagReapStale     = flag.Bool("reap-stale", false, "delete recon-e2e-* clusters older than the job timeout (leaked by cancelled runs), then exit")
 	flagList          = flag.Bool("list", false, "list cluster templates + keypairs visible to the project, then exit")
 	flagClusters      = flag.Bool("clusters", false, "list all Magnum clusters + their status (diagnostic), then exit")
 	flagStageSelftest = flag.Bool("stage-selftest", false, "stage -bootstrap-binary into Swift, fetch it back anonymously, verify, unstage, then exit")
@@ -271,6 +272,9 @@ func main() {
 		if err := r.stageSelfTest(ctx); err != nil {
 			die("stage-selftest: %v", err)
 		}
+		return
+	case *flagReapStale:
+		r.reapStale(ctx)
 		return
 	case *flagTeardown:
 		if cfg.scenario == "all" {

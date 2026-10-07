@@ -274,6 +274,14 @@ jobs:
           chmod +x "${{ runner.temp }}/sonobuoy/sonobuoy"
           "${{ runner.temp }}/sonobuoy/sonobuoy" version || true
 
+      - name: Reap stale e2e clusters
+        # A cancelled run skips its teardown; each leaked cluster pins two Nova
+        # server groups (project quota 10) until every create fails.
+        env:
+          BOOTSTRAP_BINARY: ${{ vars.RECONCILER_BINARY_URL == '' && format('{0}/prebuilt/bootstrap', runner.temp) || '' }}
+        run: |
+          "${{ runner.temp }}/prebuilt/magnum-e2e" -reap-stale || true
+
       - name: Run OpenStack Magnum e2e
         # Stage the prebuilt reconciler into Swift unless an explicit
         # RECONCILER_BINARY_URL override is configured.

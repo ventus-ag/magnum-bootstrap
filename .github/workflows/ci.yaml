@@ -99,7 +99,9 @@ permissions:
 # Cancel superseded runs for the same PR/branch so VM jobs don't pile up.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Only superseded PR runs are cancelled: a cancelled e2e skips its teardown
+  # and leaks billed clusters, so main/scheduled runs queue instead.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ---------------------------------------------------------------------------
