@@ -109,6 +109,37 @@ func TestCheckOptionFilesCountsProvisionedPaths(t *testing.T) {
 	}
 }
 
+func TestCheckOptionFilesTreatsAFileAboutToBePrunedAsMissing(t *testing.T) {
+	dir := t.TempDir()
+	restore := kubeFilesDir
+	kubeFilesDir = dir
+	defer func() { kubeFilesDir = restore }()
+
+	managed := filepath.Join(dir, "oidc_ca")
+	placed := filepath.Join(dir, "by_hand")
+	for _, path := range []string{managed, placed} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, kubeFilesManifest), []byte("oidc_ca\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := func(path string) map[string]string {
+		return map[string]string{"kubeapi_options": "--oidc-ca-file=" + path}
+	}
+
+	if err := CheckOptionFiles(nil, opts(managed)); err == nil {
+		t.Fatal("a managed file this run deletes must not count as present")
+	}
+	if err := CheckOptionFiles(map[string]bool{managed: true}, opts(managed)); err != nil {
+		t.Fatalf("a managed file this run keeps is present: %v", err)
+	}
+	if err := CheckOptionFiles(nil, opts(placed)); err != nil {
+		t.Fatalf("a hand-placed file is never pruned: %v", err)
+	}
+}
+
 func TestRestartUnits(t *testing.T) {
 	units := []UnitOptions{
 		{Unit: "kube-apiserver", Options: "--audit-policy-file=/etc/kubernetes/files/policy"},

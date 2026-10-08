@@ -212,13 +212,30 @@ func MissingFileFlags(opts string, exists func(string) bool) []string {
 	return missing
 }
 
+// prunedKubeFiles lists the managed files EnsureKubeFiles will delete in this
+// run: still on disk now, so a plain stat would call them present.
+func prunedKubeFiles(provisioned map[string]bool) map[string]bool {
+	previous, _ := os.ReadFile(filepath.Join(kubeFilesDir, kubeFilesManifest))
+	pruned := map[string]bool{}
+	for name := range strings.FieldsSeq(string(previous)) {
+		if path := filepath.Join(kubeFilesDir, name); kubeFileName.MatchString(name) && !provisioned[path] {
+			pruned[path] = true
+		}
+	}
+	return pruned
+}
+
 // CheckOptionFiles fails when any of the named option strings references a
 // missing input file. provisioned paths (written later in this run) count as
 // present, so a dry run and the first run behave the same.
 func CheckOptionFiles(provisioned map[string]bool, options map[string]string) error {
+	pruned := prunedKubeFiles(provisioned)
 	exists := func(path string) bool {
 		if provisioned[path] {
 			return true
+		}
+		if pruned[path] {
+			return false
 		}
 		_, err := os.Stat(path)
 		return err == nil
