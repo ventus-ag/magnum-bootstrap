@@ -1,6 +1,7 @@
 package carotation
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -102,5 +103,82 @@ func TestStagedRotationIDs(t *testing.T) {
 	ids := StagedRotationIDs()
 	if len(ids) != 2 || ids[0] != "rot-new" {
 		t.Fatalf("StagedRotationIDs = %v; want rot-new first", ids)
+	}
+}
+
+func useTempMarker(t *testing.T) {
+	t.Helper()
+	orig := MarkerPath
+	MarkerPath = t.TempDir() + "/last_ca_rotation_id"
+	t.Cleanup(func() { MarkerPath = orig })
+}
+
+func TestFinalizedRemembersOlderRotations(t *testing.T) {
+	useTempMarker(t)
+
+	if Finalized("rot-1") || Finalized("") {
+		t.Fatal("nothing finalized yet")
+	}
+	for _, id := range []string{"rot-1", "rot-2", "rot-2", "rot-3"} {
+		if err := WriteMarker(id); err != nil {
+			t.Fatalf("WriteMarker(%s): %v", id, err)
+		}
+	}
+	if ReadMarker() != "rot-3" {
+		t.Fatalf("marker = %q, want latest rot-3", ReadMarker())
+	}
+	for _, id := range []string{"rot-1", "rot-2", "rot-3"} {
+		if !Finalized(id) {
+			t.Errorf("%s finalized earlier must stay finalized", id)
+		}
+	}
+	if Finalized("rot-4") {
+		t.Error("rot-4 never finalized")
+	}
+	if got := readFinalized(); len(got) != 3 {
+		t.Errorf("history = %v, want 3 unique ids", got)
+	}
+}
+
+func TestFinalizedHistoryIsBounded(t *testing.T) {
+	useTempMarker(t)
+	for i := range finalizedKeep + 5 {
+		if err := WriteMarker(fmt.Sprintf("rot-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(readFinalized()); got != finalizedKeep {
+		t.Fatalf("history len = %d, want %d", got, finalizedKeep)
+	}
+	if Finalized("rot-0") {
+		t.Error("oldest id must be pruned")
+	}
+	if !Finalized(fmt.Sprintf("rot-%d", finalizedKeep+4)) {
+		t.Error("newest id must be kept")
+	}
+}
+
+func TestFinalizedMarkerOnlyLegacyNode(t *testing.T) {
+	useTempMarker(t)
+	// A node finalized by a binary predating the history only has the marker.
+	if err := os.WriteFile(MarkerPath, []byte("rot-7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !Finalized("rot-7") {
+		t.Error("marker alone must count as finalized")
+	}
+}
+
+func BenchmarkFinalizedFullHistory(b *testing.B) {
+	orig := MarkerPath
+	MarkerPath = b.TempDir() + "/last_ca_rotation_id"
+	defer func() { MarkerPath = orig }()
+	for i := range finalizedKeep {
+		if err := WriteMarker(fmt.Sprintf("rot-%d", i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for b.Loop() {
+		Finalized("rot-0")
 	}
 }

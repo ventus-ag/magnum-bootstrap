@@ -480,3 +480,35 @@ func TestResumableRotationIDFromStagedBundle(t *testing.T) {
 		t.Fatalf("resumableRotationID = %q (%q); want rot-9", id, why)
 	}
 }
+
+func TestRunSkipsOlderFinalizedRotation(t *testing.T) {
+	// A Heat rolling update re-renders members outside the batch from the
+	// ResourceGroup's stored definitions, re-delivering an older token that
+	// already finalized here. Re-running it would park every master at a
+	// prepare barrier no other node joins.
+	defer coord.SetBaseDir(t.TempDir())()
+	orig := coord.MarkerPath
+	coord.MarkerPath = filepath.Join(t.TempDir(), "last_ca_rotation_id")
+	defer func() { coord.MarkerPath = orig }()
+	restore := certDir
+	certDir = t.TempDir()
+	defer func() { certDir = restore }()
+
+	for _, id := range []string{"rot-2", "rot-3"} {
+		if err := coord.WriteMarker(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := workerCfg()
+	cfg.Trigger.CARotationID = "rot-2"
+	res, err := Module{}.Run(context.Background(), cfg, moduleapi.Request{Apply: true})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Changes) != 0 {
+		t.Fatalf("stale finalized token must be a no-op, got %v", res.Changes)
+	}
+	if got := coord.ReadMarker(); got != "rot-3" {
+		t.Fatalf("marker = %q, must stay at the latest rotation rot-3", got)
+	}
+}

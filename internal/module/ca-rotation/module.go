@@ -89,7 +89,7 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		logf(req, "skipping ca rotation rotationId=%s operation=%s (not a pure CA rotation)", rotationID, cfg.Operation())
 		return moduleapi.Result{}, nil
 	}
-	if lastAppliedRotationID == rotationID {
+	if lastAppliedRotationID == rotationID || coord.Finalized(rotationID) {
 		logf(req, "skipping ca rotation rotationId=%s (already finalized)", rotationID)
 		return moduleapi.Result{}, nil
 	}

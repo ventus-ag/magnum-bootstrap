@@ -25,6 +25,9 @@ type ProgramMetadata struct {
 	InputChecksum  string   `json:"inputChecksum"`
 	HeatParamsFile string   `json:"heatParamsFile"`
 	PhaseIDs       []string `json:"phaseIds"`
+	// AppliedCARotationID is resolved from local state, not heat-params, so the
+	// in-program reload must restore it.
+	AppliedCARotationID string `json:"-"`
 }
 
 // NodeReconcile is the top-level Pulumi component resource for a node reconcile run.
@@ -147,6 +150,8 @@ func BuildMetadata(cfg config.Config, reconcilePlan plan.Plan, command string, d
 		InputChecksum:  cfg.InputChecksum,
 		HeatParamsFile: heatParamsFile,
 		PhaseIDs:       reconcilePlan.PhaseIDs(),
+
+		AppliedCARotationID: cfg.Trigger.AppliedCARotationID,
 	}
 }
 
@@ -178,6 +183,7 @@ func BuildProgram(goCtx context.Context, heatParamsPath string, reconcilePlan pl
 		if err != nil {
 			return fmt.Errorf("failed to load heat params: %w", err)
 		}
+		cfg.Trigger.AppliedCARotationID = metadata.AppliedCARotationID
 
 		// Let Pulumi determine whether this is a preview or an apply run.
 		// DryRun() returns true during pulumi preview, false during pulumi up.

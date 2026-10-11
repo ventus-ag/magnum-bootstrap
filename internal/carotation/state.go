@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -44,7 +45,53 @@ func WriteMarker(rotationID string) error {
 	if err := os.MkdirAll(filepath.Dir(MarkerPath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(MarkerPath, []byte(rotationID+"\n"), 0o644)
+	if err := os.WriteFile(MarkerPath, []byte(rotationID+"\n"), 0o644); err != nil {
+		return err
+	}
+	return recordFinalized(rotationID)
+}
+
+// finalizedKeep bounds the finalized-rotation history.
+const finalizedKeep = 64
+
+// finalizedPath lists every rotation finalized on this node, oldest first. The
+// marker holds only the latest, but a Heat rolling update can re-deliver an
+// OLDER token: members outside the current batch are re-rendered from the
+// ResourceGroup's stored definitions, which never saw rotations written
+// straight to the member stacks.
+func finalizedPath() string { return MarkerPath + ".history" }
+
+func readFinalized() []string {
+	data, err := os.ReadFile(finalizedPath())
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(data))
+}
+
+func recordFinalized(rotationID string) error {
+	ids := readFinalized()
+	if slices.Contains(ids, rotationID) {
+		return nil
+	}
+	ids = append(ids, rotationID)
+	if len(ids) > finalizedKeep {
+		ids = ids[len(ids)-finalizedKeep:]
+	}
+	path := finalizedPath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(ids, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// Finalized reports whether rotationID already completed on this node.
+func Finalized(rotationID string) bool {
+	if rotationID == "" {
+		return false
+	}
+	return ReadMarker() == rotationID || slices.Contains(readFinalized(), rotationID)
 }
 
 // trust/leaf mode constants recorded in State for observability and resume.

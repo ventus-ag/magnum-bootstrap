@@ -385,8 +385,9 @@ func run(ctx context.Context, mode string, f runFlags, stdout, stderr io.Writer)
 	// records the CURRENT rotation id: the rotation is finalized, so this run is
 	// ordinary convergence and the chain-check must be active. A newer rotation
 	// (id changed) leaves marker != CARotationID, so Operation() stays ca-rotate.
-	if marker := carotation.ReadMarker(); marker != "" && marker == cfg.Trigger.CARotationID {
-		cfg.Trigger.AppliedCARotationID = marker
+	// An older, already-finalized id re-delivered by a stack update is applied too.
+	if carotation.Finalized(cfg.Trigger.CARotationID) {
+		cfg.Trigger.AppliedCARotationID = cfg.Trigger.CARotationID
 	}
 	// CA_ROTATION_ID stays in heat-params after a rotation and every parent
 	// update carries it to new members. A node that has never reconciled and
