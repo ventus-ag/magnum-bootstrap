@@ -86,6 +86,29 @@ if [ -z "$SLOT" ]; then
   if [ -n "${GITHUB_RUN_ID:-}" ]; then SLOT=$(( (GITHUB_RUN_ID + ${GITHUB_RUN_ATTEMPT:-0} + ${E2E_SLOT_OFFSET:-0} * 50) % 150 ))
   else SLOT=$(( (${E2E_SLOT_OFFSET:-0} * 50) % 150 )); fi
 fi
+# The derived slot is only where the search starts: separate jobs (another
+# workflow, a different run id) can still derive the same residue. Each run holds
+# a host-wide flock on its slot for its lifetime — inherited by its qemu
+# children, so a KEEP_VM cluster keeps its slot until the VMs die.
+SLOT_LOCK_DIR="${SLOT_LOCK_DIR:-${CACHE_DIR:-$HOME/.cache/fcos-e2e}/slots}"
+slot_ports_listening() {
+  local lo=$((2200 + ($1 % 200) * 256))
+  ss -Hltn 2>/dev/null | awk -v lo="$lo" -v hi="$((lo + 255))" \
+    '{n = split($4, a, ":"); p = a[n] + 0; if (p >= lo && p <= hi) f = 1} END {exit !f}'
+}
+claim_slot() {
+  local i s
+  mkdir -p "$SLOT_LOCK_DIR"
+  for i in $(seq 0 149); do
+    s=$(( (SLOT + i) % 150 ))
+    exec {SLOT_LOCK_FD}>"$SLOT_LOCK_DIR/$s.lock"
+    if flock -n "$SLOT_LOCK_FD" && ! slot_ports_listening "$s"; then SLOT="$s"; return 0; fi
+    exec {SLOT_LOCK_FD}>&-
+  done
+  return 1
+}
+SLOT_WANTED="$SLOT"
+claim_slot || { echo "no free e2e slot (all 150 locked under $SLOT_LOCK_DIR)" >&2; exit 1; }
 # Unique /24, unique mcast group+port, unique SSH port window per slot.
 CNET="${CNET:-192.168.$((100 + SLOT % 150))}"
 MCAST="${MCAST:-230.$((SLOT / 256)).$((SLOT % 256)).77:$((34801 + SLOT))}"
@@ -114,6 +137,14 @@ QEMU_ACCEL="${QEMU_ACCEL:-kvm}"
 QEMU_CPU="${QEMU_CPU:-auto}"
 QEMU_MACHINE="${QEMU_MACHINE:-}"   # empty = qemu default (i440fx); try q35
 QEMU_IRQCHIP="${QEMU_IRQCHIP:-}"   # empty = qemu default (full in-kernel); auto=split on nested AMD (KVM rejects 'off')
+# CPU model whenever TCG is used. `max` exposes SHA-NI/AVX2, measured in-guest
+# vs qemu64: sha256 ~3x, gunzip ~2.5x (image digest + layer unpack), TLS
+# handshakes equal, bulk TLS ~15% slower (Go picks AES-GCM over ChaCha20 once it
+# sees AES-NI; max,-aes is worse still: TCG's AVX2 ChaCha20 is slow).
+TCG_CPU="${TCG_CPU:-max}"
+# Overlays are throwaway, so guest flushes need not reach the host disk:
+# unsafe cut a 4KiB write+fsync from ~28ms to ~2ms (etcd fsyncs every commit).
+QEMU_DRIVE_CACHE="${QEMU_DRIVE_CACHE:-unsafe}"
 SSH_WAIT_TRIES="${SSH_WAIT_TRIES:-180}"   # per-attempt boot wait = tries x 5s (900s)
 
 # Nested-virt boots can hang at a RANDOM early-init point with no panic — the
@@ -165,7 +196,7 @@ AGENT_IMAGE="${AGENT_IMAGE:-docker.io/openstackmagnum/heat-container-agent:victo
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/fcos-e2e.XXXXXX)}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/fcos-e2e}"
 BUTANE=""
-declare -A QEMU_PIDS=()
+declare -A QEMU_PIDS=() QEMU_STARTED=()
 
 log()  { printf '\033[1;32m[host %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 err()  { printf '\033[1;31m[host %s] ERROR:\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -217,12 +248,13 @@ resolve_butane() {
 resolve_qemu_cpu() {
   [ "$QEMU_CPU" = auto ] || { log "QEMU accel=$QEMU_ACCEL cpu=$QEMU_CPU (explicit)"; return; }
   if [ "$QEMU_ACCEL" != kvm ]; then
-    QEMU_CPU=qemu64
-    log "QEMU cpu=auto -> qemu64 (accel=$QEMU_ACCEL, no KVM)"
+    QEMU_CPU="$TCG_CPU"
+    log "QEMU cpu=auto -> $TCG_CPU (accel=$QEMU_ACCEL, no KVM)"
     return
   fi
   local virt vendor
-  virt="$(systemd-detect-virt 2>/dev/null || echo none)"
+  # On bare metal it prints "none" AND exits 1, so `|| echo none` would double it.
+  virt="$(systemd-detect-virt 2>/dev/null)" || true; virt="${virt:-none}"
   vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
   QEMU_CPU=host
   if [ "$virt" != none ] && [ "$vendor" = AuthenticAMD ]; then
@@ -236,7 +268,7 @@ resolve_qemu_cpu() {
     # workarounds + TCG fallback) via ALLOW_KVM_ON_NESTED_AMD=1, or move the tier
     # to a sound-virt runner (Zen2+/Intel or bare-metal/--device /dev/kvm).
     if [ "${ALLOW_KVM_ON_NESTED_AMD:-0}" != 1 ]; then
-      QEMU_ACCEL=tcg; QEMU_CPU=qemu64; QEMU_IRQCHIP=""
+      QEMU_ACCEL=tcg; QEMU_CPU="$TCG_CPU"; QEMU_IRQCHIP=""
       SSH_WAIT_TRIES=$(( SSH_WAIT_TRIES > 360 ? SSH_WAIT_TRIES : 360 ))   # TCG boots slowly
       BOOT_STALL_SECS=$(( BOOT_STALL_SECS > 300 ? BOOT_STALL_SECS : 300 ))
       # The 1-vCPU cap below is a KVM nested-IPI workaround — irrelevant to TCG.
@@ -333,6 +365,7 @@ preflight() {
     || die "VICTORIA_DIR does not look like a ventus-ag/magnum checkout (missing magnum/drivers/.../bootstrap)"
   mkdir -p "$WORKDIR" "$CACHE_DIR"
   log "workdir: $WORKDIR"
+  log "slot: $SLOT$([ "$SLOT" != "$SLOT_WANTED" ] && echo " (wanted $SLOT_WANTED: taken)") — cluster net ${CNET}.0/24, ssh ports ${PORT_BASE}+"
 }
 
 build_binaries() {
@@ -394,18 +427,22 @@ download_fcos() {
   tag="${FCOS_VERSION:-$FCOS_STREAM}"
   img="$CACHE_DIR/fcos-${tag}.qcow2"
   if [ -f "$img" ]; then echo "$img"; return; fi
+  # Concurrent legs on a cold cache would download into the same paths.
+  local lock_fd; exec {lock_fd}>"$CACHE_DIR/.download.lock"; flock "$lock_fd"
+  if [ -f "$img" ]; then exec {lock_fd}>&-; echo "$img"; return; fi
   if [ -n "${FCOS_VERSION:-}" ]; then
-    log "resolving pinned Fedora CoreOS ${FCOS_STREAM} build ${FCOS_VERSION} qcow2"
+    log "resolving pinned Fedora CoreOS ${FCOS_STREAM} build ${FCOS_VERSION} qcow2" >&2
     url="https://builds.coreos.fedoraproject.org/prod/streams/${FCOS_STREAM}/builds/${FCOS_VERSION}/x86_64/fedora-coreos-${FCOS_VERSION}-qemu.x86_64.qcow2.xz"
   else
-    log "resolving Fedora CoreOS ${FCOS_STREAM} qcow2 (latest)"
+    log "resolving Fedora CoreOS ${FCOS_STREAM} qcow2 (latest)" >&2
     meta="$(curl -fsSL "https://builds.coreos.fedoraproject.org/streams/${FCOS_STREAM}.json")"
     url="$(echo "$meta" | jq -r '.architectures.x86_64.artifacts.qemu.formats["qcow2.xz"].disk.location')"
   fi
   [ -n "$url" ] && [ "$url" != "null" ] || die "could not resolve FCoS qcow2 url"
   xz="$CACHE_DIR/$(basename "$url")"
-  log "downloading $url"; curl -fsSL "$url" -o "$xz" || die "FCoS download failed (pinned FCOS_VERSION=${FCOS_VERSION:-<none>} may not exist for stream ${FCOS_STREAM})"
-  log "decompressing image"; xz -dkc "$xz" > "$img.tmp" && mv "$img.tmp" "$img"
+  log "downloading $url" >&2; curl -fsSL "$url" -o "$xz" || die "FCoS download failed (pinned FCOS_VERSION=${FCOS_VERSION:-<none>} may not exist for stream ${FCOS_STREAM})"
+  log "decompressing image" >&2; xz -dkc "$xz" > "$img.tmp" && mv "$img.tmp" "$img"
+  exec {lock_fd}>&-
   echo "$img"
 }
 
@@ -497,22 +534,29 @@ boot_progress() {
 # Boots with bounded retries. A nested-virt boot can freeze silently at a random
 # early-init point; the next boot usually succeeds, so a stalled VM is killed and
 # retried on a clean overlay rather than failing the whole run.
+# A sixth arg "launched" means attempt 1's qemu is already running (boot_all
+# starts every VM up front so boots overlap).
 boot_node() {
-  local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5"
-  local total=$((BOOT_RETRIES + 1)) n pid
+  local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5" launched="${6:-}"
+  local total=$((BOOT_RETRIES + 1)) n pid rc=1
   for n in $(seq 1 "$total"); do
     if [ "$n" -gt 1 ]; then
       log "$name boot attempt $n/$total — previous boot hung; recreating overlay"
       recreate_overlay "$name"
     fi
-    if boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" "$n" "$total"; then
-      return 0
+    rc=0
+    if [ "$n" = 1 ] && [ -n "$launched" ]; then
+      wait_node "$name" "$port" "$n" "$total" || rc=$?
+    else
+      boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" "$n" "$total" || rc=$?
     fi
+    [ "$rc" = 0 ] && return 0
     pid="${QEMU_PIDS[$name]:-}"
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true; sleep 2; kill -9 "$pid" 2>/dev/null || true
       unset 'QEMU_PIDS[$name]'
     fi
+    [ "$rc" = 2 ] && break   # qemu refused to start: a fresh overlay changes nothing
   done
   # KVM exhausted. If the failures were early-boot HANGS (not an alive-but-
   # unreachable guest, which TCG can't fix), fall back to pure-emulation TCG: it
@@ -522,27 +566,33 @@ boot_node() {
   if [ "$QEMU_ACCEL" = kvm ] && [ "${TCG_FALLBACK:-1}" = 1 ] \
      && [ "$(boot_progress "$WORKDIR/console.${name}.log")" != reached-multiuser ]; then
     log "$name: KVM hung in early boot $total attempt(s) — falling back to TCG (software emulation; reliable but slow). Disable with TCG_FALLBACK=0."
-    QEMU_ACCEL=tcg; QEMU_CPU=qemu64; QEMU_IRQCHIP=""
+    QEMU_ACCEL=tcg; QEMU_CPU="$TCG_CPU"; QEMU_IRQCHIP=""
     SSH_WAIT_TRIES=$(( SSH_WAIT_TRIES > 360 ? SSH_WAIT_TRIES : 360 ))   # TCG boots slowly
     BOOT_STALL_SECS=$(( BOOT_STALL_SECS > 300 ? BOOT_STALL_SECS : 300 ))
     recreate_overlay "$name"
-    if boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" 1 1; then return 0; fi
+    rc=0; boot_node_once "$name" "$port" "$mem" "$cpus" "$cmac" 1 1 || rc=$?
+    [ "$rc" = 0 ] && return 0
     pid="${QEMU_PIDS[$name]:-}"
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true; sleep 2; kill -9 "$pid" 2>/dev/null || true
       unset 'QEMU_PIDS[$name]'
     fi
   fi
-  err "$name failed to boot after $total KVM attempt(s)$([ "$QEMU_ACCEL" = tcg ] && echo ' + TCG fallback') — last 80 console lines:"
+  [ "$rc" = 2 ] && die "$name: qemu refused to start (host-side, not a guest boot problem): $(tr '\n' ' ' < "$WORKDIR/qemu.${name}.err" 2>/dev/null)"
+  err "$name failed to boot after $total attempt(s) (accel now $QEMU_ACCEL) — last 80 console lines:"
   tail -n 80 "$WORKDIR/console.${name}.log" 2>/dev/null | sed 's/^/    | /' >&2 || true
   die "$name SSH never came up. If even the TCG fallback failed, use a runner with sound nested virt (Zen2+/Intel or bare-metal/--device /dev/kvm). console: $WORKDIR/console.${name}.log"
 }
 
 # boot_node_once <name> <port> <mem> <cpus> <cmac> <attempt> <total>
-# Boots one VM and waits for SSH. Returns 0 when SSH is up; returns 1 if the boot
-# crashes, exits, or stalls (console idle BOOT_STALL_SECS with no SSH) so the
-# caller can retry on a fresh overlay.
+# Boots one VM and waits for SSH (see wait_node for return codes).
 boot_node_once() {
+  launch_node "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+  wait_node "$1" "$2" "$6" "$7"
+}
+
+# launch_node <name> <port> <mem> <cpus> <cmac> <attempt> <total> — start qemu.
+launch_node() {
   local name="$1" port="$2" mem="$3" cpus="$4" cmac="$5" n="$6" total="$7"
   local net=(-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${port}-:22" -device virtio-net-pci,netdev=n0)
   if [ -n "$cmac" ]; then
@@ -561,20 +611,31 @@ boot_node_once() {
   qemu-system-x86_64 \
     -machine "${QEMU_MACHINE:+${QEMU_MACHINE},}accel=${QEMU_ACCEL}${irq:+,kernel-irqchip=${irq}}" -cpu "$QEMU_CPU" -smp "$cpus" -m "$mem" \
     -nographic -serial file:"$WORKDIR/console.${name}.log" -monitor none \
-    -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2 \
+    -drive if=virtio,file="$WORKDIR/${name}.qcow2",format=qcow2,cache=${QEMU_DRIVE_CACHE} \
     -fw_cfg name=opt/com.coreos/config,file="$WORKDIR/ignition.${name}.json" \
-    "${net[@]}" &
+    "${net[@]}" 2>"$WORKDIR/qemu.${name}.err" &
   QEMU_PIDS[$name]=$!
+  QEMU_STARTED[$name]="$(date +%s)"
+  log "$name qemu pid ${QEMU_PIDS[$name]} (console: $WORKDIR/console.${name}.log)"
+}
+
+# wait_node <name> <port> <attempt> <total> — wait for SSH on a launched VM.
+# Returns 0 when SSH is up; 1 if the boot crashes or stalls (console idle
+# BOOT_STALL_SECS with no SSH) so the caller can retry on a fresh overlay; 2 if
+# qemu itself exited (host-side: port in use, bad flag, no memory).
+wait_node() {
+  local name="$1" port="$2" n="$3" total="$4"
   local clog="$WORKDIR/console.${name}.log" waited=0 last_size=-1 last_change
   last_change="$(date +%s)"
-  log "$name qemu pid ${QEMU_PIDS[$name]} — waiting for SSH on 127.0.0.1:$port (console: $clog)"
+  log "$name waiting for SSH on 127.0.0.1:$port"
   for attempt in $(seq 1 "$SSH_WAIT_TRIES"); do
-    if gssh "$port" true 2>/dev/null; then log "$name SSH up after ${waited}s (attempt $n/$total)"; return 0; fi
+    waited=$(( $(date +%s) - ${QEMU_STARTED[$name]} ))
     if ! kill -0 "${QEMU_PIDS[$name]}" 2>/dev/null; then
-      err "$name qemu exited early after ${waited}s (attempt $n/$total) — last 40 console lines:"
-      tail -n 40 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || true
-      return 1
+      err "$name qemu exited early after ${waited}s (attempt $n/$total) — qemu stderr:"
+      sed 's/^/    | /' "$WORKDIR/qemu.${name}.err" >&2 2>/dev/null || true
+      return 2
     fi
+    if gssh "$port" true 2>/dev/null; then log "$name SSH up ${waited}s after launch (attempt $n/$total)"; return 0; fi
     # A fatal guest condition (panic, GPF, or — common under nested KVM — an RCU
     # stall / soft lockup / hung task during early init) never recovers.
     if grep -qiE 'Kernel panic|BUG:|Oops:|general protection fault|detected stall|soft lockup|hung task|Unable to mount root|not syncing' "$clog" 2>/dev/null; then
@@ -602,7 +663,7 @@ boot_node_once() {
       log "$name still waiting for SSH (${waited}s elapsed, console ${sz}B, idle $((now - last_change))s) — console tail:"
       tail -n 8 "$clog" 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (console log empty — qemu may not have started serial output yet)" >&2
     fi
-    sleep 5; waited=$((waited + 5))
+    sleep 5
   done
   if [ "$(boot_progress "$clog")" = reached-multiuser ]; then
     err "$name SSH did not come up after ${waited}s but the guest REACHED MULTI-USER (attempt $n/$total) — NOT a boot hang: SSH unreachable. Check user-mode net/hostfwd (DHCP on :2222) or Ignition ssh-key/sshd config. Last 60 console lines:"
@@ -1051,32 +1112,40 @@ print_summary() {
 }
 
 # --- main ------------------------------------------------------------------
+# Every VM is launched before any is waited on: under TCG one FCoS boot takes
+# minutes, and nothing at boot depends on another node.
 boot_all() {
+  local -a names=() mems=() cpus=() cmacs=()
   if clustered; then
-    # lb node first (small; mock-lb tolerates down backends and registers each
-    # master as its apiserver/etcd comes up).
     if lb_enabled; then
       render_ignition lb e2e-lb "$LB_CMAC" "$LB_CIP"
-      boot_node lb "$(ssh_port lb)" "$LB_MEM_MB" "$LB_CPUS" "$LB_CMAC"
+      names+=(lb); mems+=("$LB_MEM_MB"); cpus+=("$LB_CPUS"); cmacs+=("$LB_CMAC")
     fi
     local i=0 key
     while [ "$i" -lt "${MASTERS:-1}" ]; do
       key="$(master_key "$i")"
       render_ignition "$key" "e2e-master-$i" "$(master_cmac "$i")" "$(master_cip "$i")"
-      boot_node "$key" "$(ssh_port "$key")" "$MASTER_MEM_MB" "$MASTER_CPUS" "$(master_cmac "$i")"
+      names+=("$key"); mems+=("$MASTER_MEM_MB"); cpus+=("$MASTER_CPUS"); cmacs+=("$(master_cmac "$i")")
       i=$((i + 1))
     done
     i=0
     while [ "$i" -lt "$WORKERS" ]; do
       render_ignition "worker$i" "e2e-minion-$i" "$(worker_cmac "$i")" "$(worker_ip "$i")"
-      boot_node "worker$i" "$(ssh_port "worker$i")" "$WORKER_MEM_MB" "$WORKER_CPUS" "$(worker_cmac "$i")"
+      names+=("worker$i"); mems+=("$WORKER_MEM_MB"); cpus+=("$WORKER_CPUS"); cmacs+=("$(worker_cmac "$i")")
       i=$((i + 1))
     done
   else
     # MASTER_LB_ENABLED=false single master: user-mode path, no cluster NIC.
     render_ignition master e2e-master-0 "$MASTER_CMAC" "$MASTER_CIP"
-    boot_node master "$(ssh_port master)" "$MASTER_MEM_MB" "$MASTER_CPUS" ""
+    names+=(master); mems+=("$MASTER_MEM_MB"); cpus+=("$MASTER_CPUS"); cmacs+=("")
   fi
+  local j total=$((BOOT_RETRIES + 1))
+  for j in "${!names[@]}"; do
+    launch_node "${names[$j]}" "$(ssh_port "${names[$j]}")" "${mems[$j]}" "${cpus[$j]}" "${cmacs[$j]}" 1 "$total"
+  done
+  for j in "${!names[@]}"; do
+    boot_node "${names[$j]}" "$(ssh_port "${names[$j]}")" "${mems[$j]}" "${cpus[$j]}" "${cmacs[$j]}" launched
+  done
 }
 
 provision_all() {

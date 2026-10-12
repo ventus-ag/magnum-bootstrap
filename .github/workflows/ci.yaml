@@ -379,6 +379,8 @@ jobs:
           KUBE_TAG: v1.30.10
           KUBE_TAG_UPGRADE: v1.31.6
           SCENARIOS: create ca-rotate upgrade periodic
+          # Runs concurrently with the e2e-fcos legs (offsets 0/1) on nightly.
+          E2E_SLOT_OFFSET: "2"
           WORKDIR: ${{ runner.temp }}/fcos-e2e-oldimage
         run: |
           chmod +x "$PREBUILT_BOOTSTRAP" "$PREBUILT_HOST_PROVIDER" || true
