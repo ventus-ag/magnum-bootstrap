@@ -124,16 +124,7 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 				"create": true,
 				"name":   "cloud-config-occm",
 			},
-			"cloudConfig": map[string]interface{}{
-				"global": map[string]interface{}{
-					"auth-url": cfg.Shared.AuthURL,
-					"user-id":  cfg.Shared.TrusteeUserID,
-					"password": cfg.Shared.TrusteePassword,
-					"trust-id": cfg.Shared.TrustID,
-					"region":   cfg.Shared.RegionName,
-					"ca-file":  "/etc/kubernetes/ca-bundle.crt",
-				},
-			},
+			"cloudConfig": cloudConfigValues(cfg),
 			"enabledControllers": []interface{}{
 				"cloud-node",
 				"cloud-node-lifecycle",
@@ -203,4 +194,26 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		return nil, err
 	}
 	return res, nil
+}
+
+func cloudConfigValues(cfg config.Config) map[string]interface{} {
+	values := map[string]interface{}{
+		"global": map[string]interface{}{
+			"auth-url": cfg.Shared.AuthURL,
+			"user-id":  cfg.Shared.TrusteeUserID,
+			"password": cfg.Shared.TrusteePassword,
+			"trust-id": cfg.Shared.TrustID,
+			"region":   cfg.Shared.RegionName,
+			"ca-file":  "/etc/kubernetes/ca-bundle.crt",
+		},
+	}
+	// Without subnet-id OCCM >= 1.27 puts internal-LB members on the Service's
+	// VIP subnet (another project's), which Octavia rejects; 1.24 only worked
+	// because it cached the autodetected node subnet globally.
+	if cfg.Shared.ClusterSubnet != "" {
+		values["loadBalancer"] = map[string]interface{}{
+			"subnet-id": cfg.Shared.ClusterSubnet,
+		}
+	}
+	return values
 }
