@@ -19,7 +19,8 @@ import (
 
 // containerdVersions maps Kubernetes minor version to the containerd version.
 // Based on containerd.io/releases support matrix:
-//   - K8s >= 1.35: containerd 2.2.x (officially supports 1.35+)
+//   - K8s >= 1.36: containerd 2.3.x
+//   - K8s 1.35: containerd 2.2.x
 //   - K8s 1.32-1.34: containerd 2.1.x (officially supports 1.32-1.35)
 //   - K8s < 1.32: containerd 1.7.x LTS (officially supports through 1.35, LTS until Sep 2026)
 var containerdVersions = map[string]string{
@@ -519,16 +520,11 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 
 	// Write containerd config.toml — EnsureFile is idempotent.
-	// Config format is driven by containerd version (not K8s version):
-	// containerd 2.x requires version=3 config with new CRI plugin paths.
+	// Config format is driven by the selected containerd binary, including
+	// static fallbacks, so runtime drop-ins use a compatible config version.
 	pause := pauseImage(cfg.Shared.KubeTag)
 	systemdCgroup := containerdUsesSystemdCgroup(cfg.ResolveCgroupDriver())
-	var configContent string
-	if useV2Layout {
-		configContent = containerdV3Config(pause, systemdCgroup)
-	} else {
-		configContent = containerdV2Config(pause, systemdCgroup)
-	}
+	configContent := containerdConfig(containerdVersion, pause, systemdCgroup)
 	configResult, err := (hostresource.FileSpec{Path: "/etc/containerd/config.toml", Content: []byte(configContent), Mode: 0o644}).Apply(executor)
 	if err != nil {
 		return nil, false, err
@@ -668,14 +664,25 @@ func pauseImage(kubeTag string) string {
 	return "registry.k8s.io/pause:" + v
 }
 
-// containerdV3Config returns a containerd 2.x (config version 3) config.
-func containerdV3Config(pause string, systemdCgroup bool) string {
-	return fmt.Sprintf(`version = 3
+// containerdConfig matches the selected binary's config version: 1.x uses v2,
+// 2.0-2.2 use v3, and 2.3+ uses v4. NVIDIA's toolkit writes drop-ins at the
+// binary's current config version; importing a newer version than the root
+// config fails even when containerd can migrate the root config itself.
+func containerdConfig(version, pause string, systemdCgroup bool) string {
+	major, rest, ok := parseContainerdMajor(version)
+	if !ok || major < 2 {
+		return containerdV2Config(pause, systemdCgroup)
+	}
+	minorString, _, _ := strings.Cut(rest, ".")
+	minor, _ := strconv.Atoi(minorString)
+	configVersion := 3
+	if major > 2 || minor >= 3 {
+		configVersion = 4
+	}
+	return fmt.Sprintf(`version = %d
+imports = ["/etc/containerd/conf.d/*.toml"]
 
 [plugins]
-  [plugins."io.containerd.cri.v1.images"]
-    sandbox_image = "%s"
-
   [plugins."io.containerd.cri.v1.images".pinned_images]
     sandbox = "%s"
 
@@ -687,13 +694,13 @@ func containerdV3Config(pause string, systemdCgroup bool) string {
     enable_unprivileged_ports = true
     enable_unprivileged_icmp = true
 
-   [plugins."io.containerd.cri.v1.runtime".runtimes.runc]
+   [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
      runtime_type = "io.containerd.runc.v2"
-     [plugins."io.containerd.cri.v1.runtime".runtimes.runc.options]
+     [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
        SystemdCgroup = %t
 
-  [plugins."io.containerd.cri.v1.cni"]
-    bin_dir = "/opt/cni/bin"
+  [plugins."io.containerd.cri.v1.runtime".cni]
+    bin_dirs = ["/opt/cni/bin"]
     conf_dir = "/etc/cni/net.d"
 
   [plugins."io.containerd.snapshotter.v1.overlayfs"]
@@ -702,12 +709,13 @@ func containerdV3Config(pause string, systemdCgroup bool) string {
 
 [debug]
   level = "info"
-`, pause, pause, systemdCgroup)
+`, configVersion, pause, systemdCgroup)
 }
 
 // containerdV2Config returns a containerd 1.x (config version 2) config.
 func containerdV2Config(pause string, systemdCgroup bool) string {
 	return fmt.Sprintf(`version = 2
+imports = ["/etc/containerd/conf.d/*.toml"]
 root = "/var/lib/containerd"
 state = "/run/containerd"
 oom_score = 0
@@ -901,11 +909,10 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 		}
 		pause := pauseImage(cfg.Shared.KubeTag)
 		systemdCgroup := containerdUsesSystemdCgroup(cfg.ResolveCgroupDriver())
-		configContent := containerdV2Config(pause, systemdCgroup)
+		configContent := containerdConfig(containerdVersion, pause, systemdCgroup)
 		var configDeps []pulumi.Resource
 		configDeps = append(configDeps, dirResources["/etc/containerd"])
 		if useV2Layout {
-			configContent = containerdV3Config(pause, systemdCgroup)
 			dropinDirRes, err := hostsdk.RegisterDirectorySpec(ctx, name+"-containerd-dropin-dir", hostresource.DirectorySpec{Path: "/etc/systemd/system/containerd.service.d", Mode: 0o755}, childOpts...)
 			if err != nil {
 				return nil, err

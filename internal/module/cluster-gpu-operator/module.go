@@ -14,14 +14,15 @@ import (
 // Helm chart version.
 // Source: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/platform-support.html
 //
-//	chart v26.3.0 → K8s 1.32-1.35 (current)
-//	chart v25.3.4 → K8s 1.29-1.33 (deprecated, critical fixes only)
-//	chart v24.9.2 → K8s 1.24-1.31 (end of support)
+//	chart v26.7.2 → K8s 1.33-1.37 (supported)
+//	chart v26.3.3 → K8s 1.32-1.36 (deprecated; retained for 1.32)
+//	Older pins are retained for legacy clusters and are end of support.
 var gpuOperatorChartVersions = map[string]string{
-	"1.35": "v26.3.0",
-	"1.34": "v26.3.0",
-	"1.33": "v26.3.0",
-	"1.32": "v26.3.0",
+	"1.36": "v26.7.2",
+	"1.35": "v26.7.2",
+	"1.34": "v26.7.2",
+	"1.33": "v26.7.2",
+	"1.32": "v26.3.3",
 	"1.31": "v25.3.4",
 	"1.30": "v25.3.4",
 	"1.29": "v25.3.4",
