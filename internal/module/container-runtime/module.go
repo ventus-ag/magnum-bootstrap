@@ -217,27 +217,9 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 		configChanged = changed
 	}
 
-	// Signal restart only if the runtime config actually changed (not just
-	// Docker being stopped). The configChanged flag is set by file writes
-	// in reconcileContainerd/reconcileDocker, not by service state changes.
-	if configChanged && req.Restarts != nil {
-		if cfg.Shared.ContainerRuntime == "containerd" {
-			req.Restarts.Add("containerd", "container-runtime config changed")
-		} else {
-			req.Restarts.Add("docker", "container-runtime config changed")
-		}
-	}
-
-	// On a genuine cgroup-driver flip, the runtime's config necessarily changed
-	// (handled above) — but kubelet must restart too so it emits cgroup paths in
-	// the SAME format the runtime now expects. kube-master-config also rewrites
-	// kubelet-config (which would trigger this), but signal it explicitly here so
-	// the flip is safe even if the kubelet config text is otherwise unchanged.
-	if cgroupDriverFlipped && req.Restarts != nil {
-		req.Restarts.Add("kubelet", "cgroup driver flip "+priorCgroupDriver+"->"+desiredCgroupDriver)
-		if req.Logger != nil {
-			req.Logger.Infof("container-runtime: cgroup driver flipping %s->%s; restarting kubelet with the runtime", priorCgroupDriver, desiredCgroupDriver)
-		}
+	markRuntimeRestarts(cfg.Shared.ContainerRuntime, configChanged, priorCgroupDriver, desiredCgroupDriver, req.Restarts)
+	if cgroupDriverFlipped && req.Logger != nil {
+		req.Logger.Infof("container-runtime: cgroup driver changing %s->%s; restarting kubelet with the runtime", priorCgroupDriver, desiredCgroupDriver)
 	}
 
 	return moduleapi.Result{
@@ -247,6 +229,26 @@ func (Module) Run(ctx context.Context, cfg config.Config, req moduleapi.Request)
 			"cgroupDriver":     cfg.Shared.CgroupDriver,
 		},
 	}, nil
+}
+
+// Kubelet reads the effective CRI cgroup driver at startup. A corrected runtime
+// config can change that driver even when kubelet's YAML has not changed, so
+// every containerd binary/config update must also refresh kubelet.
+func markRuntimeRestarts(runtime string, changed bool, previousDriver, desiredDriver string, tracker *moduleapi.RestartTracker) {
+	if tracker == nil {
+		return
+	}
+	if changed {
+		if runtime == "containerd" {
+			tracker.Add("containerd", "container-runtime changed")
+			tracker.Add("kubelet", "containerd changed; reload effective CRI cgroup driver")
+		} else {
+			tracker.Add("docker", "container-runtime changed")
+		}
+	}
+	if previousDriver != "" && !strings.EqualFold(previousDriver, desiredDriver) {
+		tracker.Add("kubelet", "cgroup driver change "+previousDriver+"->"+desiredDriver)
+	}
 }
 
 func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.Executor) ([]host.Change, bool, error) {
@@ -531,6 +533,21 @@ func reconcileContainerd(ctx context.Context, cfg config.Config, executor *host.
 	}
 	changes = append(changes, configResult.Changes...)
 	configChanged = configChanged || configResult.Changed
+
+	// The toolkit's imported runtime options override the root configuration.
+	// Keep its runc and NVIDIA handlers on the same cgroup driver.
+	nvidiaConfig, err := nvidiaContainerdConfig(nvidiaContainerdConfigPath, systemdCgroup)
+	if err != nil {
+		return nil, false, err
+	}
+	if nvidiaConfig != nil {
+		result, err := nvidiaConfig.Apply(executor)
+		if err != nil {
+			return nil, false, err
+		}
+		changes = append(changes, result.Changes...)
+		configChanged = configChanged || result.Changed
+	}
 
 	// Write Docker Hub registry host config (containerd 2.x registry config_path).
 	if useV2Layout {
@@ -944,6 +961,18 @@ func (Module) Register(ctx *pulumi.Context, name string, heat *moduleapi.HeatPar
 			return nil, err
 		}
 		serviceDeps = append(serviceDeps, configRes)
+		nvidiaConfig, err := nvidiaContainerdConfig(nvidiaContainerdConfigPath, systemdCgroup)
+		if err != nil {
+			return nil, err
+		}
+		if nvidiaConfig != nil {
+			nvidiaOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, configRes)
+			nvidiaRes, err := hostsdk.RegisterFileSpec(ctx, name+"-nvidia-config", *nvidiaConfig, nvidiaOpts...)
+			if err != nil {
+				return nil, err
+			}
+			serviceDeps = append(serviceDeps, nvidiaRes)
+		}
 		serviceOpts := hostresource.ChildResourceOptionsWithDeps(res, opts, serviceDeps...)
 		if _, err := hostsdk.RegisterSystemdServiceSpec(ctx, name+"-service", hostresource.SystemdServiceSpec{Unit: "containerd", SkipIfMissing: true, Enabled: hostresource.BoolPtr(true), Active: hostresource.BoolPtr(true)}, serviceOpts...); err != nil {
 			return nil, err

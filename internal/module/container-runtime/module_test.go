@@ -71,13 +71,23 @@ func TestContainerdConfigWithRuntimeDropIn(t *testing.T) {
   [plugins.%q.containerd.runtimes.nvidia.options]
     BinaryName = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
     SystemdCgroup = %t
-`, versionLine, plugin, plugin, systemd)
+`, versionLine, plugin, plugin, !systemd)
 			// Containerd 1.7 merges the CRI plugin as one map. Like the toolkit,
 			// preserve its existing settings alongside the added runtime.
 			if major < 2 {
 				dropin = versionLine + "\n" + cfg[strings.Index(cfg, "[plugins]"):] + strings.TrimPrefix(dropin, versionLine+"\n")
 			}
-			if err := os.WriteFile(filepath.Join(dropinDir, "99-nvidia.toml"), []byte(dropin), 0o644); err != nil {
+			dropinPath := filepath.Join(dropinDir, "99-nvidia.toml")
+			if err := os.WriteFile(dropinPath, []byte(dropin), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// An older toolkit drop-in can disagree with the corrected root.
+			// Exercise the same normalization used by both bootstrap writers.
+			nvidiaConfig, err := nvidiaContainerdConfig(dropinPath, systemd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := nvidiaConfig.Apply(host.NewExecutor(true, nil)); err != nil {
 				t.Fatal(err)
 			}
 			out, err := exec.Command(binary, "--config", path, "config", "dump").CombinedOutput()

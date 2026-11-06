@@ -210,6 +210,18 @@ written, so the running args stay. Cinder's `csi-cinder-sc-delete` /
 Switching `cinder_csi_enabled` / `cloud_provider_enabled` off is not applied
 while Cinder PersistentVolumes / LoadBalancer Services still depend on them.
 
+## Runtime and GPU Operator updates
+
+Normal bootstrap runs apply the current runtime configuration and version map
+to both existing and new nodes, and update GPU Operator through its Helm
+release. No separate migration workflow or Magnum parameters are required.
+
+A containerd binary or configuration change requests restarts of containerd
+and kubelet so kubelet reads the effective runtime cgroup driver again. Existing
+NVIDIA runtime drop-ins use that same driver while retaining their other
+settings. Unchanged runtime settings do not request another restart. GPU
+Operator updates can roll out new driver and toolkit versions.
+
 ## Architecture
 
 ```
